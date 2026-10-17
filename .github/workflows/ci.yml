@@ -139,6 +139,22 @@ jobs:
       - name: Smoke test
         run: .github/scripts/smoke_test.sh ./branch_bench_cov "$RUNNER_TEMP/smoke"
 
+      # The VM has no PMU or cpufreq, so fake them to cover those code paths.
+      - name: Smoke test with faked perf counters and cpufreq
+        run: |
+          gcc -std=c99 -O2 -Wall -Wextra -Werror -shared -fPIC \
+            -o "$RUNNER_TEMP/fake_perf.so" .github/scripts/fake_perf.c -ldl
+          export LD_PRELOAD="$RUNNER_TEMP/fake_perf.so"
+          dir="$RUNNER_TEMP/smoke-fake"
+          .github/scripts/smoke_test.sh ./branch_bench_cov "$dir"
+          # Fails if the shim was not used: these lines need the counters.
+          grep -q '^\*\*Cost per miss:\*\*' "$dir/report.md"
+          grep -q '^\*\*Average clock during measurements:\*\*' "$dir/report.md"
+          # Only some counters open.
+          for ev in misses branches,cycles; do
+            FAKE_PERF_EVENTS=$ev ./branch_bench_cov -t 1 $SMALL_RUN -o "$dir/part.md"
+          done
+
       - name: Coverage report
         run: gcovr --root . --filter branch_bench.c --sonarqube coverage.xml --print-summary
 

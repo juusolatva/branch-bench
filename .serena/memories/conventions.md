@@ -11,5 +11,5 @@ Full rules are in `AGENTS.md` (sections 1–7). Key points:
 - Randomness only from xorshift64 `rng64()` / `rng_state`, never `rand()`.
 - Test 3 leaves: `FOR_EACH_LEAF(DEF_LEAF)` / `PTR_LEAF`, each with distinct arithmetic so ICF can't merge them; keep `NUM_FUNCS` in sync. (GCC does fold `sum_branch` into `sum_threshold`: identical bodies, harmless.)
 - CLI: options handled one at a time in `apply_option()`; numeric values via `option_number()`/`parse_count()` (range-checked, K/M suffixes). Keep functions small: SonarQube Cloud flags cognitive complexity > 25.
-- Types: `u64`/`u8`; format u64 with `PRIu64`, `size_t` with `%zu`; unsigned literal suffixes uppercase (`1UL`).
+- Types: `u64`/`u8`; format u64 with `PRIu64`, `size_t` with `%zu`; unsigned literal suffixes uppercase (`1UL`). Integer→`double` conversions always as explicit `(double)` casts (SonarQube S5276), also in mixed arithmetic like `100.0 * (double)a / (double)b`.
 - Style: 4-space indent, K&R braces, section-banner comments (`/* ── Title ─── */`), aligned `#define` comments, `static` on every file-scope symbol.

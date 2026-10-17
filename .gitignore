@@ -1,1 +1,8 @@
 branch_bench
+branch_bench_cov
+fake_perf.so
+*.gcda
+*.gcno
+*.gcov
+coverage.xml
+build_wrapper_output/

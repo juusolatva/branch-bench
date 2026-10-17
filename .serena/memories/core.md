@@ -7,6 +7,7 @@ Single-file C99 microbenchmark measuring branch-misprediction cost. `AGENTS.md` 
 - `run.sh` — canonical build+run (`-std=c99` + required flags).
 - `README.md` — user docs, incl. the interpretation guide (its only copy; the program just points to it).
 - `RESULTS.md` — per-CPU reports from `-o`, appended by hand.
+- `.github/workflows/ci.yml` — gcc (x86-64+arm64) / clang / sanitizer / SonarQube coverage jobs. Scripts in `.github/scripts/`: `check_kernels.sh` (Test 1–3 kernels keep real branches), `smoke_test.sh` (every option + invalid input, exit codes only), `fake_perf.c` (LD_PRELOAD shim faking perf counters, `/proc/cpuinfo`, cpufreq for coverage). `sonar-project.properties` — scan settings (only `branch_bench.c` is analyzed).
 
 ## Invariants / gotchas
 - Run-time settings are globals set only by CLI options; each `run_testN` copies `size` into a local `len` once (otherwise static analyzers report out-of-bounds reads).
@@ -16,6 +17,7 @@ Single-file C99 microbenchmark measuring branch-misprediction cost. `AGENTS.md` 
 - Report heading (`model @ max GHz`) is generated; RESULTS.md suffixes like `(WSL2)` or board/core names are hand-edited.
 - RESULTS.md's i5-3380M section is historical (hardware gone): it keeps old Test 3 labels and the pre-Cycles table layout. Keep it for the Ivy Bridge vs Haswell Test 3 comparison; don't regenerate or normalize it.
 - Console and Markdown report are written in parallel in each `run_testN`; change both together.
+- CI runners have no PMU or cpufreq: those paths are covered only via `fake_perf.c`. New perf events, `/proc`/sysfs reads or cpuinfo keys need matching fakes there, or new-code coverage drops below the 80% gate.
 - Serena symbol tools (`find_symbol`, `insert_before_symbol`) have timed out on this file; `replace_content` and plain reads work reliably.
 
 Further memories:

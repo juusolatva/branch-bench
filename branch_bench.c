@@ -97,7 +97,7 @@ static double now_ms(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1e3 + ts.tv_nsec * 1e-6;
+    return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec * 1e-6;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
@@ -376,7 +376,7 @@ static double cpu_max_ghz(void)
         fclose(f);
     }
 #endif
-    return khz_max / 1e6;
+    return (double)khz_max / 1e6;
 }
 
 /* Report heading: the CPU model, with any "@ <base clock>" it carries
@@ -437,7 +437,8 @@ static void report_table(FILE *f, const char *title, const char *desc,
                 fprintf(f, " – |");
         }
         if (perf_has(CTR_BRANCHES) && perf_has(CTR_MISSES) && r->branch_total)
-            fprintf(f, " %.1f%% |", 100.0 * r->branch_misses / r->branch_total);
+            fprintf(f, " %.1f%% |",
+                    100.0 * (double)r->branch_misses / (double)r->branch_total);
         else
             fprintf(f, " – |");
         if (perf_has(CTR_MISSES))
@@ -461,7 +462,8 @@ static void print_row(const char *label, const Result *r, const Work *w)
     if (perf_has(CTR_MISSES)) {
         printf("  misses %9"PRIu64"  (", r->branch_misses);
         if (perf_has(CTR_BRANCHES) && r->branch_total)
-            printf("%.1f%%, ", 100.0 * r->branch_misses / r->branch_total);
+            printf("%.1f%%, ",
+                   100.0 * (double)r->branch_misses / (double)r->branch_total);
         printf("%.3f/%s)", misses_per_item(r, w), w->unit);
     }
     printf("\n");

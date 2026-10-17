@@ -6,5 +6,6 @@
 - Required flags (never drop): `-O2 -fno-tree-vectorize -fno-if-conversion`. Without them the kernels get vectorized or cmov-converted and the mispredictions disappear. Test 4's branchless variant doesn't depend on them.
 - Perf: `perf_event_open(2)`, user mode only, one group of branches/misses/cycles read with `PERF_FORMAT_GROUP` (+ time enabled/running, scaled if multiplexed). Unavailable with restrictive `perf_event_paranoid`, in most containers/VMs and WSL2; then wall-clock only (`now_ms()`, monotonic).
 - Clock info: max clock from `/sys/devices/system/cpu/cpu*/cpufreq/cpuinfo_max_freq` (highest across CPUs); measured average from cycles ÷ time.
-- Code quality: SonarQube Cloud (public project `juusolatva_branch_bench`, analyzes each push); the user marks false positives there.
+- Code quality: SonarQube Cloud (public project `juusolatva_branch_bench`), scanned from the CI `sonarqube` job (Build Wrapper + gcovr coverage; Automatic Analysis off). Quality gate on new code: coverage ≥ 80%, code-smell severity score ≤ 14 (5 new Major issues scored 15), duplication ≤ 3%. The user marks false positives there.
+- CI: GitHub Actions, hosted runners (VMs, no PMU/cpufreq) — correctness and codegen only, never timings.
 - Results so far: Intel Ivy Bridge/Haswell/Kaby Lake R, AMD Zen 5 (WSL2), Raspberry Pi 4 (Cortex-A72). Planned: Cudy WR3000S (Cortex-A53, OpenWrt). Dev machine: Fedora Linux x86_64 (i5-8350U).

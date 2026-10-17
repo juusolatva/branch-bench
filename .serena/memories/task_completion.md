@@ -9,6 +9,7 @@ No test framework, linter or formatter exists. Verify with:
 5. Kernels: compare the disassembly with the previous build (instructions, ignoring addresses and padding nops); real conditional branches must remain (no cmov or SIMD) and no loop may be eliminated. Check that no hot-loop jump crosses or ends on a 32-byte boundary (JCC erratum on Skylake-derived Intel). If kernel code changed, compare cycles per element and cost per miss against the previous build (`-n 5`).
 6. Option changes: test invalid and missing values (exit code 1, clear message) and `--help`.
 7. Non-perf path: code must still compile without `HAVE_PERF` (e.g. `-U__linux__` on a scratch copy) and handle missing individual counters.
-8. Keep `AGENTS.md`, `README.md` and these memories in sync with behaviour changes.
+8. CI parity: `smoke_test.sh` passes (normal build, and with the `fake_perf.c` shim when perf/cpuinfo/cpufreq code changed); `check_kernels.sh` passes; new options are added to `smoke_test.sh`. See `mem:suggested_commands`.
+9. Keep `AGENTS.md`, `README.md` and these memories in sync with behaviour changes.
 
 Don't commit unless the user asks.

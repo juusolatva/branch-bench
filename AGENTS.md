@@ -51,7 +51,7 @@ GCC is the reference compiler. Clang rejects `-fno-if-conversion` and has no equ
 - `./branch_bench -h` / `./branch_bench --help`: Displays usage information.
 
 ### Testing and Validation
-There is no dedicated test framework or linter in this repository. Validate changes by compiling with `gcc` using the required flags (plus `-Wall -Wextra -pedantic` to catch issues) and executing the binary. `clang --analyze -std=c99 branch_bench.c` should report no warnings; it finds the same kind of path-based bugs (uninitialized values, out-of-bounds reads) that SonarQube Cloud reports. Test 4 includes a built-in runtime sanity check verifying that branch and branchless implementations compute identical sums; on a mismatch it prints an error and the program exits with status 1.
+There is no dedicated test framework or linter in this repository. Validate changes by compiling with `gcc` using the required flags (plus `-Wall -Wextra -pedantic` to catch issues) and executing the binary. `clang --analyze -std=c99 branch_bench.c` should report no warnings; it finds the same kind of path-based bugs (uninitialized values, out-of-bounds reads) that SonarQube Cloud reports. SonarQube also flags implicit integer-to-`double` conversions (rule S5276), so write them as explicit `(double)` casts; they compile to the same code. Test 4 includes a built-in runtime sanity check verifying that branch and branchless implementations compute identical sums; on a mismatch it prints an error and the program exits with status 1.
 
 Changes anywhere in the file can move the kernels to new addresses, which can change timings even when their code is untouched. After a change, compare the kernels' disassembly with the previous build. Also check that no jump in a kernel's hot loop crosses or ends on a 32-byte boundary: Intel's JCC-erratum microcode slows such jumps on Skylake-derived CPUs, including the i5-8350U in RESULTS.md.
 
@@ -60,9 +60,17 @@ Changes anywhere in the file can move the kernels to new addresses, which can ch
 - **gcc** (x86-64 and arm64): builds with the required flags plus `-Wall -Wextra -pedantic -Werror`, compiles the non-perf path (`-U__linux__`), runs `--size 64K --reps 2`, and runs [`.github/scripts/check_kernels.sh`](.github/scripts/check_kernels.sh), which fails if the Test 1–3 kernels contain a conditional move/select or SIMD registers, or lose their conditional branch or indirect call. Run it locally with `.github/scripts/check_kernels.sh ./branch_bench`.
 - **clang**: builds with the Clang flags and `-Werror`, runs the small size, and runs `clang --analyze` with `-analyzer-werror`. The kernel check is not run, because Clang emits `cmov` in `sum_threshold`.
 - **sanitizers**: GCC ASan+UBSan (x86-64 and arm64) and Clang MSan, each running [`.github/scripts/smoke_test.sh`](.github/scripts/smoke_test.sh), which exercises every option, the report file and invalid input. Sanitizer builds are for correctness only; never use them for results.
-- **sonarqube**: a `--coverage` build under SonarQube's Build Wrapper runs `smoke_test.sh`, `gcovr` converts the coverage, and the scan uploads both (settings in [`sonar-project.properties`](sonar-project.properties)). Needs the `SONAR_TOKEN` secret and Automatic Analysis disabled in SonarQube Cloud.
+- **sonarqube**: a `--coverage` build under SonarQube's Build Wrapper runs `smoke_test.sh`, once as is and once with the [`.github/scripts/fake_perf.c`](.github/scripts/fake_perf.c) `LD_PRELOAD` shim, which fakes the perf counters (`FAKE_PERF_EVENTS` selects which ones open), `/proc/cpuinfo` and cpufreq sysfs so the code paths that need them are covered too. `gcovr` converts the coverage, and the scan uploads both (settings in [`sonar-project.properties`](sonar-project.properties)). Needs the `SONAR_TOKEN` secret and Automatic Analysis disabled in SonarQube Cloud.
 
-When adding an option, add its valid and invalid forms to `smoke_test.sh`. When adding a kernel that must keep a branch, add it to `check_kernels.sh`.
+The SonarQube Cloud quality gate requires at least 80% coverage on new code. Paths reachable only with perf counters or sysfs are covered through the shim, which can also be run locally:
+```sh
+gcc -std=c99 -O0 --coverage -fno-tree-vectorize -fno-if-conversion -o branch_bench_cov branch_bench.c
+gcc -shared -fPIC -o fake_perf.so .github/scripts/fake_perf.c -ldl
+LD_PRELOAD=$PWD/fake_perf.so .github/scripts/smoke_test.sh ./branch_bench_cov
+gcov -b branch_bench_cov-branch_bench.gcda   # summary; per-line counts in branch_bench.c.gcov
+```
+
+When adding an option, add its valid and invalid forms to `smoke_test.sh`. When adding a kernel that must keep a branch, add it to `check_kernels.sh`. When code starts using a new perf event, `/proc` or sysfs file (e.g. new `/proc/cpuinfo` keys), extend `fake_perf.c` so the coverage job still reaches it.
 
 ---
 
