@@ -51,9 +51,18 @@ GCC is the reference compiler. Clang rejects `-fno-if-conversion` and has no equ
 - `./branch_bench -h` / `./branch_bench --help`: Displays usage information.
 
 ### Testing and Validation
-There is no dedicated test framework or linter in this repository. Validate changes by compiling with `gcc` using the required flags (plus `-Wall -Wextra -pedantic` to catch issues) and executing the binary. `clang --analyze -std=c99 branch_bench.c` should report no warnings; it finds the same kind of path-based bugs (uninitialized values, out-of-bounds reads) that SonarQube Cloud reports. Test 4 includes a built-in runtime sanity check verifying that branch and branchless implementations compute identical sums.
+There is no dedicated test framework or linter in this repository. Validate changes by compiling with `gcc` using the required flags (plus `-Wall -Wextra -pedantic` to catch issues) and executing the binary. `clang --analyze -std=c99 branch_bench.c` should report no warnings; it finds the same kind of path-based bugs (uninitialized values, out-of-bounds reads) that SonarQube Cloud reports. Test 4 includes a built-in runtime sanity check verifying that branch and branchless implementations compute identical sums; on a mismatch it prints an error and the program exits with status 1.
 
 Changes anywhere in the file can move the kernels to new addresses, which can change timings even when their code is untouched. After a change, compare the kernels' disassembly with the previous build. Also check that no jump in a kernel's hot loop crosses or ends on a 32-byte boundary: Intel's JCC-erratum microcode slows such jumps on Skylake-derived CPUs, including the i5-8350U in RESULTS.md.
+
+### Continuous Integration
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on pushes to `main` and on pull requests. Hosted runners are VMs, usually without hardware perf counters, so CI checks correctness and codegen only, not timings.
+- **gcc** (x86-64 and arm64): builds with the required flags plus `-Wall -Wextra -pedantic -Werror`, compiles the non-perf path (`-U__linux__`), runs `--size 64K --reps 2`, and runs [`.github/scripts/check_kernels.sh`](.github/scripts/check_kernels.sh), which fails if the Test 1–3 kernels contain a conditional move/select or SIMD registers, or lose their conditional branch or indirect call. Run it locally with `.github/scripts/check_kernels.sh ./branch_bench`.
+- **clang**: builds with the Clang flags and `-Werror`, runs the small size, and runs `clang --analyze` with `-analyzer-werror`. The kernel check is not run, because Clang emits `cmov` in `sum_threshold`.
+- **sanitizers**: GCC ASan+UBSan (x86-64 and arm64) and Clang MSan, each running [`.github/scripts/smoke_test.sh`](.github/scripts/smoke_test.sh), which exercises every option, the report file and invalid input. Sanitizer builds are for correctness only; never use them for results.
+- **sonarqube**: a `--coverage` build under SonarQube's Build Wrapper runs `smoke_test.sh`, `gcovr` converts the coverage, and the scan uploads both (settings in [`sonar-project.properties`](sonar-project.properties)). Needs the `SONAR_TOKEN` secret and Automatic Analysis disabled in SonarQube Cloud.
+
+When adding an option, add its valid and invalid forms to `smoke_test.sh`. When adding a kernel that must keep a branch, add it to `check_kernels.sh`.
 
 ---
 
@@ -128,12 +137,3 @@ The benchmark is developed and tested on x86-64 and ARM (Cortex-A72) Linux. Supp
 - **Memory footprint:** by default the tests allocate two 4 MiB buffers at a time; on small embedded boards use `--size` (and `--reps` to keep run times sensible).
 - **Interpretation:** README's interpretation section is written for deep out-of-order cores. In-order cores (common on MIPS) have much shorter misprediction penalties.
 - **Validation:** cross-compile (e.g. `mips-linux-gnu-gcc`) and run under `qemu-user` to check correctness and output format. Timings under emulation are meaningless; real hardware is required for results.
-
-### GitHub Actions CI
-Add a workflow that runs on every push and pull request:
-- Build with `gcc -std=c99 -Wall -Wextra -pedantic -Werror` using the required flags, and with Clang (see Compiler Support).
-- Run the binary with a reduced size (e.g. `--size 64K --reps 2`) so Test 4's sanity check executes; that check must fail the run (non-zero exit) on a mismatch, not just print a warning.
-- Check the disassembly of the Test 1–3 kernels for `cmov`. Whether real branches survive depends on the compiler version, and losing them silently invalidates results.
-- Optionally run the SonarQube Cloud analysis from the same workflow.
-
-Hosted runners are VMs, usually without hardware perf counters, so CI checks correctness and codegen only, not timings.

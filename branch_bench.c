@@ -788,6 +788,9 @@ static void run_test3(FILE *report)
  *
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+/* Set when Test 4's branch and branchless sums differ; main() then exits 1. */
+static int sanity_failed = 0;
+
 /* Branch version — kept as a branch by -fno-if-conversion build flag */
 __attribute__((noinline))
 static u64 sum_branch(const u8 *arr, size_t n, unsigned n_reps)
@@ -845,8 +848,10 @@ static void run_test4(FILE *report)
     /* verify both produce same result on the same data (sanity check) —
      * this comparison already reads all four .result fields, so unlike
      * tests 1-3 there's no separate anti-DCE sink needed here. */
-    if (r_sb.result != r_sl.result || r_rb.result != r_rl.result)
-        fprintf(stderr, "  WARNING: branch/branchless results differ!\n");
+    if (r_sb.result != r_sl.result || r_rb.result != r_rl.result) {
+        fprintf(stderr, "  ERROR: branch/branchless results differ!\n");
+        sanity_failed = 1;
+    }
 
     const Work work = { (u64)len * reps, "elem" };
     print_row("Sorted  + branch",     &r_sb, &work);
@@ -1111,5 +1116,5 @@ int main(int argc, char **argv)
 
     perf_close();
 
-    return 0;
+    return sanity_failed ? 1 : 0;
 }
