@@ -123,7 +123,7 @@ jobs:
 
       - name: Install Build Wrapper
         id: build-wrapper
-        uses: SonarSource/sonarqube-scan-action/install-build-wrapper@v8
+        uses: SonarSource/sonarqube-scan-action/install-build-wrapper@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0
 
       # Lets the perf code paths run if this VM exposes a PMU; harmless if not.
       - name: Allow perf counters
@@ -161,4 +161,4 @@ jobs:
       # Secrets are not passed to pull requests from forks.
       - name: SonarQube Cloud scan
         if: env.SONAR_TOKEN != ''
-        uses: SonarSource/sonarqube-scan-action@v8
+        uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0

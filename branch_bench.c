@@ -28,7 +28,7 @@
  *   ./branch_bench
  */
 
-/* Expose POSIX (clock_gettime, localtime_r) and syscall() under -std=c99. */
+/* Expose POSIX (clock_gettime, localtime_r, fdopen) and syscall() under -std=c99. */
 #define _DEFAULT_SOURCE
 
 #include <stdio.h>
@@ -37,10 +37,11 @@
 #include <string.h>
 #include <time.h>
 #include <inttypes.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 /* ── Linux perf_event support (optional) ────────────────────────────────── */
 #ifdef __linux__
-#  include <unistd.h>
 #  include <sys/syscall.h>
 #  ifdef __NR_perf_event_open
 #    include <linux/perf_event.h>
@@ -1090,8 +1091,11 @@ int main(int argc, char **argv)
 
     FILE *report = NULL;
     if (out_path) {
-        report = fopen(out_path, "w");
-        if (!report) { perror("fopen"); return 1; }
+        /* open() rather than fopen(), so the mode is explicit, not 0666. */
+        int fd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) { perror(out_path); return 1; }
+        report = fdopen(fd, "w");
+        if (!report) { perror("fdopen"); close(fd); return 1; }
     }
 
     perf_init();
