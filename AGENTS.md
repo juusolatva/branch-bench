@@ -13,7 +13,7 @@ It runs four self-contained tests comparing predictable versus unpredictable bra
 3. **Test 3 — Indirect Dispatch**: Sequential vs. random function pointer dispatch across 32 distinct leaf functions. Evaluates the history-based indirect branch predictor (a plain Branch Target Buffer alone cannot learn the 32-target cycle).
 4. **Test 4 — Branch vs. Branchless**: Computes identical threshold sums using conditional jumps vs. arithmetic bitmasks (`(u64)0 - (u64)(arr[i] > THRESHOLD)`), across both sorted and random datasets to isolate the pure misprediction cycle penalty.
 
-On Linux systems supporting `perf_event_open(2)`, the benchmark reads hardware performance counters (`PERF_COUNT_HW_BRANCH_INSTRUCTIONS`, `PERF_COUNT_HW_BRANCH_MISSES` and `PERF_COUNT_HW_CPU_CYCLES`) as one perf group, so all counts cover the same window. Any counter that fails to open is left out of the group, and the output shows "–" for it. From the cycle and miss counts, each test reports a **Cost per miss** (extra cycles ÷ extra misses between its predictable and unpredictable variant). When hardware counters are unavailable (e.g. non-Linux, locked down VMs/containers), it gracefully falls back to monotonic wall-clock timing (`now_ms()`). The wall-clock fallback uses POSIX `clock_gettime(CLOCK_MONOTONIC)`, so the benchmark needs a POSIX system; it does not build with MSVC.
+On Linux systems supporting `perf_event_open(2)`, the benchmark reads hardware performance counters (`PERF_COUNT_HW_BRANCH_INSTRUCTIONS`, `PERF_COUNT_HW_BRANCH_MISSES` and `PERF_COUNT_HW_CPU_CYCLES`) as one perf group, so all counts cover the same window. Any counter that fails to open is left out of the group; the console omits it and the Markdown report shows "–" for it. From the cycle and miss counts, each test reports a **Cost per miss** (extra cycles ÷ extra misses between its predictable and unpredictable variant; Test 4 uses its two branch variants). It is skipped when either counter is missing, or when the unpredictable variant adds fewer than 1000 misses or no cycles. When hardware counters are unavailable (e.g. non-Linux, locked down VMs/containers), it gracefully falls back to monotonic wall-clock timing (`now_ms()`). The wall-clock fallback uses POSIX `clock_gettime(CLOCK_MONOTONIC)`, so the benchmark needs a POSIX system; it does not build with MSVC.
 
 ---
 
@@ -21,52 +21,58 @@ On Linux systems supporting `perf_event_open(2)`, the benchmark reads hardware p
 
 ### Canonical Run Command
 ```sh
-./run.sh
+./run.sh            # options are passed on, e.g. ./run.sh -n 5 -o report.md
 ```
 
-The script compiles the code and immediately executes the benchmark:
+The script compiles the code and immediately executes the benchmark with its arguments. It stops if compilation fails (`set -e`), so a stale binary never runs:
 ```sh
 gcc -std=c99 -O2 -fno-tree-vectorize -fno-if-conversion -o branch_bench branch_bench.c
-./branch_bench
+exec ./branch_bench "$@"
 ```
+
+On Windows, build and run inside WSL2. [`.gitattributes`](.gitattributes) keeps the `.sh` scripts LF in every checkout, so they run there.
 
 ### Critical Compiler Flags
 Both optimization flags are strictly load-bearing:
 - `-fno-tree-vectorize`: Prevents the compiler from vectorizing loops with SIMD instructions, which would eliminate branches altogether.
-- `-fno-if-conversion`: Prevents the compiler from converting `if`/`else` control flow into conditional move (`cmov`) instructions. Real branch instructions are required for Tests 1–3 to trigger branch prediction logic.
+- `-fno-if-conversion`: Prevents the compiler from converting `if`/`else` control flow into conditional move (`cmov`) instructions. Real branch instructions are required for Tests 1–3 and Test 4's branch variant to trigger branch prediction logic.
 
-`-std=c99` enforces the C99 requirement at build time. POSIX and Linux APIs (`clock_gettime`, `syscall`, `localtime_r`) are exposed by the `#define _DEFAULT_SOURCE` at the top of `branch_bench.c`, which must stay before the first `#include`. Do not replace it with `_POSIX_C_SOURCE`: that hides `syscall()` and breaks the build.
+`-std=c99` enforces the C99 requirement at build time. POSIX and Linux APIs (`clock_gettime`, `localtime_r`, `fdopen`, `syscall`) are exposed by the `#define _DEFAULT_SOURCE` at the top of `branch_bench.c`, which must stay before the first `#include`. Do not replace it with `_POSIX_C_SOURCE`: that hides `syscall()` and breaks the build.
 
 ### Compiler Support
-GCC is the reference compiler. Clang rejects `-fno-if-conversion` and has no equivalent flag; it builds with `clang -std=c99 -O2 -fno-vectorize -fno-slp-vectorize`, but may still emit `cmov` for Tests 1–3, so verify the disassembly (`objdump -d`) before trusting Clang results.
+GCC is the reference compiler. Clang rejects `-fno-if-conversion` and has no equivalent flag; it builds with `clang -std=c99 -O2 -fno-vectorize -fno-slp-vectorize`, but (as of Clang 18–21) makes Tests 1, 2 and Test 4's branch variant branchless: `cmov` in `sum_threshold`/`sum_branch` and `sbb` arithmetic in `count_decisions`. Clang timings for those tests do not show the misprediction cost. When checking any build's disassembly (`objdump -d`), look for a conditional jump on the data inside the inner loop, not just for the absence of `cmov`.
 
 ### CLI Options
 - `./branch_bench`: Runs all four benchmarks and outputs results to stdout.
-- `./branch_bench -o <file.md>` / `./branch_bench --output <file.md>`: Generates a structured Markdown report matching the format used in [`RESULTS.md`](RESULTS.md) alongside the stdout stream. Its heading is the CPU model with the highest `cpuinfo_max_freq` from cpufreq sysfs (`@ 3.60 GHz`, replacing any base clock in the model name; left as-is where sysfs has no clock information, e.g. WSL2). When the cycle counter works, the console and report end with the **average clock during measurements** (total cycles ÷ total time over all measured trials, warm-ups excluded).
-- `./branch_bench -n <N>` / `./branch_bench --trials <N>`: Measures each variant N times (1–99) after one untimed warm-up run and reports the trial with the median time, plus the fastest–slowest range (console, and a Range column in the report). The default is a single measurement with no warm-up, and its output format is unchanged.
+- `./branch_bench -o <file.md>` / `./branch_bench --output <file.md>`: Generates a structured Markdown report matching the format used in [`RESULTS.md`](RESULTS.md) alongside the stdout stream. Its heading is the CPU model with the highest `cpuinfo_max_freq` from cpufreq sysfs (`@ 3.60 GHz`, replacing any base clock in the model name; left as-is where sysfs has no clock information, e.g. WSL2). When the cycle counter works, the console and report end with the **average clock during measurements** (total cycles ÷ total time over all measured trials, warm-ups excluded). An existing file is overwritten (a new one is created owner-only, mode 0600), so never pass `RESULTS.md`: write a separate file and paste its `## <CPU>` section into RESULTS.md by hand.
+- `./branch_bench -n <N>` / `./branch_bench --trials <N>`: Measures each variant N times (1–99) and reports the trial with the median time. N > 1 adds one untimed warm-up run and the fastest–slowest range (console, and a Range column in the report). The default (`-n 1`) is a single measurement with no warm-up, and its output format is unchanged.
 - `./branch_bench -t <N>` / `./branch_bench --test <N>`: Runs only test N (1–4); repeat the option to run several. The banner and report note which tests ran.
-- `./branch_bench --size <N>`: Elements per array for Tests 1/2/4 and calls per trial for Test 3 (default 4M = 4194304, max 1024M; `K`/`M` suffixes are powers of 1024).
+- `./branch_bench --size <N>`: Elements per array for Tests 1/2/4 and calls per trial for Test 3 (default 4M = 4194304, max 1024M; `K`/`M` suffixes, case-insensitive, are powers of 1024).
 - `./branch_bench --reps <N>`: Passes over the array per trial for Tests 1/2/4 (default 64, max 100000).
-- Non-default sizes are visible in the banner, test headings and report header table. Results are only comparable with RESULTS.md at the defaults.
+- Non-default sizes are visible in the banner, test headings and report header table. Results are only comparable with RESULTS.md at the defaults (`--size 4M --reps 64`).
 - `./branch_bench -h` / `./branch_bench --help`: Displays usage information.
 
 ### Testing and Validation
-There is no dedicated test framework or linter in this repository. Validate changes by compiling with `gcc` using the required flags (plus `-Wall -Wextra -pedantic` to catch issues) and executing the binary. `clang --analyze -std=c99 branch_bench.c` should report no warnings; it finds the same kind of path-based bugs (uninitialized values, out-of-bounds reads) that SonarQube Cloud reports. SonarQube also flags implicit integer-to-`double` conversions (rule S5276), so write them as explicit `(double)` casts; they compile to the same code. Test 4 includes a built-in runtime sanity check verifying that branch and branchless implementations compute identical sums; on a mismatch it prints an error and the program exits with status 1.
+There is no dedicated test framework or linter in this repository. Validate changes by compiling with `gcc` using the required flags (plus `-Wall -Wextra -pedantic` to catch issues) and executing the binary. `clang --analyze -std=c99 -Xclang -analyzer-werror <repo>/branch_bench.c` should report no warnings; run it from a scratch directory, because it writes a `.plist` into the current one. It finds the same kind of path-based bugs (uninitialized values, out-of-bounds reads) that SonarQube Cloud reports. SonarQube also flags implicit casts that can lower precision (rule S5276), such as `u64`/`size_t` to `double`, so write every integer-to-`double` conversion as an explicit `(double)` cast; they compile to the same code. Test 4 includes a built-in runtime sanity check verifying that branch and branchless implementations compute identical sums; on a mismatch it prints an error and the program exits with status 1.
 
 Changes anywhere in the file can move the kernels to new addresses, which can change timings even when their code is untouched. After a change, compare the kernels' disassembly with the previous build. Also check that no jump in a kernel's hot loop crosses or ends on a 32-byte boundary: Intel's JCC-erratum microcode slows such jumps on Skylake-derived CPUs, including the i5-8350U in RESULTS.md.
 
 ### Continuous Integration
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on pushes to `main` and on pull requests. Hosted runners are VMs, usually without hardware perf counters, so CI checks correctness and codegen only, not timings.
-- **gcc** (x86-64 and arm64): builds with the required flags plus `-Wall -Wextra -pedantic -Werror`, compiles the non-perf path (`-U__linux__`), runs `--size 64K --reps 2`, and runs [`.github/scripts/check_kernels.sh`](.github/scripts/check_kernels.sh), which fails if the Test 1–3 kernels contain a conditional move/select or SIMD registers, or lose their conditional branch or indirect call. Run it locally with `.github/scripts/check_kernels.sh ./branch_bench`.
-- **clang**: builds with the Clang flags and `-Werror`, runs the small size, and runs `clang --analyze` with `-analyzer-werror`. The kernel check is not run, because Clang emits `cmov` in `sum_threshold`.
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on pushes to `main`, on pull requests and on manual dispatch. Hosted runners are VMs, usually without hardware perf counters, so CI checks correctness and codegen only, not timings. They use Ubuntu 24.04's GCC 13 and Clang 18, so a codegen pass in CI says nothing about a newer local compiler. GitHub's CodeQL default setup also scans the code, outside this workflow. Actions are pinned to commit SHAs, and [`.github/dependabot.yml`](.github/dependabot.yml) opens a monthly pull request when they or the `gcovr` pin in [`.github/requirements.txt`](.github/requirements.txt) have new releases.
+- **gcc** (x86-64 and arm64): builds with the required flags plus `-Wall -Wextra -pedantic -Werror`, compiles the non-perf path (`-U__linux__`), runs `--size 64K --reps 2`, and runs [`.github/scripts/check_kernels.sh`](.github/scripts/check_kernels.sh). It fails if a Test 1–3 kernel (Test 1's is also Test 4's branch variant) contains a conditional move/select (`cmov`; `csel`/`cset` family on arm64), flag arithmetic (`setcc`/`sbb`/`adc`; `adc`/`sbc`/`ngc` on arm64) or SIMD registers, or has no conditional branch (Tests 1–2) or indirect call (Test 3). The loop back-edge alone satisfies the branch requirement, so a pass is necessary, not sufficient: a new branchless idiom could slip through. Still read the inner loop's disassembly after codegen-relevant changes. x86-64 and aarch64 only. Run it locally with `.github/scripts/check_kernels.sh ./branch_bench`.
+- **clang**: builds with the Clang flags and `-Werror`, runs the small size, runs `check_kernels.sh` as an expected failure (the step fails unless it reports FAIL for both Test 1/4 and Test 2, which proves the check still detects lost branches), and runs `clang --analyze` with `-analyzer-werror`.
 - **sanitizers**: GCC ASan+UBSan (x86-64 and arm64) and Clang MSan, each running [`.github/scripts/smoke_test.sh`](.github/scripts/smoke_test.sh), which exercises every option, the report file and invalid input. Sanitizer builds are for correctness only; never use them for results.
-- **sonarqube**: a `--coverage` build under SonarQube's Build Wrapper runs `smoke_test.sh`, once as is and once with the [`.github/scripts/fake_perf.c`](.github/scripts/fake_perf.c) `LD_PRELOAD` shim, which fakes the perf counters (`FAKE_PERF_EVENTS` selects which ones open), `/proc/cpuinfo` and cpufreq sysfs so the code paths that need them are covered too. `gcovr` converts the coverage, and the scan uploads both (settings in [`sonar-project.properties`](sonar-project.properties)). Needs the `SONAR_TOKEN` secret and Automatic Analysis disabled in SonarQube Cloud.
+- **sonarqube**: a `--coverage` build under SonarQube's Build Wrapper runs `smoke_test.sh`, once as is and once with the [`.github/scripts/fake_perf.c`](.github/scripts/fake_perf.c) `LD_PRELOAD` shim, which fakes the perf counters (`FAKE_PERF_EVENTS`, a comma list of `branches`, `misses` and `cycles`, selects which ones open; default all three), `/proc/cpuinfo` and cpufreq sysfs so the code paths that need them are covered too. Two more shim runs open only some counters (`misses`, then `branches,cycles`). `gcovr` converts the coverage, and the scan uploads both (settings in [`sonar-project.properties`](sonar-project.properties)). Needs the `SONAR_TOKEN` secret (passed only to the scan step; without it, e.g. on pull requests from forks, the scan is skipped with a notice) and Automatic Analysis disabled in SonarQube Cloud.
 
-The SonarQube Cloud quality gate requires at least 80% coverage on new code. Paths reachable only with perf counters or sysfs are covered through the shim, which can also be run locally:
+The SonarQube Cloud quality gate requires at least 80% coverage on new code, plus at most 3% duplicated lines and severity limits for new bugs, code smells, vulnerabilities and SCA (dependency) issues. The scan waits for the gate (`sonar.qualitygate.wait=true` in `sonar-project.properties`), so a failed gate fails the sonarqube job. No `sonar.projectVersion` is set, so the new-code period never advances and "new code" covers everything since the first analysis. Paths reachable only with perf counters or sysfs are covered through the shim. To reproduce CI's coverage locally:
 ```sh
 gcc -std=c99 -O0 --coverage -fno-tree-vectorize -fno-if-conversion -o branch_bench_cov branch_bench.c
 gcc -shared -fPIC -o fake_perf.so .github/scripts/fake_perf.c -ldl
-LD_PRELOAD=$PWD/fake_perf.so .github/scripts/smoke_test.sh ./branch_bench_cov
+.github/scripts/smoke_test.sh ./branch_bench_cov                                 # no counters in a VM (CI)
+LD_PRELOAD=$PWD/fake_perf.so .github/scripts/smoke_test.sh ./branch_bench_cov   # all counters faked
+for ev in misses branches,cycles; do                                            # some counters
+    FAKE_PERF_EVENTS=$ev LD_PRELOAD=$PWD/fake_perf.so ./branch_bench_cov -t 1 --size 64K --reps 2 -o /tmp/part.md
+done
 gcov -b branch_bench_cov-branch_bench.gcda   # summary; per-line counts in branch_bench.c.gcov
 ```
 
@@ -77,7 +83,7 @@ When adding an option, add its valid and invalid forms to `smoke_test.sh`. When 
 ## Code Architecture and Implementation Conventions
 
 ### 1. Function Inlining Prevention
-All benchmark kernels (such as `sum_threshold`, `count_decisions`, `dispatch_sequential`, `dispatch_random`, `sum_branch`, and `sum_branchless`) must be annotated with `__attribute__((noinline))`. This guarantees that the compiler will not inline hot loops into caller functions or optimize across call boundaries.
+All benchmark kernels (such as `sum_threshold`, `count_decisions`, `dispatch_sequential`, `dispatch_random`, `sum_branch`, and `sum_branchless`) must be annotated with `__attribute__((noinline))`. This keeps the compiler from inlining hot loops into their callers. It does not stop other interprocedural optimizations, such as identical code folding (see section 5) or `.constprop` clones, so check the disassembly.
 
 ### 2. Dead Code Elimination (DCE) Prevention
 Because benchmark loops compute values without external side effects during timing, the compiler could eliminate the loop entirely.
@@ -105,7 +111,7 @@ GCC *does* fold `sum_branch` into `sum_threshold`, because their bodies are iden
 - Do **not** nest `perf_start()` or `perf_stop()` inside the `now_ms()` timing window; doing so introduces system call overhead into the wall-clock measurements.
 - `MEASURE` is a macro, not a function, on purpose: the kernel must be called directly (not through a function pointer) so its codegen stays unchanged.
 - Guard access to each counter field with `perf_has(CTR_BRANCHES)`, `perf_has(CTR_MISSES)` or `perf_has(CTR_CYCLES)`; any of them can be missing independently (`print_row()`, `report_table()` and `print_miss_cost()` already do).
-- New counters go into the same group via `perf_add()` in `perf_init()`, plus a matching `Result` field and `CTR_*` slot.
+- New counters go into the same group. Each needs a `CTR_*` slot before `CTR_COUNT`, one more `-1` in the `perf_fd` initializer (a compile-time check fails the build when its length differs from `CTR_COUNT`), a `perf_add()` call in `perf_init()`, a `Result` field and its pointer in `perf_stop()`'s `dst[]`, a column in `report_table()` (header, `counts[]`, `order[]` and the `k < 3` loop bound) and in `print_row()`, and support in `fake_perf.c` (`event_allowed()` and `FAKE_PERF_EVENTS`).
 
 ### 7. Formatted Report Emission
 Each test function receives `FILE *report` (which will be `NULL` if `-o` was not specified). Any new test should:
@@ -115,6 +121,8 @@ Each test function receives `FILE *report` (which will be `NULL` if `-o` was not
 - print its summary lines (e.g. `→ Slowdown:` and `**Slowdown:**`), then `print_miss_cost(report, &predictable, &unpredictable)` for the cost-per-miss line.
 
 This keeps console and Markdown output consistent. Console labels may carry extra padding for alignment; report labels should not.
+
+To wire up a new test, bump `NUM_TESTS`, add `if (test_selected(N)) run_testN(report);` in `main()`, add N to `smoke_test.sh`'s `for t in 1 2 3 4` report loop and change its `expect 1 -t 5` invalid case to the new out-of-range number, and add its kernel to `check_kernels.sh` if it must keep a branch.
 
 ---
 
@@ -128,8 +136,8 @@ This keeps console and Markdown output consistent. Console labels may carry extr
 ## TODO
 
 ### Measurement quality
-- **Verify the ARM raw-event fallback on hardware:** `perf_add()` falls back to raw events `0x12` (`BR_PRED`), `0x10` (`BR_MIS_PRED`) and `0x11` (`CPU_CYCLES`) when the generic events fail. Misses previously used `0x21` (`BR_RETIRED`, which counts all retired branches); the fix has only been checked by preprocessing for aarch64 (no ARM toolchain was available), not compiled or run. Test it on a Raspberry Pi 4 and a Cudy WR3000S (Cortex-A53, OpenWrt). On OpenWrt, check that the kernel has `CONFIG_PERF_EVENTS` enabled, and expect "Unknown CPU" because arm64 `/proc/cpuinfo` has no model line there.
-  - **Raspberry Pi 4 (Cortex-A72):** done; RESULTS.md has a run with all three counters. Misses look correct (0.500 per element for Test 1 shuffled), but the unpredictable variants count more branches than the predictable ones (646M vs 537M in Test 1), which suggests the speculative `BR_PRED` raw event was used, i.e. the generic branch event failed and the fallback ran. Confirm which path ran with `strace -e perf_event_open ./branch_bench -t 1 --size 64K --reps 1` (`PERF_TYPE_RAW` with config `0x12` means the fallback).
+- **Verify the ARM raw-event fallback on hardware:** `perf_add()` falls back to raw events `0x12` (`BR_PRED`), `0x10` (`BR_MIS_PRED`) and `0x11` (`CPU_CYCLES`) when the generic events fail. Misses previously used `0x21` (`BR_RETIRED`, which counts all retired branches); the fix has been built and run on a Raspberry Pi 4 and is compiled on CI's arm64 runner (which has no PMU, so the fallback is tried there but never succeeds). Still open: confirm which path ran on the Pi, and test on a Cudy WR3000S (Cortex-A53, OpenWrt). On OpenWrt, check that the kernel has `CONFIG_PERF_EVENTS` enabled, and expect "Unknown CPU" because arm64 `/proc/cpuinfo` has no model line there.
+  - **Raspberry Pi 4 (Cortex-A72):** run done, path not yet confirmed; RESULTS.md has a run with all three counters. Misses look correct (0.500 per element for Test 1 shuffled), but the unpredictable variants count more branches than the predictable ones (646M vs 537M in Test 1), which suggests the speculative `BR_PRED` raw event was used, i.e. the generic branch event failed and the fallback ran. Confirm which path ran with `strace -e perf_event_open ./branch_bench -t 1 --size 64K --reps 1` (`PERF_TYPE_RAW` with config `0x12` means the fallback).
   - **Cudy WR3000S (Cortex-A53):** not run yet.
 
 ---
@@ -140,7 +148,7 @@ This keeps console and Markdown output consistent. Console labels may carry extr
 The benchmark is developed and tested on x86-64 and ARM (Cortex-A72) Linux. Supporting other architectures is a long-term goal; known gaps:
 - **CPU model detection:** `get_cpu_model()` only recognizes the x86 `model name` and ARM `Model`/`Hardware` keys in `/proc/cpuinfo`. MIPS uses `cpu model` (plus `system type`), PowerPC uses `cpu`, and RISC-V often has only `isa`/`uarch`, so these currently report "Unknown CPU".
 - **Perf counters:** generic `PERF_COUNT_HW_*` events (branches, misses, cycles) are tried first everywhere, but raw-event fallbacks exist only for ARM. Many embedded MIPS cores have no PMU or no kernel PMU driver, so these fall back to wall-clock timing only.
-- **Branch codegen:** `-fno-if-conversion` must still leave real branches in Tests 1–3. Check the disassembly on each new architecture: MIPS has conditional moves (`movn`/`movz`, `seleqz`/`selnez` on R6) and RISC-V has `czero` (Zicond).
+- **Branch codegen:** `-fno-if-conversion` must still leave real branches in Tests 1–3 and Test 4's branch variant. Check the disassembly on each new architecture: MIPS has conditional moves (`movn`/`movz`, `seleqz`/`selnez` on R6) and RISC-V has `czero` (Zicond).
 - **32-bit targets:** the `u64` accumulators and Test 3 leaf arithmetic become multi-instruction sequences on 32-bit cores (e.g. MIPS32), which changes the per-iteration work and makes timings incomparable with 64-bit results.
 - **Memory footprint:** by default the tests allocate two 4 MiB buffers at a time; on small embedded boards use `--size` (and `--reps` to keep run times sensible).
 - **Interpretation:** README's interpretation section is written for deep out-of-order cores. In-order cores (common on MIPS) have much shorter misprediction penalties.

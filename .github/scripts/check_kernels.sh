@@ -1,9 +1,14 @@
 #!/bin/sh
 # Checks that the Test 1-3 kernels in a GCC build still contain the code the
-# benchmark measures: a real conditional branch (no conditional move/select,
-# no SIMD) in Tests 1-2, an indirect call in Test 3.  Whether these survive
-# depends on the compiler version, and losing them silently invalidates
-# results.  x86-64 and aarch64 only.
+# benchmark measures: a real conditional branch in Tests 1-2 (no conditional
+# move/select, no flag arithmetic such as setcc/sbb/adc, no SIMD), an
+# indirect call in Test 3.  Whether these survive depends on the compiler
+# version, and losing them silently invalidates results.  x86-64 and aarch64
+# only.
+#
+# The loop back-edge alone satisfies the conditional-branch requirement, so
+# the check relies on rejecting every known branchless form.  A pass is
+# necessary, not sufficient: a new branchless idiom could still slip through.
 #
 # Usage: check_kernels.sh <binary>
 # ARCH and OBJDUMP override the host architecture and objdump, e.g. for a
@@ -16,13 +21,13 @@ objdump=${OBJDUMP:-objdump}
 
 case $arch in
     x86_64)
-        cond_move='cmov[a-z]*[[:space:]]'
+        branchless='(cmov[a-z]*|set[a-z]+|sbb[a-z]?|adc[a-z]?)[[:space:]]'
         cond_branch='j(a|ae|b|be|c|e|g|ge|l|le|na|nae|nb|nbe|nc|ne|ng|nge|nl|nle|no|np|ns|nz|o|p|pe|po|s|z)[[:space:]]'
         indirect_call='call[[:space:]]+\*'
         simd='%[xyz]mm[0-9]+'
         ;;
     aarch64)
-        cond_move='(csel|csinc|csinv|csneg|cset|csetm|cinc|cinv|cneg)[[:space:]]'
+        branchless='(csel|csinc|csinv|csneg|cset|csetm|cinc|cinv|cneg|adcs?|sbcs?|ngcs?)[[:space:]]'
         cond_branch='(b\.[a-z]+|cbz|cbnz|tbz|tbnz)[[:space:]]'
         indirect_call='blr[[:space:]]'
         simd='[vq][0-9]+'
@@ -53,8 +58,8 @@ check() {
     if [ -z "$insns" ]; then
         echo "FAIL $1: function not found"; fail=1; return 0
     fi
-    if printf '%s\n' "$insns" | grep -Eq "^$cond_move"; then
-        echo "FAIL $1: conditional move/select found"; bad=1
+    if printf '%s\n' "$insns" | grep -Eq "^$branchless"; then
+        echo "FAIL $1: branchless instruction found (conditional move/select or flag arithmetic)"; bad=1
     fi
     if printf '%s\n' "$insns" | grep -Eq "$simd"; then
         echo "FAIL $1: SIMD registers used"; bad=1

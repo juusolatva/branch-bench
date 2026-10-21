@@ -1,0 +1,21 @@
+# Opens a monthly pull request per ecosystem when something pinned for CI
+# has a new release: the actions in .github/workflows/ (it updates both the
+# commit SHA and its "# vX.Y.Z" comment) and the Python tools in
+# .github/requirements.txt.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: pip
+    directory: /.github
+    schedule:
+      interval: monthly
+    groups:
+      python:
+        patterns: ["*"]

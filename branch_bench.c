@@ -10,7 +10,8 @@
  *  Test 4 — Branch vs Branchless sorted/random × branch/arithmetic    (misprediction cost isolation)
  *
  * On Linux, hardware counters are read via perf_event_open(2) when the kernel
- * allows it (most KVM guests support this).  Falls back to wall-clock timing
+ * allows it (in a VM only if the hypervisor exposes a virtual PMU, which
+ * many cloud VPSes don't).  Falls back to wall-clock timing
  * automatically, which is meaningful everywhere including containers and VMs.
  *
  * Build:
@@ -18,11 +19,13 @@
  *
  * Note: -fno-tree-vectorize prevents SIMD rewriting that would bypass branches.
  *       -fno-if-conversion keeps if-else as actual branch instructions (not CMOV),
- *       which is required for tests 1-3 to show misprediction cost.
+ *       which is required for tests 1-3 and Test 4's branch variant to show
+ *       misprediction cost.
  *       Test 4's branchless variant uses arithmetic masks — unaffected by these flags.
  *       clang rejects -fno-if-conversion and has no equivalent; it builds with
- *       -fno-vectorize -fno-slp-vectorize instead, but may emit CMOV for
- *       tests 1-3, so check the disassembly before trusting clang results.
+ *       -fno-vectorize -fno-slp-vectorize instead, but (as of clang 18-21)
+ *       makes Tests 1, 2 and 4's branch variant branchless (CMOV, SBB), so
+ *       clang timings don't show the misprediction cost.
  *
  * Run:
  *   ./branch_bench
@@ -118,7 +121,10 @@ enum { CTR_BRANCHES, CTR_MISSES, CTR_CYCLES, CTR_COUNT };
 /* All counters are opened as one perf group so the kernel schedules them
  * together and they cover exactly the same window.  The first counter that
  * opens becomes the group leader; one that fails to open is left out. */
-static int perf_fd[CTR_COUNT]   = { -1, -1, -1 };
+static int perf_fd[]            = { -1, -1, -1 };
+/* One -1 per CTR_* slot: a slot left out would start as fd 0 and count as
+ * open.  Fails to compile when the initializer and CTR_COUNT disagree. */
+typedef char perf_fd_init_check[sizeof perf_fd / sizeof perf_fd[0] == CTR_COUNT ? 1 : -1];
 static int perf_slot[CTR_COUNT];      /* position in the group read buffer */
 static int perf_leader          = -1;
 static int perf_members         = 0;

@@ -1,0 +1,4 @@
+* text=auto
+# Shell scripts keep LF endings in every checkout, so a Windows clone still
+# runs under WSL (a CRLF "set -eu" or shebang line fails there).
+*.sh text eol=lf
