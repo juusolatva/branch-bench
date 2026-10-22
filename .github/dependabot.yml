@@ -1,13 +1,19 @@
 # Opens a monthly pull request per ecosystem when something pinned for CI
 # has a new release: the actions in .github/workflows/ (it updates both the
-# commit SHA and its "# vX.Y.Z" comment) and the Python tools in
-# .github/requirements.txt.
+# commit SHA and its "# vX.Y.Z" comment) and the Python packages locked in
+# .github/requirements.txt (gcovr and its dependencies; it reruns
+# pip-compile on requirements.in, so the hashes are updated too).
+# The cooldown skips releases younger than 7 days, giving a broken or
+# compromised release time to be noticed and pulled first. It does not
+# delay security updates.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: monthly
+    cooldown:
+      default-days: 7
     groups:
       actions:
         patterns: ["*"]
@@ -16,6 +22,11 @@ updates:
     directory: /.github
     schedule:
       interval: monthly
+    cooldown:
+      default-days: 7
+    # Include gcovr's dependencies, not only the packages in requirements.in.
+    allow:
+      - dependency-type: all
     groups:
       python:
         patterns: ["*"]
