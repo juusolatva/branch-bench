@@ -1,0 +1,6 @@
+# Python tools for CI. requirements.txt pins these and all their
+# dependencies with hashes, and ci.yml installs from it. After editing this
+# file, regenerate it from this directory with:
+#   pip-compile --generate-hashes --output-file=requirements.txt requirements.in
+# Dependabot updates requirements.txt the same way.
+gcovr

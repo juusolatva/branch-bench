@@ -147,8 +147,13 @@ jobs:
           persist-credentials: false
           fetch-depth: 0  # full history for SonarQube's blame and new-code data
 
+      # requirements.txt pins gcovr and all its dependencies with hashes; pip
+      # rejects any package that is missing from it or has another hash.
       - name: Install gcovr
-        run: pipx install gcovr --pip-args="-c .github/requirements.txt"
+        run: |
+          python3 -m venv "$RUNNER_TEMP/gcovr"
+          "$RUNNER_TEMP/gcovr/bin/pip" install --require-hashes -r .github/requirements.txt
+          echo "$RUNNER_TEMP/gcovr/bin" >> "$GITHUB_PATH"
 
       - name: Install Build Wrapper
         id: build-wrapper
@@ -186,11 +191,17 @@ jobs:
             FAKE_PERF_EVENTS=$ev ./branch_bench_cov -t 1 $SMALL_RUN -o "$dir/part.md"
           done
 
+      # When no data matches the filter, gcovr writes an empty report and exits
+      # 0; the minimum (the quality gate's 80%) makes that fail here instead.
       - name: Coverage report
-        run: gcovr --root . --filter branch_bench.c --sonarqube coverage.xml --print-summary
+        run: >
+          gcovr --root . --filter 'branch_bench\.c$'
+          --sonarqube coverage.xml --print-summary --fail-under-line 80
 
-      # Secrets are not passed to pull requests from forks. The scan waits for
-      # the quality gate and fails the job if it fails (sonar-project.properties).
+      # Pull requests from forks get no secrets, and Dependabot's pull requests
+      # get only Dependabot secrets, so SONAR_TOKEN must be both an Actions and
+      # a Dependabot secret. The scan waits for the quality gate and fails the
+      # job if it fails (sonar-project.properties).
       - name: SonarQube Cloud scan
         if: env.HAS_SONAR_TOKEN == 'true'
         uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0
@@ -199,4 +210,4 @@ jobs:
 
       - name: Note skipped SonarQube Cloud scan
         if: env.HAS_SONAR_TOKEN != 'true'
-        run: echo "::notice::SonarQube Cloud scan skipped (no SONAR_TOKEN, e.g. a pull request from a fork)"
+        run: echo "::notice::SonarQube Cloud scan skipped (no SONAR_TOKEN, e.g. a pull request from a fork, or from Dependabot without the Dependabot secret)"
