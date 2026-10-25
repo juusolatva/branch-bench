@@ -12,4 +12,4 @@ No test framework, linter or formatter exists. Verify with:
 8. CI parity: `smoke_test.sh` passes (normal build, and with the `fake_perf.c` shim when perf/cpuinfo/cpufreq code changed); `check_kernels.sh` passes (necessary, not sufficient: still do step 5); new options are added to `smoke_test.sh`; a new branch-keeping kernel is added to `check_kernels.sh`; a new perf counter follows the checklist in `mem:conventions`. See `mem:suggested_commands`.
 9. Keep `AGENTS.md`, `README.md` and these memories in sync with behaviour changes.
 
-Don't commit unless the user asks.
+Commits are allowed; prefer opening a pull request on a branch over pushing directly to `main`.

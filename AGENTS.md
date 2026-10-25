@@ -130,7 +130,7 @@ To wire up a new test, bump `NUM_TESTS`, add `if (test_selected(N)) run_testN(re
 ---
 
 ## Git and Contribution Guidelines
-- Do not commit changes unless explicitly requested by the user.
+- Committing changes is allowed; prefer opening pull requests on a branch over pushing directly to `main`.
 - Keep the codebase self-contained within [`branch_bench.c`](branch_bench.c).
 - Maintain C99 compatibility (C99 language plus POSIX/Linux APIs, built with GCC) without unnecessary external dependencies. GNU extensions already in use, such as `__attribute__((noinline))`, are accepted.
 
