@@ -64,7 +64,11 @@ Changes anywhere in the file can move the kernels to new addresses, which can ch
 - **sanitizers**: GCC ASan+UBSan (x86-64 and arm64) and Clang MSan, each running [`.github/scripts/smoke_test.sh`](.github/scripts/smoke_test.sh), which exercises every option, the report file and invalid input. Sanitizer builds are for correctness only; never use them for results.
 - **sonarqube**: a `--coverage` build under SonarQube's Build Wrapper runs `smoke_test.sh`, once as is and once with the [`.github/scripts/fake_perf.c`](.github/scripts/fake_perf.c) `LD_PRELOAD` shim, which fakes the perf counters (`FAKE_PERF_EVENTS`, a comma list of `branches`, `misses` and `cycles`, selects which ones open; default all three), `/proc/cpuinfo` and cpufreq sysfs so the code paths that need them are covered too. Two more shim runs open only some counters (`misses`, then `branches,cycles`). `gcovr` converts the coverage and fails the job below 80% line coverage, which also catches an empty report (gcovr itself exits 0 when its filter matches nothing). The scan uploads both (settings in [`sonar-project.properties`](sonar-project.properties)). Needs `SONAR_TOKEN` as both an Actions secret and a Dependabot secret, because Dependabot's pull requests see only Dependabot secrets (the token is passed only to the scan step; without it, e.g. on pull requests from forks, the scan is skipped with a notice), and Automatic Analysis disabled in SonarQube Cloud.
 
-The SonarQube Cloud quality gate requires at least 80% coverage on new code, plus at most 3% duplicated lines and severity limits for new bugs, code smells, vulnerabilities and SCA (dependency) issues. The scan waits for the gate (`sonar.qualitygate.wait=true` in `sonar-project.properties`), so a failed gate fails the sonarqube job. No `sonar.projectVersion` is set, so the new-code period never advances and "new code" covers everything since the first analysis. Paths reachable only with perf counters or sysfs are covered through the shim. To reproduce CI's coverage locally:
+The SonarQube Cloud quality gate requires at least 80% coverage on new code, plus at most 3% duplicated lines and severity limits for new bugs, code smells, vulnerabilities and SCA (dependency) issues. The scan waits for the gate (`sonar.qualitygate.wait=true` in `sonar-project.properties`), so a failed gate fails the sonarqube job. No `sonar.projectVersion` is set, so the new-code period never advances and "new code" covers everything since the first analysis. Paths reachable only with perf counters or sysfs are covered through the shim.
+
+SonarQube's C taint analysis reports `csecurity:S5145` (logging injection, CWE-117) on the `printf`/`fprintf` calls in `report_table()` and `print_row()` that print `Result` fields. These are false positives: those calls print only numbers (`%.1f`, `PRIu64`) and string literals, which cannot inject text. The reported taint source is unreliable (it has pointed at the volatile store in `anti_dce_sink()` and at `Result r_sb = {0};`), and code workarounds did not help (`noinline` on the test functions, copying fields into locals, a write-only sink), so do not change code to silence them. Mark them False Positive in SonarQube Cloud, on the pull request and on `main`; an issue can come back as new when its line is edited. The taint analysis runs only in SonarQube Cloud (the local `sonar` CLI's deep analysis returns 403 Forbidden for this project), so each attempt costs a CI run. If the issues keep reappearing, ignore the rule for `branch_bench.c` via `sonar.issue.ignore.multicriteria` in `sonar-project.properties`, with a comment explaining why.
+
+To reproduce CI's coverage locally:
 ```sh
 gcc -std=c99 -O0 -g --coverage -fno-tree-vectorize -fno-if-conversion -o branch_bench_cov branch_bench.c
 gcc -shared -fPIC -o fake_perf.so .github/scripts/fake_perf.c -ldl
@@ -91,7 +95,7 @@ All benchmark kernels (such as `sum_threshold`, `count_decisions`, `dispatch_seq
 ### 2. Dead Code Elimination (DCE) Prevention
 Because benchmark loops compute values without external side effects during timing, the compiler could eliminate the loop entirely.
 - Always retain or consume the computed output.
-- Use `anti_dce_sink(u64 v)` (in [`branch_bench.c`](branch_bench.c)) on computed results, which forces the value into a `volatile u64` sink.
+- Use `anti_dce_sink(u64 v)` (in [`branch_bench.c`](branch_bench.c)) on computed results. It stores the value into a file-scope `volatile u64` that is never read back; the compiler cannot elide a volatile store, so the computation stays.
 - If a test performs an observable validation (such as Test 4's result comparison check), an additional `anti_dce_sink` call may be omitted.
 
 ### 3. Separation of Setup vs. Timed Execution
@@ -121,7 +125,9 @@ Each test function receives `FILE *report` (which will be `NULL` if `-o` was not
 - describe its work per trial once, as `const Work work = { count, "elem" }` (or `"call"`), which drives the misses-per-item column;
 - construct a `ReportRow` array (`{ label, result }`);
 - for standard 2-row (predictable vs. unpredictable) tests, call `emit_pair_summary(report, title, desc, rows, &work)`, which emits the console rows, the Markdown table, the slowdown ratio and the cost-per-miss line;
-- for multi-row tests (like Test 4), call `emit_rows(report, title, desc, rows, count, &work)`, `emit_ratio(report, console_prefix, md_label, num_ms, denom_ms, suffix)` for each comparison ratio, and `print_miss_cost(report, &predictable, &unpredictable)`.
+- for multi-row tests (like Test 4), call `emit_rows(report, title, desc, rows, count, &work)`, `emit_ratio(report, console_prefix, md_label, num_ms, denom_ms, suffix)` for each comparison ratio, and `print_miss_cost(report, &predictable, &unpredictable)`, then `printf("\n")` to end the test's console block (`emit_pair_summary` does this itself).
+
+Call these after all `MEASURE` calls. The console heading stays in `run_testN` before them, so progress shows while the kernels run.
 
 This keeps console and Markdown output consistent from a single `ReportRow` definition. Labels in `ReportRow` may carry extra internal spaces for console alignment; `report_table()` automatically collapses multi-space runs when writing Markdown.
 
