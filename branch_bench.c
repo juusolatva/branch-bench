@@ -174,6 +174,9 @@ static int      perf_slot[CTR_COUNT];   /* position in the group read buffer */
 static unsigned perf_open_mask = 0;     /* bit c set once counter c opened   */
 static int      perf_leader    = -1;
 static int      perf_members   = 0;
+static u64      perf_enabled_start;
+static u64      perf_running_start;
+static int      perf_started;
 
 static int perf_has(int ctr) { return (perf_open_mask >> ctr) & 1u; }
 
@@ -222,28 +225,50 @@ static void perf_close(void)
         if (perf_has(c)) close(perf_fd[c]);
 }
 
+/* Scheduling times are cumulative: PERF_EVENT_IOC_RESET resets counts only. */
+static int perf_read_group(u64 *buf)
+{
+    ssize_t want = (ssize_t)((3 + perf_members) * sizeof(u64));
+    return read(perf_leader, buf, (size_t)want) == want &&
+           buf[0] == (u64)perf_members;
+}
+
 static void perf_start(void)
 {
+    perf_started = 0;
     if (perf_leader < 0) return;
-    ioctl(perf_leader, PERF_EVENT_IOC_RESET,  PERF_IOC_FLAG_GROUP);
-    ioctl(perf_leader, PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP);
+    if (ioctl(perf_leader, PERF_EVENT_IOC_RESET, PERF_IOC_FLAG_GROUP) < 0)
+        return;
+    u64 buf[3 + CTR_COUNT];
+    if (!perf_read_group(buf)) return;
+    perf_enabled_start = buf[1];
+    perf_running_start = buf[2];
+    perf_started = ioctl(perf_leader, PERF_EVENT_IOC_ENABLE,
+                         PERF_IOC_FLAG_GROUP) == 0;
 }
 
 static void perf_stop(Result *r)
 {
     if (perf_leader < 0) return;
-    ioctl(perf_leader, PERF_EVENT_IOC_DISABLE, PERF_IOC_FLAG_GROUP);
+    int stopped = ioctl(perf_leader, PERF_EVENT_IOC_DISABLE,
+                        PERF_IOC_FLAG_GROUP) == 0;
+    int started = perf_started;
+    perf_started = 0;
+    if (!started || !stopped) return;
 
     /* nr, time_enabled, time_running, then one value per member */
     u64 buf[3 + CTR_COUNT];
-    ssize_t want = (ssize_t)((3 + perf_members) * sizeof(u64));
-    if (read(perf_leader, buf, sizeof(buf)) != want || buf[2] == 0)
-        return;                     /* no data, or group never scheduled */
+    if (!perf_read_group(buf) || buf[1] < perf_enabled_start ||
+        buf[2] < perf_running_start)
+        return;
+    u64 enabled = buf[1] - perf_enabled_start;
+    u64 running = buf[2] - perf_running_start;
+    if (!running || running > enabled) return;
 
     double scale = 1.0;
-    if (buf[2] < buf[1]) {          /* counters were time-shared */
+    if (running < enabled) {       /* counters were time-shared this trial */
         static int warned = 0;
-        scale = (double)buf[1] / (double)buf[2];
+        scale = (double)enabled / (double)running;
         if (!warned) {
             fprintf(stderr, "Note: perf counters were shared with other users; "
                             "counts are scaled estimates.\n");

@@ -45,8 +45,12 @@ static int      n_fake = 0;
 static int      leader = -1;
 static uint64_t config_of[MAX_FAKE];
 static uint64_t elapsed_ns = 0;     /* time enabled since the last reset */
+static uint64_t total_enabled_ns = 0;
+static uint64_t total_running_ns = 0;
+static uint64_t trial_running_ns = 0;
 static uint64_t enabled_at = 0;     /* 0 while disabled */
 static int      reads = 0;
+static int      sample_pending = 0;
 
 static uint64_t mono_ns(void)
 {
@@ -132,11 +136,19 @@ int ioctl(int fd, unsigned long request, ...)
     if (fd >= 0 && fd == leader) {
         if (request == PERF_EVENT_IOC_RESET) {
             elapsed_ns = 0;
+            trial_running_ns = 0;
             if (enabled_at) enabled_at = mono_ns();
         } else if (request == PERF_EVENT_IOC_ENABLE) {
             if (!enabled_at) enabled_at = mono_ns();
         } else if (request == PERF_EVENT_IOC_DISABLE) {
-            if (enabled_at) elapsed_ns += mono_ns() - enabled_at;
+            if (enabled_at) {
+                elapsed_ns += mono_ns() - enabled_at;
+                reads++;
+                trial_running_ns = reads == 1 ? 0 : reads == 2 ? elapsed_ns / 2 : elapsed_ns;
+                total_enabled_ns += elapsed_ns;
+                total_running_ns += trial_running_ns;
+                sample_pending = 1;
+            }
             enabled_at = 0;
         }
         return 0;
@@ -153,17 +165,16 @@ ssize_t read(int fd, void *buf, size_t count)
         /* nr, time_enabled, time_running, then one value per member */
         uint64_t v[3 + MAX_FAKE];
         size_t want = (size_t)(3 + n_fake) * sizeof(uint64_t);
-        uint64_t ns = elapsed_ns;
-        reads++;
         v[0] = (uint64_t)n_fake;
-        v[1] = ns;
-        v[2] = reads == 1 ? 0 : reads == 2 ? ns / 2 : ns;
+        v[1] = total_enabled_ns;
+        v[2] = total_running_ns;
         for (int i = 0; i < n_fake; i++) {
-            uint64_t ran = v[2];
+            uint64_t ran = trial_running_ns;
             const FakeEvent *ev = find_event(config_of[i]);
             v[3 + i] = ev ? (ran * ev->mul) / ev->div : 0;
         }
-        if (reads == 3) want -= sizeof(uint64_t);
+        if (sample_pending && reads == 3) want -= sizeof(uint64_t);
+        sample_pending = 0;
         if (want > count) want = count;
         memcpy(buf, v, want);
         return (ssize_t)want;

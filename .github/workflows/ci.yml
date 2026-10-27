@@ -50,6 +50,11 @@ jobs:
       - name: Run (small size)
         run: ./branch_bench $SMALL_RUN
 
+      - name: Perf regression tests (no PMU required)
+        run: |
+          gcc $BENCH_FLAGS $WARN_FLAGS -o "$RUNNER_TEMP/perf_test" .github/scripts/perf_test.c
+          "$RUNNER_TEMP/perf_test"
+
       - name: Check Test 1-3 kernels keep real branches
         run: .github/scripts/check_kernels.sh ./branch_bench
 
