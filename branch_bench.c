@@ -87,10 +87,8 @@ typedef struct {
 /* Forces the optimizer to treat v as observed, so the computation that
  * produced it can't be proven dead and elided. Use whenever a test's
  * results aren't already consumed by something with observable side
- * effects (e.g. a printed sanity check).
- * Write-only: a store to a volatile object can't be elided, and never
- * reading it back keeps taint analysis (SonarQube S5145) from treating the
- * read as outside input that flows into the printed results. */
+ * effects (e.g. a printed sanity check).  A store to a volatile object
+ * can't be elided, so writing v there is enough; it is never read back. */
 static volatile u64 anti_dce_value;
 
 static void anti_dce_sink(u64 v)
