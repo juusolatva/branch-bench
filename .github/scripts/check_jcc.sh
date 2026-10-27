@@ -7,13 +7,15 @@
 # this is a local check, not a CI one.  x86-64 only.
 #
 # Usage: check_jcc.sh <binary>
-# Prints one line per hit (function, address, instruction); exits 0 either way.
+# Prints one line per hit (function, address, instruction) and exits 0 with or
+# without hits; exits non-zero if objdump fails.
 # OBJDUMP overrides the objdump binary.
 set -eu
 
 bin=${1:?usage: check_jcc.sh <binary>}
 
-${OBJDUMP:-objdump} -dw "$bin" | awk -F'\t' '
+disassembly=$(${OBJDUMP:-objdump} -dw "$bin")
+printf '%s\n' "$disassembly" | awk -F'\t' '
     function hex(s,    i, n) {
         n = 0
         for (i = 1; i <= length(s); i++)
@@ -24,7 +26,7 @@ ${OBJDUMP:-objdump} -dw "$bin" | awk -F'\t' '
         fn = $0; sub(/^[0-9a-f]+ /, "", fn); sub(/:$/, "", fn)
         pop = ""; next
     }
-    fn ~ /^<(sum_threshold|sum_branch|count_decisions|dispatch_sequential|dispatch_random)>$/ && NF >= 3 {
+    fn ~ /^<(sum_threshold|sum_branch|sum_branchless|count_decisions|dispatch_sequential|dispatch_random)>$/ && NF >= 3 {
         addr = $1; gsub(/[ :]/, "", addr)
         s = hex(addr); e = s + split($2, bytes, " ")
         split($3, w, " "); op = w[1]
