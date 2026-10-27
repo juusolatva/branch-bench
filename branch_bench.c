@@ -93,6 +93,7 @@ typedef struct {
     double time_min_ms;    /* fastest/slowest trial; equal to time_ms */
     double time_max_ms;    /* when trials == 1                        */
     u64    counts[CTR_COUNT]; /* 0 for any counter not opened         */
+    int    counts_valid;   /* successful counter measurement for this trial */
     u64    result;         /* anti-dead-code-elimination sink         */
 } Result;
 
@@ -249,6 +250,7 @@ static void perf_start(void)
 
 static void perf_stop(Result *r)
 {
+    r->counts_valid = 0;
     if (perf_leader < 0) return;
     int stopped = ioctl(perf_leader, PERF_EVENT_IOC_DISABLE,
                         PERF_IOC_FLAG_GROUP) == 0;
@@ -278,6 +280,7 @@ static void perf_stop(Result *r)
     for (int c = 0; c < CTR_COUNT; c++)
         if (perf_has(c))
             r->counts[c] = (u64)((double)buf[3 + perf_slot[c]] * scale);
+    r->counts_valid = 1;
 }
 
 static int perf_available(void)  { return perf_leader >= 0; }
@@ -290,6 +293,12 @@ static void perf_stop(Result *r)  { (void)r; }
 static int  perf_available(void)  { return 0; }
 static int  perf_has(int ctr)     { (void)ctr; return 0; }
 #endif
+
+/* Opening a counter doesn't guarantee that a particular trial could read it. */
+static int result_has(const Result *r, int ctr)
+{
+    return r->counts_valid && perf_has(ctr);
+}
 
 /* Sorts trials by time and returns the median one (the lower of the two
  * middle trials when n is even), so every field of the returned row comes
@@ -320,7 +329,7 @@ static double clock_ms_sum     = 0;
 
 static void account_clock(const Result *r)
 {
-    if (!perf_has(CTR_CYCLES) || !r->counts[CTR_CYCLES]) return;
+    if (!result_has(r, CTR_CYCLES)) return;
     clock_cycles_sum += (double)r->counts[CTR_CYCLES];
     clock_ms_sum     += r->time_ms;
 }
@@ -523,16 +532,16 @@ static void report_table(FILE *f, const char *title, const char *desc,
             fprintf(f, " %.1f–%.1f |", r->time_min_ms, r->time_max_ms);
         for (int k = 0; k < CTR_COUNT; k++) {
             int c = counter_display_order[k];
-            if (perf_has(c))
+            if (result_has(r, c))
                 fprintf(f, " %" PRIu64 " |", r->counts[c]);
             else
                 fprintf(f, " – |");
         }
-        if (perf_has(CTR_BRANCHES) && perf_has(CTR_MISSES) && branches)
+        if (result_has(r, CTR_BRANCHES) && result_has(r, CTR_MISSES) && branches)
             fprintf(f, " %.1f%% |", 100.0 * (double)misses / (double)branches);
         else
             fprintf(f, " – |");
-        if (perf_has(CTR_MISSES))
+        if (result_has(r, CTR_MISSES))
             fprintf(f, " %.3f |\n", misses_per_item(r, w));
         else
             fprintf(f, " – |\n");
@@ -550,16 +559,18 @@ static void print_row(const char *label, const Result *r, const Work *w)
         printf(" (%7.1f–%7.1f)", r->time_min_ms, r->time_max_ms);
     for (int k = 0; k < CTR_COUNT; k++) {
         int c = counter_display_order[k];
-        if (!perf_has(c)) continue;
+        if (!result_has(r, c)) continue;
         const CounterDesc *d = &counter_descs[c];
         printf("  %s %*" PRIu64, d->console_label, d->console_width, r->counts[c]);
         if (c == CTR_MISSES) {
             printf("  (");
-            if (perf_has(CTR_BRANCHES) && branches)
+            if (result_has(r, CTR_BRANCHES) && branches)
                 printf("%.1f%%, ", 100.0 * (double)misses / (double)branches);
             printf("%.3f/%s)", misses_per_item(r, w), w->unit);
         }
     }
+    if (perf_available() && !r->counts_valid)
+        printf("  (hardware counts unavailable)");
     printf("\n");
 }
 
@@ -570,7 +581,9 @@ static void print_row(const char *label, const Result *r, const Work *w)
 static void print_miss_cost(FILE *report, const Result *predictable,
                             const Result *unpredictable)
 {
-    if (!perf_has(CTR_CYCLES) || !perf_has(CTR_MISSES)) return;
+    if (!result_has(predictable, CTR_CYCLES) || !result_has(predictable, CTR_MISSES) ||
+        !result_has(unpredictable, CTR_CYCLES) || !result_has(unpredictable, CTR_MISSES))
+        return;
     const u64 pred_misses   = predictable->counts[CTR_MISSES];
     const u64 unpred_misses = unpredictable->counts[CTR_MISSES];
     const u64 pred_cycles   = predictable->counts[CTR_CYCLES];
