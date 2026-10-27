@@ -93,6 +93,7 @@ typedef struct {
     double time_min_ms;    /* fastest/slowest trial; equal to time_ms */
     double time_max_ms;    /* when trials == 1                        */
     u64    counts[CTR_COUNT]; /* 0 for any counter not opened         */
+    int    counts_valid;   /* successful counter measurement for this trial */
     u64    result;         /* anti-dead-code-elimination sink         */
 } Result;
 
@@ -174,6 +175,9 @@ static int      perf_slot[CTR_COUNT];   /* position in the group read buffer */
 static unsigned perf_open_mask = 0;     /* bit c set once counter c opened   */
 static int      perf_leader    = -1;
 static int      perf_members   = 0;
+static u64      perf_enabled_start;
+static u64      perf_running_start;
+static int      perf_started;
 
 static int perf_has(int ctr) { return (perf_open_mask >> ctr) & 1u; }
 
@@ -222,28 +226,51 @@ static void perf_close(void)
         if (perf_has(c)) close(perf_fd[c]);
 }
 
+/* Scheduling times are cumulative: PERF_EVENT_IOC_RESET resets counts only. */
+static int perf_read_group(u64 *buf)
+{
+    ssize_t want = (ssize_t)((3 + perf_members) * sizeof(u64));
+    return read(perf_leader, buf, (size_t)want) == want &&
+           buf[0] == (u64)perf_members;
+}
+
 static void perf_start(void)
 {
+    perf_started = 0;
     if (perf_leader < 0) return;
-    ioctl(perf_leader, PERF_EVENT_IOC_RESET,  PERF_IOC_FLAG_GROUP);
-    ioctl(perf_leader, PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP);
+    if (ioctl(perf_leader, PERF_EVENT_IOC_RESET, PERF_IOC_FLAG_GROUP) < 0)
+        return;
+    u64 buf[3 + CTR_COUNT];
+    if (!perf_read_group(buf)) return;
+    perf_enabled_start = buf[1];
+    perf_running_start = buf[2];
+    perf_started = ioctl(perf_leader, PERF_EVENT_IOC_ENABLE,
+                         PERF_IOC_FLAG_GROUP) == 0;
 }
 
 static void perf_stop(Result *r)
 {
+    r->counts_valid = 0;
     if (perf_leader < 0) return;
-    ioctl(perf_leader, PERF_EVENT_IOC_DISABLE, PERF_IOC_FLAG_GROUP);
+    int stopped = ioctl(perf_leader, PERF_EVENT_IOC_DISABLE,
+                        PERF_IOC_FLAG_GROUP) == 0;
+    int started = perf_started;
+    perf_started = 0;
+    if (!started || !stopped) return;
 
     /* nr, time_enabled, time_running, then one value per member */
     u64 buf[3 + CTR_COUNT];
-    ssize_t want = (ssize_t)((3 + perf_members) * sizeof(u64));
-    if (read(perf_leader, buf, sizeof(buf)) != want || buf[2] == 0)
-        return;                     /* no data, or group never scheduled */
+    if (!perf_read_group(buf) || buf[1] < perf_enabled_start ||
+        buf[2] < perf_running_start)
+        return;
+    u64 enabled = buf[1] - perf_enabled_start;
+    u64 running = buf[2] - perf_running_start;
+    if (!running || running > enabled) return;
 
     double scale = 1.0;
-    if (buf[2] < buf[1]) {          /* counters were time-shared */
+    if (running < enabled) {       /* counters were time-shared this trial */
         static int warned = 0;
-        scale = (double)buf[1] / (double)buf[2];
+        scale = (double)enabled / (double)running;
         if (!warned) {
             fprintf(stderr, "Note: perf counters were shared with other users; "
                             "counts are scaled estimates.\n");
@@ -253,6 +280,7 @@ static void perf_stop(Result *r)
     for (int c = 0; c < CTR_COUNT; c++)
         if (perf_has(c))
             r->counts[c] = (u64)((double)buf[3 + perf_slot[c]] * scale);
+    r->counts_valid = 1;
 }
 
 static int perf_available(void)  { return perf_leader >= 0; }
@@ -265,6 +293,12 @@ static void perf_stop(Result *r)  { (void)r; }
 static int  perf_available(void)  { return 0; }
 static int  perf_has(int ctr)     { (void)ctr; return 0; }
 #endif
+
+/* Opening a counter doesn't guarantee that a particular trial could read it. */
+static int result_has(const Result *r, int ctr)
+{
+    return r->counts_valid && perf_has(ctr);
+}
 
 /* Sorts trials by time and returns the median one (the lower of the two
  * middle trials when n is even), so every field of the returned row comes
@@ -295,7 +329,7 @@ static double clock_ms_sum     = 0;
 
 static void account_clock(const Result *r)
 {
-    if (!perf_has(CTR_CYCLES) || !r->counts[CTR_CYCLES]) return;
+    if (!result_has(r, CTR_CYCLES)) return;
     clock_cycles_sum += (double)r->counts[CTR_CYCLES];
     clock_ms_sum     += r->time_ms;
 }
@@ -498,16 +532,16 @@ static void report_table(FILE *f, const char *title, const char *desc,
             fprintf(f, " %.1f–%.1f |", r->time_min_ms, r->time_max_ms);
         for (int k = 0; k < CTR_COUNT; k++) {
             int c = counter_display_order[k];
-            if (perf_has(c))
+            if (result_has(r, c))
                 fprintf(f, " %" PRIu64 " |", r->counts[c]);
             else
                 fprintf(f, " – |");
         }
-        if (perf_has(CTR_BRANCHES) && perf_has(CTR_MISSES) && branches)
+        if (result_has(r, CTR_BRANCHES) && result_has(r, CTR_MISSES) && branches)
             fprintf(f, " %.1f%% |", 100.0 * (double)misses / (double)branches);
         else
             fprintf(f, " – |");
-        if (perf_has(CTR_MISSES))
+        if (result_has(r, CTR_MISSES))
             fprintf(f, " %.3f |\n", misses_per_item(r, w));
         else
             fprintf(f, " – |\n");
@@ -525,16 +559,18 @@ static void print_row(const char *label, const Result *r, const Work *w)
         printf(" (%7.1f–%7.1f)", r->time_min_ms, r->time_max_ms);
     for (int k = 0; k < CTR_COUNT; k++) {
         int c = counter_display_order[k];
-        if (!perf_has(c)) continue;
+        if (!result_has(r, c)) continue;
         const CounterDesc *d = &counter_descs[c];
         printf("  %s %*" PRIu64, d->console_label, d->console_width, r->counts[c]);
         if (c == CTR_MISSES) {
             printf("  (");
-            if (perf_has(CTR_BRANCHES) && branches)
+            if (result_has(r, CTR_BRANCHES) && branches)
                 printf("%.1f%%, ", 100.0 * (double)misses / (double)branches);
             printf("%.3f/%s)", misses_per_item(r, w), w->unit);
         }
     }
+    if (perf_available() && !r->counts_valid)
+        printf("  (hardware counts unavailable)");
     printf("\n");
 }
 
@@ -545,7 +581,9 @@ static void print_row(const char *label, const Result *r, const Work *w)
 static void print_miss_cost(FILE *report, const Result *predictable,
                             const Result *unpredictable)
 {
-    if (!perf_has(CTR_CYCLES) || !perf_has(CTR_MISSES)) return;
+    if (!result_has(predictable, CTR_CYCLES) || !result_has(predictable, CTR_MISSES) ||
+        !result_has(unpredictable, CTR_CYCLES) || !result_has(unpredictable, CTR_MISSES))
+        return;
     const u64 pred_misses   = predictable->counts[CTR_MISSES];
     const u64 unpred_misses = unpredictable->counts[CTR_MISSES];
     const u64 pred_cycles   = predictable->counts[CTR_CYCLES];
@@ -1184,12 +1222,18 @@ int main(int argc, char **argv)
 
     printf("See README.md for how to interpret these results.\n");
 
+    int report_failed = 0;
     if (report) {
-        fclose(report);
-        printf("\nFormatted report written to %s\n", out_path);
+        /* A previous buffered write may have failed even if close succeeds. */
+        report_failed = ferror(report) != 0;
+        if (fclose(report) != 0) report_failed = 1;
+        if (report_failed)
+            fprintf(stderr, "Error writing report to %s\n", out_path);
+        else
+            printf("\nFormatted report written to %s\n", out_path);
     }
 
     perf_close();
 
-    return sanity_failed ? 1 : 0;
+    return sanity_failed || report_failed ? 1 : 0;
 }

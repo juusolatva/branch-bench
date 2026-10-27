@@ -56,4 +56,15 @@ expect 1 -o
 expect 1 -o "$dir/no/such/dir/report.md"
 expect 1 --bogus
 
+# /dev/full accepts open() but fails writes, including buffered close().
+if [ -c /dev/full ]; then
+    expect 1 -t 3 --size 1 --reps 1 -o /dev/full
+    if grep -q 'Formatted report written' "$dir/stdout"; then
+        echo "FAIL report write failure announced success"; fail=1
+    fi
+    if ! grep -q 'Error writing report' "$dir/stderr"; then
+        echo "FAIL report write failure lacks a diagnostic"; fail=1
+    fi
+fi
+
 exit "$fail"

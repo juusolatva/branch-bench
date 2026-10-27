@@ -22,6 +22,10 @@ The benchmark builds on Linux with GCC; on Windows, use WSL2. Other POSIX system
 
 Branch, miss and cycle counts need Linux hardware performance counters, which require `/proc/sys/kernel/perf_event_paranoid` to be 2 or lower. Check it with `cat /proc/sys/kernel/perf_event_paranoid`; distributions such as Debian and Ubuntu default to a higher value, and `sudo sysctl kernel.perf_event_paranoid=2` lowers it until the next reboot. Without counters, and in most VMs and containers, only times are shown: a VM has counters only if its hypervisor provides a virtual PMU (WSL2 can). A counter that cannot be opened is left out of the console output and shows as – in the report. If the kernel time-shares the counters with other users, a note says the counts are scaled estimates.
 
+If a trial's counter read fails or its group never gets scheduled, that
+trial still reports its wall-clock time. Its hardware counts show as –
+in the report and are excluded from the cost per miss and average clock.
+
 ## Saving results
 
 Console output is meant to be read as it scrolls by. To get a clean,
