@@ -113,17 +113,17 @@ GCC *does* fold `sum_branch` into `sum_threshold`, because their bodies are iden
 - The reported row is one real trial (the median by time, the lower middle one for even counts), never a per-field median, so time, cycles, branches and misses always belong together.
 - Do **not** nest `perf_start()` or `perf_stop()` inside the `now_ms()` timing window; doing so introduces system call overhead into the wall-clock measurements.
 - `MEASURE` is a macro, not a function, on purpose: the kernel must be called directly (not through a function pointer) so its codegen stays unchanged.
-- Guard access to each counter field with `perf_has(CTR_BRANCHES)`, `perf_has(CTR_MISSES)` or `perf_has(CTR_CYCLES)`; any of them can be missing independently (`print_row()`, `report_table()` and `print_miss_cost()` already do).
-- New counters go into the same group. Each needs a `CTR_*` slot before `CTR_COUNT`, one more `-1` in the `perf_fd` initializer (a compile-time check fails the build when its length differs from `CTR_COUNT`), a `perf_add()` call in `perf_init()`, a `Result` field and its pointer in `perf_stop()`'s `dst[]`, a column in `report_table()` (header, `counts[]`, `order[]` and the `k < 3` loop bound) and in `print_row()`, and support in `fake_perf.c` (`event_allowed()` and `FAKE_PERF_EVENTS`).
+- Guard access to each counter slot in `r.counts[]` with `perf_has(CTR_BRANCHES)`, `perf_has(CTR_MISSES)` or `perf_has(CTR_CYCLES)`; any of them can be missing independently (`print_row()`, `report_table()` and `print_miss_cost()` already do).
+- New counters go into the same group. Each needs a `CTR_*` slot before `CTR_COUNT`, an entry in `counter_descs[]` (generic code, ARM raw fallback, Markdown header, console label and width), its position in `counter_display_order[]`, and an entry in `fake_perf.c`'s `fake_events[]` table (and `FAKE_PERF_EVENTS`).
 
 ### 7. Formatted Report Emission
 Each test function receives `FILE *report` (which will be `NULL` if `-o` was not specified). Any new test should:
 - describe its work per trial once, as `const Work work = { count, "elem" }` (or `"call"`), which drives the misses-per-item column;
-- print each console row with `print_row(label, &result, &work)`;
-- construct a `ReportRow` array and call `report_table(report, title, desc, rows, count, &work)`;
-- print its summary lines (e.g. `→ Slowdown:` and `**Slowdown:**`), then `print_miss_cost(report, &predictable, &unpredictable)` for the cost-per-miss line.
+- construct a `ReportRow` array (`{ label, result }`);
+- for standard 2-row (predictable vs. unpredictable) tests, call `emit_pair_summary(report, title, desc, rows, &work)`, which emits the console rows, the Markdown table, the slowdown ratio and the cost-per-miss line;
+- for multi-row tests (like Test 4), call `emit_rows(report, title, desc, rows, count, &work)`, `emit_ratio(report, console_prefix, md_label, num_ms, denom_ms, suffix)` for each comparison ratio, and `print_miss_cost(report, &predictable, &unpredictable)`.
 
-This keeps console and Markdown output consistent. Console labels may carry extra padding for alignment; report labels should not.
+This keeps console and Markdown output consistent from a single `ReportRow` definition. Labels in `ReportRow` may carry extra internal spaces for console alignment; `report_table()` automatically collapses multi-space runs when writing Markdown.
 
 To wire up a new test, bump `NUM_TESTS`, add `if (test_selected(N)) run_testN(report);` in `main()`, add N to `smoke_test.sh`'s `for t in 1 2 3 4` report loop and change its `expect 1 -t 5` invalid case to the new out-of-range number, and add its kernel to `check_kernels.sh` if it must keep a branch.
 

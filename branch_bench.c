@@ -74,14 +74,14 @@ static unsigned tests_selected = 0;    /* -t/--test bitmask (bit n-1 = test n); 
 typedef uint64_t        u64;
 typedef unsigned char   u8;
 
+enum { CTR_BRANCHES, CTR_MISSES, CTR_CYCLES, CTR_COUNT };
+
 typedef struct {
     double time_ms;
     double time_min_ms;    /* fastest/slowest trial; equal to time_ms */
     double time_max_ms;    /* when trials == 1                        */
-    u64    branch_total;   /* 0 if perf unavailable   */
-    u64    branch_misses;
-    u64    cycles;         /* 0 if cycle counter unavailable */
-    u64    result;         /* anti-dead-code-elimination sink */
+    u64    counts[CTR_COUNT]; /* 0 for any counter not opened         */
+    u64    result;         /* anti-dead-code-elimination sink         */
 } Result;
 
 /* Forces the optimizer to treat v as observed, so the computation that
@@ -110,24 +110,48 @@ static double now_ms(void)
  * Call convention: perf_start() is called just *before* the now_ms() timer
  * starts, and perf_stop() just *after* it stops, so the ioctl/read syscalls
  * themselves are never counted in time_ms. This means the perf window is
- * very slightly wider than the timed window — branch_total/branch_misses
- * can include a handful of instructions time_ms doesn't. Negligible in
- * magnitude (a few syscalls' worth out of millions of branches), and
- * intentional: the alternative is syscall overhead leaking into time_ms.
+ * very slightly wider than the timed window — counts[CTR_BRANCHES] and
+ * counts[CTR_MISSES] can include a handful of instructions time_ms doesn't.
+ * Negligible in magnitude (a few syscalls' worth out of millions of
+ * branches), and intentional: the alternative is syscall overhead leaking
+ * into time_ms.
  * ───────────────────────────────────────────────────────────────────────── */
-enum { CTR_BRANCHES, CTR_MISSES, CTR_CYCLES, CTR_COUNT };
+typedef struct {
+    uint64_t    generic;        /* PERF_TYPE_HARDWARE config, if HAVE_PERF */
+    uint64_t    arm_raw;        /* ARM PMU raw event fallback code         */
+    const char *md_header;      /* Markdown table column header            */
+    const char *console_label;  /* Console label before the count          */
+    int         console_width;  /* Field width for the console count       */
+} CounterDesc;
+
+/* Indexed by CTR_* (opening order).  ARM codes are speculative counts, so
+ * they include wrong-path branches.  Not 0x21 for misses: that is
+ * BR_RETIRED, which counts every retired branch. */
+static const CounterDesc counter_descs[CTR_COUNT] = {
+#ifdef HAVE_PERF
+    { PERF_COUNT_HW_BRANCH_INSTRUCTIONS, 0x12, "Branches", "branches", 10 },
+    { PERF_COUNT_HW_BRANCH_MISSES,       0x10, "Misses",   "misses",    9 },
+    { PERF_COUNT_HW_CPU_CYCLES,          0x11, "Cycles",   "cycles",   11 },
+#else
+    { 0, 0x12, "Branches", "branches", 10 },
+    { 0, 0x10, "Misses",   "misses",    9 },
+    { 0, 0x11, "Cycles",   "cycles",   11 },
+#endif
+};
+
+/* Column order in console and Markdown output (distinct from opening order). */
+static const int counter_display_order[CTR_COUNT] = {
+    CTR_CYCLES, CTR_BRANCHES, CTR_MISSES
+};
 
 #ifdef HAVE_PERF
 /* All counters are opened as one perf group so the kernel schedules them
  * together and they cover exactly the same window.  The first counter that
  * opens becomes the group leader; one that fails to open is left out. */
-static int perf_fd[]            = { -1, -1, -1 };
-/* One -1 per CTR_* slot: a slot left out would start as fd 0 and count as
- * open.  Fails to compile when the initializer and CTR_COUNT disagree. */
-typedef char perf_fd_init_check[sizeof perf_fd / sizeof perf_fd[0] == CTR_COUNT ? 1 : -1];
+static int perf_fd[CTR_COUNT];
 static int perf_slot[CTR_COUNT];      /* position in the group read buffer */
-static int perf_leader          = -1;
-static int perf_members         = 0;
+static int perf_leader  = -1;
+static int perf_members = 0;
 
 static int perf_open(uint32_t type, uint64_t config, int group_fd)
 {
@@ -147,14 +171,13 @@ static int perf_open(uint32_t type, uint64_t config, int group_fd)
 
 /* Adds one counter to the group: the generic hardware event first, then
  * on ARM the architectural PMU event code (ARMv7 and ARMv8 alike). */
-static void perf_add(int ctr, uint64_t generic, uint64_t arm_raw)
+static void perf_add(int ctr)
 {
-    int fd = perf_open(PERF_TYPE_HARDWARE, generic, perf_leader);
+    const CounterDesc *d = &counter_descs[ctr];
+    int fd = perf_open(PERF_TYPE_HARDWARE, d->generic, perf_leader);
 #if defined(__aarch64__) || defined(__arm__)
     if (fd < 0)
-        fd = perf_open(PERF_TYPE_RAW, arm_raw, perf_leader);
-#else
-    (void)arm_raw;
+        fd = perf_open(PERF_TYPE_RAW, d->arm_raw, perf_leader);
 #endif
     if (fd < 0) return;
     if (perf_leader < 0) perf_leader = fd;
@@ -164,11 +187,10 @@ static void perf_add(int ctr, uint64_t generic, uint64_t arm_raw)
 
 static void perf_init(void)
 {
-    /* ARM codes are speculative counts, so they include wrong-path branches.
-     * Not 0x21 for misses: that is BR_RETIRED, which counts every branch. */
-    perf_add(CTR_BRANCHES, PERF_COUNT_HW_BRANCH_INSTRUCTIONS, 0x12); /* BR_PRED     */
-    perf_add(CTR_MISSES,   PERF_COUNT_HW_BRANCH_MISSES,       0x10); /* BR_MIS_PRED */
-    perf_add(CTR_CYCLES,   PERF_COUNT_HW_CPU_CYCLES,          0x11); /* CPU_CYCLES  */
+    for (int c = 0; c < CTR_COUNT; c++)
+        perf_fd[c] = -1;
+    for (int c = 0; c < CTR_COUNT; c++)
+        perf_add(c);
 }
 
 static void perf_close(void)
@@ -205,10 +227,9 @@ static void perf_stop(Result *r)
             warned = 1;
         }
     }
-    u64 *dst[CTR_COUNT] = { &r->branch_total, &r->branch_misses, &r->cycles };
     for (int c = 0; c < CTR_COUNT; c++)
         if (perf_fd[c] >= 0)
-            *dst[c] = (u64)((double)buf[3 + perf_slot[c]] * scale);
+            r->counts[c] = (u64)((double)buf[3 + perf_slot[c]] * scale);
 }
 
 static int perf_available(void)  { return perf_leader >= 0; }
@@ -252,8 +273,8 @@ static double clock_ms_sum     = 0;
 
 static void account_clock(const Result *r)
 {
-    if (!perf_has(CTR_CYCLES) || !r->cycles) return;
-    clock_cycles_sum += (double)r->cycles;
+    if (!perf_has(CTR_CYCLES) || !r->counts[CTR_CYCLES]) return;
+    clock_cycles_sum += (double)r->counts[CTR_CYCLES];
     clock_ms_sum     += r->time_ms;
 }
 
@@ -413,7 +434,17 @@ typedef struct {
 
 static double misses_per_item(const Result *r, const Work *w)
 {
-    return w->count ? (double)r->branch_misses / (double)w->count : 0;
+    return w->count ? (double)r->counts[CTR_MISSES] / (double)w->count : 0;
+}
+
+/* Writes `s` to `f` with runs of two or more spaces collapsed to one space,
+ * so console padding inside a row label does not appear in Markdown tables. */
+static void fputs_collapsed(FILE *f, const char *s)
+{
+    for (; *s; s++) {
+        if (s[0] == ' ' && s[1] == ' ') continue;
+        fputc(*s, f);
+    }
 }
 
 /* Emits one Markdown table (variant × time/counters/miss rates) for a
@@ -426,26 +457,32 @@ static void report_table(FILE *f, const char *title, const char *desc,
     if (desc) fprintf(f, "%s\n\n", desc);
     fprintf(f, "| Variant | Time (ms) |");
     if (trials > 1) fprintf(f, " Range (ms) |");
-    fprintf(f, " Cycles | Branches | Misses | Miss %% | Misses/%s |\n", w->unit);
+    for (int k = 0; k < CTR_COUNT; k++)
+        fprintf(f, " %s |", counter_descs[counter_display_order[k]].md_header);
+    fprintf(f, " Miss %% | Misses/%s |\n", w->unit);
     fprintf(f, "|---|---:|");
     if (trials > 1) fprintf(f, "---:|");
-    fprintf(f, "---:|---:|---:|---:|---:|\n");
+    for (int k = 0; k < CTR_COUNT; k++)
+        fprintf(f, "---:|");
+    fprintf(f, "---:|---:|\n");
     for (int i = 0; i < n; i++) {
         const Result *r = &rows[i].r;
-        const u64 counts[CTR_COUNT] = { r->branch_total, r->branch_misses, r->cycles };
-        const int order[] = { CTR_CYCLES, CTR_BRANCHES, CTR_MISSES };
-        fprintf(f, "| %s | %.1f |", rows[i].label, r->time_ms);
+        const u64 branches = r->counts[CTR_BRANCHES];
+        const u64 misses   = r->counts[CTR_MISSES];
+        fprintf(f, "| ");
+        fputs_collapsed(f, rows[i].label);
+        fprintf(f, " | %.1f |", r->time_ms);
         if (trials > 1)
             fprintf(f, " %.1f–%.1f |", r->time_min_ms, r->time_max_ms);
-        for (int k = 0; k < 3; k++) {
-            if (perf_has(order[k]))
-                fprintf(f, " %" PRIu64 " |", counts[order[k]]);
+        for (int k = 0; k < CTR_COUNT; k++) {
+            int c = counter_display_order[k];
+            if (perf_has(c))
+                fprintf(f, " %" PRIu64 " |", r->counts[c]);
             else
                 fprintf(f, " – |");
         }
-        if (perf_has(CTR_BRANCHES) && perf_has(CTR_MISSES) && r->branch_total)
-            fprintf(f, " %.1f%% |",
-                    100.0 * (double)r->branch_misses / (double)r->branch_total);
+        if (perf_has(CTR_BRANCHES) && perf_has(CTR_MISSES) && branches)
+            fprintf(f, " %.1f%% |", 100.0 * (double)misses / (double)branches);
         else
             fprintf(f, " – |");
         if (perf_has(CTR_MISSES))
@@ -459,19 +496,22 @@ static void report_table(FILE *f, const char *title, const char *desc,
 /* Console counterpart of report_table(): one aligned result row. */
 static void print_row(const char *label, const Result *r, const Work *w)
 {
+    const u64 branches = r->counts[CTR_BRANCHES];
+    const u64 misses   = r->counts[CTR_MISSES];
     printf("  %-38s  %7.1f ms", label, r->time_ms);
     if (trials > 1)
         printf(" (%7.1f–%7.1f)", r->time_min_ms, r->time_max_ms);
-    if (perf_has(CTR_CYCLES))
-        printf("  cycles %11"PRIu64, r->cycles);
-    if (perf_has(CTR_BRANCHES))
-        printf("  branches %10"PRIu64, r->branch_total);
-    if (perf_has(CTR_MISSES)) {
-        printf("  misses %9"PRIu64"  (", r->branch_misses);
-        if (perf_has(CTR_BRANCHES) && r->branch_total)
-            printf("%.1f%%, ",
-                   100.0 * (double)r->branch_misses / (double)r->branch_total);
-        printf("%.3f/%s)", misses_per_item(r, w), w->unit);
+    for (int k = 0; k < CTR_COUNT; k++) {
+        int c = counter_display_order[k];
+        if (!perf_has(c)) continue;
+        const CounterDesc *d = &counter_descs[c];
+        printf("  %s %*" PRIu64, d->console_label, d->console_width, r->counts[c]);
+        if (c == CTR_MISSES) {
+            printf("  (");
+            if (perf_has(CTR_BRANCHES) && branches)
+                printf("%.1f%%, ", 100.0 * (double)misses / (double)branches);
+            printf("%.3f/%s)", misses_per_item(r, w), w->unit);
+        }
     }
     printf("\n");
 }
@@ -484,13 +524,48 @@ static void print_miss_cost(FILE *report, const Result *predictable,
                             const Result *unpredictable)
 {
     if (!perf_has(CTR_CYCLES) || !perf_has(CTR_MISSES)) return;
-    if (unpredictable->branch_misses < predictable->branch_misses + 1000 ||
-        unpredictable->cycles <= predictable->cycles)
+    const u64 pred_misses   = predictable->counts[CTR_MISSES];
+    const u64 unpred_misses = unpredictable->counts[CTR_MISSES];
+    const u64 pred_cycles   = predictable->counts[CTR_CYCLES];
+    const u64 unpred_cycles = unpredictable->counts[CTR_CYCLES];
+    if (unpred_misses < pred_misses + 1000 || unpred_cycles <= pred_cycles)
         return;
-    double cost = (double)(unpredictable->cycles - predictable->cycles) /
-                  (double)(unpredictable->branch_misses - predictable->branch_misses);
+    double cost = (double)(unpred_cycles - pred_cycles) /
+                  (double)(unpred_misses - pred_misses);
     printf("  → Cost per miss: %.1f cycles\n", cost);
     if (report) fprintf(report, "**Cost per miss:** %.1f cycles\n\n", cost);
+}
+
+/* Emits all console rows and the Markdown table for a test. */
+static void emit_rows(FILE *report, const char *title, const char *desc,
+                      const ReportRow *rows, int n, const Work *w)
+{
+    for (int i = 0; i < n; i++)
+        print_row(rows[i].label, &rows[i].r, w);
+    report_table(report, title, desc, rows, n, w);
+}
+
+/* Emits a ratio summary line to both console and the Markdown report. */
+static void emit_ratio(FILE *report, const char *console_prefix,
+                       const char *md_label, double num_ms, double denom_ms,
+                       const char *suffix)
+{
+    double ratio = num_ms / denom_ms;
+    printf("%s%.2f×%s\n", console_prefix, ratio, suffix);
+    if (report)
+        fprintf(report, "**%s:** %.2f×%s\n\n", md_label, ratio, suffix);
+}
+
+/* Standard 2-row emission (predictable vs unpredictable): console rows,
+ * Markdown table, slowdown ratio, and cost per miss. */
+static void emit_pair_summary(FILE *report, const char *title, const char *desc,
+                              const ReportRow rows[2], const Work *w)
+{
+    emit_rows(report, title, desc, rows, 2, w);
+    emit_ratio(report, "  → Slowdown:  ", "Slowdown",
+               rows[1].r.time_ms, rows[0].r.time_ms, "");
+    print_miss_cost(report, &rows[0].r, &rows[1].r);
+    printf("\n");
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
@@ -566,21 +641,13 @@ static void run_test1(FILE *report)
     free(sorted); free(shuffled);
 
     const Work work = { (u64)len * reps, "elem" };
-    print_row("Sorted   (predictable, ~0% misses)",    &rs, &work);
-    print_row("Shuffled (unpredictable, ~50% misses)", &rr, &work);
-
-    printf("  → Slowdown:  %.2f×\n", rr.time_ms / rs.time_ms);
-
-    ReportRow rows[] = {
-        { "Sorted (predictable, ~0% misses)",     rs },
+    const ReportRow rows[] = {
+        { "Sorted   (predictable, ~0% misses)",    rs },
         { "Shuffled (unpredictable, ~50% misses)", rr },
     };
-    report_table(report, "Test 1 — Threshold Sum",
-                 "Sorted vs shuffled array, same direct branch. Identical data, different order.",
-                 rows, 2, &work);
-    if (report) fprintf(report, "**Slowdown:** %.2f×\n\n", rr.time_ms / rs.time_ms);
-    print_miss_cost(report, &rs, &rr);
-    printf("\n");
+    emit_pair_summary(report, "Test 1 — Threshold Sum",
+                      "Sorted vs shuffled array, same direct branch. Identical data, different order.",
+                      rows, &work);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -642,21 +709,13 @@ static void run_test2(FILE *report)
     free(decisions_random);   decisions_random   = NULL;
 
     const Work work = { (u64)len * reps, "elem" };
-    print_row("Periodic (every 4th — learnable)",   &rp, &work);
-    print_row("Random   (same rate — unlearnable)", &rr, &work);
-
-    printf("  → Slowdown:  %.2f×\n", rr.time_ms / rp.time_ms);
-
-    ReportRow rows[] = {
-        { "Periodic (every 4th — learnable)",  rp },
-        { "Random (same rate — unlearnable)",  rr },
+    const ReportRow rows[] = {
+        { "Periodic (every 4th — learnable)",   rp },
+        { "Random   (same rate — unlearnable)", rr },
     };
-    report_table(report, "Test 2 — Stride Conditional",
-                 "Both arrays have ~25% ones; only the pattern differs.",
-                 rows, 2, &work);
-    if (report) fprintf(report, "**Slowdown:** %.2f×\n\n", rr.time_ms / rp.time_ms);
-    print_miss_cost(report, &rp, &rr);
-    printf("\n");
+    emit_pair_summary(report, "Test 2 — Stride Conditional",
+                      "Both arrays have ~25% ones; only the pattern differs.",
+                      rows, &work);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -752,21 +811,13 @@ static void run_test3(FILE *report)
     free(dispatch_indices); dispatch_indices = NULL;
 
     const Work work = { len, "call" };
-    print_row("Sequential i%32 (learnable cycle)", &rs, &work);
-    print_row("Random index (unlearnable)",        &rr, &work);
-
-    printf("  → Slowdown:  %.2f×\n", rr.time_ms / rs.time_ms);
-
-    ReportRow rows[] = {
+    const ReportRow rows[] = {
         { "Sequential i%32 (learnable cycle)", rs },
-        { "Random index (unlearnable)",    rr },
+        { "Random index (unlearnable)",        rr },
     };
-    report_table(report, "Test 3 — Indirect Dispatch",
-                 "32 targets, function-pointer call. The indirect predictor must guess the target address.",
-                 rows, 2, &work);
-    if (report) fprintf(report, "**Slowdown:** %.2f×\n\n", rr.time_ms / rs.time_ms);
-    print_miss_cost(report, &rs, &rr);
-    printf("\n");
+    emit_pair_summary(report, "Test 3 — Indirect Dispatch",
+                      "32 targets, function-pointer call. The indirect predictor must guess the target address.",
+                      rows, &work);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -863,31 +914,21 @@ static void run_test4(FILE *report)
     }
 
     const Work work = { (u64)len * reps, "elem" };
-    print_row("Sorted  + branch",     &r_sb, &work);
-    print_row("Sorted  + branchless", &r_sl, &work);
-    print_row("Random  + branch",     &r_rb, &work);
-    print_row("Random  + branchless", &r_rl, &work);
-
-    printf("\n  Branch penalty on random data:  %.2f× vs sorted-branch\n",
-           r_rb.time_ms / r_sb.time_ms);
-    printf("  Branchless is consistent:       %.2f× random vs sorted\n",
-           r_rl.time_ms / r_sl.time_ms);
-
-    ReportRow rows[] = {
-        { "Sorted + branch",     r_sb },
-        { "Sorted + branchless", r_sl },
-        { "Random + branch",     r_rb },
-        { "Random + branchless", r_rl },
+    const ReportRow rows[] = {
+        { "Sorted  + branch",     r_sb },
+        { "Sorted  + branchless", r_sl },
+        { "Random  + branch",     r_rb },
+        { "Random  + branchless", r_rl },
     };
-    report_table(report, "Test 4 — Branch vs Branchless",
-                 "Same sum, computed via conditional jump vs. arithmetic mask, on sorted and random data.",
-                 rows, 4, &work);
-    if (report) {
-        fprintf(report, "**Branch penalty on random data:** %.2f× vs sorted-branch\n\n",
-                r_rb.time_ms / r_sb.time_ms);
-        fprintf(report, "**Branchless is consistent:** %.2f× random vs sorted\n\n",
-                r_rl.time_ms / r_sl.time_ms);
-    }
+    emit_rows(report, "Test 4 — Branch vs Branchless",
+              "Same sum, computed via conditional jump vs. arithmetic mask, on sorted and random data.",
+              rows, 4, &work);
+    emit_ratio(report, "\n  Branch penalty on random data:  ",
+               "Branch penalty on random data", r_rb.time_ms, r_sb.time_ms,
+               " vs sorted-branch");
+    emit_ratio(report, "  Branchless is consistent:       ",
+               "Branchless is consistent", r_rl.time_ms, r_sl.time_ms,
+               " random vs sorted");
     print_miss_cost(report, &r_sb, &r_rb);
     printf("\n");
 }

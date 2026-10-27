@@ -55,19 +55,37 @@ static uint64_t mono_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
 }
 
+typedef struct {
+    uint64_t    config;
+    const char *name;
+    uint64_t    mul;
+    uint64_t    div;
+} FakeEvent;
+
+static const FakeEvent fake_events[] = {
+    { PERF_COUNT_HW_BRANCH_INSTRUCTIONS, "branches", 1,  1 },
+    { PERF_COUNT_HW_BRANCH_MISSES,       "misses",   1, 20 },
+    { PERF_COUNT_HW_CPU_CYCLES,          "cycles",   3,  1 },
+};
+
+#define NUM_FAKE_EVENTS ((int)(sizeof fake_events / sizeof fake_events[0]))
+
+static const FakeEvent *find_event(uint64_t config)
+{
+    for (int i = 0; i < NUM_FAKE_EVENTS; i++)
+        if (fake_events[i].config == config)
+            return &fake_events[i];
+    return NULL;
+}
+
 static int event_allowed(uint64_t config)
 {
-    const char *name;
-    switch (config) {
-    case PERF_COUNT_HW_BRANCH_INSTRUCTIONS: name = "branches"; break;
-    case PERF_COUNT_HW_BRANCH_MISSES:       name = "misses";   break;
-    case PERF_COUNT_HW_CPU_CYCLES:          name = "cycles";   break;
-    default:                                return 0;
-    }
+    const FakeEvent *ev = find_event(config);
+    if (!ev) return 0;
     const char *list = getenv("FAKE_PERF_EVENTS");
     if (!list) return 1;
-    size_t len = strlen(name);
-    for (const char *p = list; (p = strstr(p, name)) != NULL; p += len)
+    size_t len = strlen(ev->name);
+    for (const char *p = list; (p = strstr(p, ev->name)) != NULL; p += len)
         if ((p == list || p[-1] == ',') && (p[len] == ',' || p[len] == '\0'))
             return 1;
     return 0;
@@ -142,11 +160,8 @@ ssize_t read(int fd, void *buf, size_t count)
         v[2] = reads == 1 ? 0 : reads == 2 ? ns / 2 : ns;
         for (int i = 0; i < n_fake; i++) {
             uint64_t ran = v[2];
-            switch (config_of[i]) {
-            case PERF_COUNT_HW_BRANCH_INSTRUCTIONS: v[3 + i] = ran;      break;
-            case PERF_COUNT_HW_BRANCH_MISSES:       v[3 + i] = ran / 20; break;
-            default:                                v[3 + i] = ran * 3;  break;
-            }
+            const FakeEvent *ev = find_event(config_of[i]);
+            v[3 + i] = ev ? (ran * ev->mul) / ev->div : 0;
         }
         if (reads == 3) want -= sizeof(uint64_t);
         if (want > count) want = count;
