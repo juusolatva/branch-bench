@@ -87,11 +87,13 @@ typedef struct {
 /* Forces the optimizer to treat v as observed, so the computation that
  * produced it can't be proven dead and elided. Use whenever a test's
  * results aren't already consumed by something with observable side
- * effects (e.g. a printed sanity check). */
+ * effects (e.g. a printed sanity check).  A store to a volatile object
+ * can't be elided, so writing v there is enough; it is never read back. */
+static volatile u64 anti_dce_value;
+
 static void anti_dce_sink(u64 v)
 {
-    volatile u64 sink = v;
-    (void)sink;
+    anti_dce_value = v;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
@@ -467,21 +469,17 @@ static void report_table(FILE *f, const char *title, const char *desc,
     fprintf(f, "---:|---:|\n");
     for (int i = 0; i < n; i++) {
         const Result *r = &rows[i].r;
-        const double time_ms     = r->time_ms;
-        const double time_min_ms = r->time_min_ms;
-        const double time_max_ms = r->time_max_ms;
-        const u64 branches       = r->counts[CTR_BRANCHES];
-        const u64 misses         = r->counts[CTR_MISSES];
+        const u64 branches = r->counts[CTR_BRANCHES];
+        const u64 misses   = r->counts[CTR_MISSES];
         fprintf(f, "| ");
         fputs_collapsed(f, rows[i].label);
-        fprintf(f, " | %.1f |", time_ms);
+        fprintf(f, " | %.1f |", r->time_ms);
         if (trials > 1)
-            fprintf(f, " %.1f–%.1f |", time_min_ms, time_max_ms);
+            fprintf(f, " %.1f–%.1f |", r->time_min_ms, r->time_max_ms);
         for (int k = 0; k < CTR_COUNT; k++) {
             int c = counter_display_order[k];
-            const u64 count = r->counts[c];
             if (perf_has(c))
-                fprintf(f, " %" PRIu64 " |", count);
+                fprintf(f, " %" PRIu64 " |", r->counts[c]);
             else
                 fprintf(f, " – |");
         }
@@ -500,20 +498,16 @@ static void report_table(FILE *f, const char *title, const char *desc,
 /* Console counterpart of report_table(): one aligned result row. */
 static void print_row(const char *label, const Result *r, const Work *w)
 {
-    const double time_ms     = r->time_ms;
-    const double time_min_ms = r->time_min_ms;
-    const double time_max_ms = r->time_max_ms;
-    const u64 branches       = r->counts[CTR_BRANCHES];
-    const u64 misses         = r->counts[CTR_MISSES];
-    printf("  %-38s  %7.1f ms", label, time_ms);
+    const u64 branches = r->counts[CTR_BRANCHES];
+    const u64 misses   = r->counts[CTR_MISSES];
+    printf("  %-38s  %7.1f ms", label, r->time_ms);
     if (trials > 1)
-        printf(" (%7.1f–%7.1f)", time_min_ms, time_max_ms);
+        printf(" (%7.1f–%7.1f)", r->time_min_ms, r->time_max_ms);
     for (int k = 0; k < CTR_COUNT; k++) {
         int c = counter_display_order[k];
         if (!perf_has(c)) continue;
         const CounterDesc *d = &counter_descs[c];
-        const u64 count = r->counts[c];
-        printf("  %s %*" PRIu64, d->console_label, d->console_width, count);
+        printf("  %s %*" PRIu64, d->console_label, d->console_width, r->counts[c]);
         if (c == CTR_MISSES) {
             printf("  (");
             if (perf_has(CTR_BRANCHES) && branches)
@@ -545,7 +539,6 @@ static void print_miss_cost(FILE *report, const Result *predictable,
 }
 
 /* Emits all console rows and the Markdown table for a test. */
-__attribute__((noinline))
 static void emit_rows(FILE *report, const char *title, const char *desc,
                       const ReportRow *rows, int n, const Work *w)
 {
@@ -567,7 +560,6 @@ static void emit_ratio(FILE *report, const char *console_prefix,
 
 /* Standard 2-row emission (predictable vs unpredictable): console rows,
  * Markdown table, slowdown ratio, and cost per miss. */
-__attribute__((noinline))
 static void emit_pair_summary(FILE *report, const char *title, const char *desc,
                               const ReportRow rows[2], const Work *w)
 {
@@ -621,7 +613,6 @@ static u64 sum_threshold(const u8 *arr, size_t n, unsigned n_reps)
     return acc;
 }
 
-__attribute__((noinline))
 static void run_test1(FILE *report)
 {
     /* Read once, so the allocation and every loop provably use the same length. */
@@ -693,7 +684,6 @@ static u64 count_decisions(const u8 *decisions, size_t n, unsigned n_reps)
     return acc;
 }
 
-__attribute__((noinline))
 static void run_test2(FILE *report)
 {
     const size_t len = size;
@@ -797,7 +787,6 @@ static u64 dispatch_random(const u8 *idx, size_t n)
     return acc;
 }
 
-__attribute__((noinline))
 static void run_test3(FILE *report)
 {
     const size_t len = size;
@@ -889,7 +878,6 @@ static u64 sum_branchless(const u8 *arr, size_t n, unsigned n_reps)
     return acc;
 }
 
-__attribute__((noinline))
 static void run_test4(FILE *report)
 {
     const size_t len = size;
