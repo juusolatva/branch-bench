@@ -55,7 +55,7 @@ GCC is the reference compiler. Clang rejects `-fno-if-conversion` and has no equ
 ### Testing and Validation
 There is no dedicated test framework or linter in this repository. Validate changes by compiling with `gcc` using the required flags (plus `-Wall -Wextra -pedantic` to catch issues) and executing the binary. `clang --analyze -std=c99 -Xclang -analyzer-werror <repo>/branch_bench.c` should report no warnings; run it from a scratch directory, because it writes a `.plist` into the current one. It finds the same kind of path-based bugs (uninitialized values, out-of-bounds reads) that SonarQube Cloud reports. SonarQube also flags implicit casts that can lower precision (rule S5276), such as `u64`/`size_t` to `double`, so write every integer-to-`double` conversion as an explicit `(double)` cast; they compile to the same code. Test 4 includes a built-in runtime sanity check verifying that branch and branchless implementations compute identical sums; on a mismatch it prints an error and the program exits with status 1.
 
-Changes anywhere in the file can move the kernels to new addresses, which can change timings even when their code is untouched. After a change, compare the kernels' disassembly with the previous build. Also check that no jump in a kernel's hot loop crosses or ends on a 32-byte boundary: Intel's JCC-erratum microcode slows such jumps on Skylake-derived CPUs, including the i5-8350U in RESULTS.md.
+Changes anywhere in the file can move the kernels to new addresses, which can change timings even when their code is untouched. After a change, compare the kernels' disassembly with the previous build (`objdump -d --no-show-raw-insn branch_bench`, diffing the `<sum_branch>`/`<sum_threshold>`, `<count_decisions>`, `<dispatch_sequential>` and `<dispatch_random>` blocks). Also check that no jump in a kernel's hot loop crosses or ends on a 32-byte boundary: Intel's JCC-erratum microcode slows such jumps on Skylake-derived CPUs, including the i5-8350U in RESULTS.md. `.github/scripts/check_jcc.sh ./branch_bench` lists every such jump in the kernels (a macro-fused `cmp`/`test` + `jcc` pair counts as one jump); a hit matters only if its address lies inside the hot loop, i.e. between a backward jump and its target. It is a local check only (x86-64), not run in CI.
 
 ### Continuous Integration
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on pushes to `main`, on pull requests and on manual dispatch. Hosted runners are VMs, usually without hardware perf counters, so CI checks correctness and codegen only, not timings. They use Ubuntu 24.04's GCC 13 and Clang 18, so a codegen pass in CI says nothing about a newer local compiler. GitHub's CodeQL default setup also scans the code, outside this workflow. Actions are pinned to commit SHAs, and gcovr and all its dependencies to versions and hashes in [`.github/requirements.txt`](.github/requirements.txt), which `pip-compile --generate-hashes` generates from [`.github/requirements.in`](.github/requirements.in) (run it in `.github/` under Python 3.12, CI's version; the exact command is in both files). [`.github/dependabot.yml`](.github/dependabot.yml) opens a monthly pull request when any of them has a release at least 7 days old (`cooldown`).
@@ -83,7 +83,7 @@ python3 -m venv /tmp/gcovr && /tmp/gcovr/bin/pip install --require-hashes -r .gi
 ```
 The last two lines install CI's pinned gcovr and write the `coverage.xml` that CI uploads; use them to check a gcovr update. gcovr's line count can differ from `gcov -b`'s by a line or two.
 
-When adding an option, add its valid and invalid forms to `smoke_test.sh`. When adding a kernel that must keep a branch, add it to `check_kernels.sh`. When code starts using a new perf event, `/proc` or sysfs file (e.g. new `/proc/cpuinfo` keys), extend `fake_perf.c` so the coverage job still reaches it.
+When adding an option, add its valid and invalid forms to `smoke_test.sh`. When adding a kernel that must keep a branch, add it to `check_kernels.sh`; add every new kernel to `check_jcc.sh`'s function list. When code starts using a new perf event, `/proc` or sysfs file (e.g. new `/proc/cpuinfo` keys), extend `fake_perf.c` so the coverage job still reaches it.
 
 ---
 
@@ -108,7 +108,7 @@ Because benchmark loops compute values without external side effects during timi
 Use the local xorshift64 PRNG (`rng64()` / `rng_state`) instead of `stdlib rand()`. This avoids glibc locking overhead and distribution skew.
 
 ### 5. Indirect Dispatch and Identical Code Folding (ICF)
-Test 3 generates 32 leaf functions via X-macros (`FOR_EACH_LEAF` / `DEF_LEAF`). Each leaf function performs a distinct arithmetic operation based on a unique Weyl sequence step (`0x9e3779b97f4a7c15ULL`). This prevents Identical Code Folding (GCC's `-fipa-icf`, on at `-O2`, or the linker's) from merging the function pointers into a single destination address.
+Test 3 generates 32 leaf functions via X-macros (`FOR_EACH_LEAF` / `DEF_LEAF`). Each leaf XORs its argument with its own constant, the leaf number times the Weyl sequence step `0x9e3779b97f4a7c15ULL`. This prevents Identical Code Folding (GCC's `-fipa-icf`, on at `-O2`, or the linker's) from merging the function pointers into a single destination address.
 
 GCC *does* fold `sum_branch` into `sum_threshold`, because their bodies are identical, so the disassembly shows a single function under one of the two names. That is harmless: Test 1 and Test 4's branch variants are meant to run the same code.
 
@@ -132,7 +132,7 @@ Call these after all `MEASURE` calls. The console heading stays in `run_testN` b
 
 This keeps console and Markdown output consistent from a single `ReportRow` definition. Labels in `ReportRow` may carry extra internal spaces for console alignment; `report_table()` automatically collapses multi-space runs when writing Markdown.
 
-To wire up a new test, bump `NUM_TESTS`, add `if (test_selected(N)) run_testN(report);` in `main()`, add N to `smoke_test.sh`'s `for t in 1 2 3 4` report loop and change its `expect 1 -t 5` invalid case to the new out-of-range number, and add its kernel to `check_kernels.sh` if it must keep a branch.
+To wire up a new test, bump `NUM_TESTS`, add `if (test_selected(N)) run_testN(report);` in `main()`, add N to `smoke_test.sh`'s `for t in 1 2 3 4` report loop and change its `expect 1 -t 5` invalid case to the new out-of-range number, add its kernel to `check_kernels.sh` if it must keep a branch, and add it to `check_jcc.sh`'s function list.
 
 ---
 
