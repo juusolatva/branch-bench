@@ -74,7 +74,19 @@ static unsigned tests_selected = 0;    /* -t/--test bitmask (bit n-1 = test n); 
 typedef uint64_t        u64;
 typedef unsigned char   u8;
 
-enum { CTR_BRANCHES, CTR_MISSES, CTR_CYCLES, CTR_COUNT };
+/* Perf counters, one row each in opening order: X(slot, generic event, ARM raw
+ * code, Markdown header, console label, console width).  The CTR_* enum and
+ * counter_descs[] are both generated from this list, so a slot can't exist
+ * without its descriptor.  ARM codes are speculative counts, so they include
+ * wrong-path branches.  Not 0x21 for misses: that is BR_RETIRED, which counts
+ * every retired branch. */
+#define FOR_EACH_COUNTER(X) \
+    X(BRANCHES, BRANCH_INSTRUCTIONS, 0x12, "Branches", "branches", 10) \
+    X(MISSES,   BRANCH_MISSES,       0x10, "Misses",   "misses",    9) \
+    X(CYCLES,   CPU_CYCLES,          0x11, "Cycles",   "cycles",   11)
+
+#define CTR_ENUM(slot, ev, raw, md, label, width) CTR_##slot,
+enum { FOR_EACH_COUNTER(CTR_ENUM) CTR_COUNT };
 
 typedef struct {
     double time_ms;
@@ -133,22 +145,19 @@ typedef struct {
 #  define PERF_HW(ev) 0
 #endif
 
+/* Indexed by CTR_* (opening order). */
+#define CTR_DESC(slot, ev, raw, md, label, width) \
+    { PERF_HW(ev), raw, md, label, width },
+static const CounterDesc counter_descs[CTR_COUNT] = { FOR_EACH_COUNTER(CTR_DESC) };
+
 /* Fails to compile when array a doesn't have exactly n entries (C99 has no
- * _Static_assert).  Catches a CTR_* slot added without its table entries. */
+ * _Static_assert). */
 #define CHECK_LEN(name, a, n) \
     typedef char name[sizeof (a) / sizeof (a)[0] == (n) ? 1 : -1]
 
-/* Indexed by CTR_* (opening order).  ARM codes are speculative counts, so
- * they include wrong-path branches.  Not 0x21 for misses: that is
- * BR_RETIRED, which counts every retired branch. */
-static const CounterDesc counter_descs[] = {
-    [CTR_BRANCHES] = { PERF_HW(BRANCH_INSTRUCTIONS), 0x12, "Branches", "branches", 10 },
-    [CTR_MISSES]   = { PERF_HW(BRANCH_MISSES),       0x10, "Misses",   "misses",    9 },
-    [CTR_CYCLES]   = { PERF_HW(CPU_CYCLES),          0x11, "Cycles",   "cycles",   11 },
-};
-CHECK_LEN(counter_descs_len_check, counter_descs, CTR_COUNT);
-
-/* Column order in console and Markdown output (distinct from opening order). */
+/* Column order in console and Markdown output (distinct from opening order).
+ * Each CTR_* must appear exactly once; CHECK_LEN fails the build when the
+ * entry count differs from CTR_COUNT. */
 static const int counter_display_order[] = {
     CTR_CYCLES, CTR_BRANCHES, CTR_MISSES
 };
