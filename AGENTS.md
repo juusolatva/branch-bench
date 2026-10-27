@@ -118,7 +118,8 @@ GCC *does* fold `sum_branch` into `sum_threshold`, because their bodies are iden
 - Do **not** nest `perf_start()` or `perf_stop()` inside the `now_ms()` timing window; doing so introduces system call overhead into the wall-clock measurements.
 - `MEASURE` is a macro, not a function, on purpose: the kernel must be called directly (not through a function pointer) so its codegen stays unchanged.
 - Guard access to each counter slot in `r.counts[]` with `perf_has(CTR_BRANCHES)`, `perf_has(CTR_MISSES)` or `perf_has(CTR_CYCLES)`; any of them can be missing independently (`print_row()`, `report_table()` and `print_miss_cost()` already do).
-- New counters go into the same group. Each needs a `CTR_*` slot before `CTR_COUNT`, an entry in `counter_descs[]` (generic code, ARM raw fallback, Markdown header, console label and width), its position in `counter_display_order[]`, and an entry in `fake_perf.c`'s `fake_events[]` table (and `FAKE_PERF_EVENTS`).
+- New counters go into the same group. Each needs a `CTR_*` slot before `CTR_COUNT`, a `[CTR_*] =` entry in `counter_descs[]` (generic code as `PERF_HW(EVENT)`, which expands to `PERF_COUNT_HW_EVENT` or to `0` without perf support; ARM raw fallback; Markdown header; console label and width), its position in `counter_display_order[]`, and an entry in `fake_perf.c`'s `fake_events[]` table (and `FAKE_PERF_EVENTS`). `CHECK_LEN` fails the build when either table's length differs from `CTR_COUNT`.
+- Which counters are open is tracked in `perf_open_mask`, not by `perf_fd[]` values, so the zero-initialized state means "none open"; test it only through `perf_has()`.
 
 ### 7. Formatted Report Emission
 Each test function receives `FILE *report` (which will be `NULL` if `-o` was not specified). Any new test should:

@@ -126,34 +126,47 @@ typedef struct {
     int         console_width;  /* Field width for the console count       */
 } CounterDesc;
 
+/* Generic hardware event code; never opened without HAVE_PERF. */
+#ifdef HAVE_PERF
+#  define PERF_HW(ev) PERF_COUNT_HW_##ev
+#else
+#  define PERF_HW(ev) 0
+#endif
+
+/* Fails to compile when array a doesn't have exactly n entries (C99 has no
+ * _Static_assert).  Catches a CTR_* slot added without its table entries. */
+#define CHECK_LEN(name, a, n) \
+    typedef char name[sizeof (a) / sizeof (a)[0] == (n) ? 1 : -1]
+
 /* Indexed by CTR_* (opening order).  ARM codes are speculative counts, so
  * they include wrong-path branches.  Not 0x21 for misses: that is
  * BR_RETIRED, which counts every retired branch. */
-static const CounterDesc counter_descs[CTR_COUNT] = {
-#ifdef HAVE_PERF
-    { PERF_COUNT_HW_BRANCH_INSTRUCTIONS, 0x12, "Branches", "branches", 10 },
-    { PERF_COUNT_HW_BRANCH_MISSES,       0x10, "Misses",   "misses",    9 },
-    { PERF_COUNT_HW_CPU_CYCLES,          0x11, "Cycles",   "cycles",   11 },
-#else
-    { 0, 0x12, "Branches", "branches", 10 },
-    { 0, 0x10, "Misses",   "misses",    9 },
-    { 0, 0x11, "Cycles",   "cycles",   11 },
-#endif
+static const CounterDesc counter_descs[] = {
+    [CTR_BRANCHES] = { PERF_HW(BRANCH_INSTRUCTIONS), 0x12, "Branches", "branches", 10 },
+    [CTR_MISSES]   = { PERF_HW(BRANCH_MISSES),       0x10, "Misses",   "misses",    9 },
+    [CTR_CYCLES]   = { PERF_HW(CPU_CYCLES),          0x11, "Cycles",   "cycles",   11 },
 };
+CHECK_LEN(counter_descs_len_check, counter_descs, CTR_COUNT);
 
 /* Column order in console and Markdown output (distinct from opening order). */
-static const int counter_display_order[CTR_COUNT] = {
+static const int counter_display_order[] = {
     CTR_CYCLES, CTR_BRANCHES, CTR_MISSES
 };
+CHECK_LEN(counter_display_order_len_check, counter_display_order, CTR_COUNT);
 
 #ifdef HAVE_PERF
 /* All counters are opened as one perf group so the kernel schedules them
  * together and they cover exactly the same window.  The first counter that
- * opens becomes the group leader; one that fails to open is left out. */
-static int perf_fd[CTR_COUNT];
-static int perf_slot[CTR_COUNT];      /* position in the group read buffer */
-static int perf_leader  = -1;
-static int perf_members = 0;
+ * opens becomes the group leader; one that fails to open is left out.
+ * perf_open_mask, not perf_fd[], says which counters are open, so the
+ * zero-initialized state means "none open" before perf_init() runs. */
+static int      perf_fd[CTR_COUNT];
+static int      perf_slot[CTR_COUNT];   /* position in the group read buffer */
+static unsigned perf_open_mask = 0;     /* bit c set once counter c opened   */
+static int      perf_leader    = -1;
+static int      perf_members   = 0;
+
+static int perf_has(int ctr) { return (perf_open_mask >> ctr) & 1u; }
 
 static int perf_open(uint32_t type, uint64_t config, int group_fd)
 {
@@ -183,14 +196,13 @@ static void perf_add(int ctr)
 #endif
     if (fd < 0) return;
     if (perf_leader < 0) perf_leader = fd;
-    perf_fd[ctr]   = fd;
-    perf_slot[ctr] = perf_members++;
+    perf_fd[ctr]    = fd;
+    perf_slot[ctr]  = perf_members++;
+    perf_open_mask |= 1u << ctr;
 }
 
 static void perf_init(void)
 {
-    for (int c = 0; c < CTR_COUNT; c++)
-        perf_fd[c] = -1;
     for (int c = 0; c < CTR_COUNT; c++)
         perf_add(c);
 }
@@ -198,7 +210,7 @@ static void perf_init(void)
 static void perf_close(void)
 {
     for (int c = 0; c < CTR_COUNT; c++)
-        if (perf_fd[c] >= 0) close(perf_fd[c]);
+        if (perf_has(c)) close(perf_fd[c]);
 }
 
 static void perf_start(void)
@@ -230,12 +242,11 @@ static void perf_stop(Result *r)
         }
     }
     for (int c = 0; c < CTR_COUNT; c++)
-        if (perf_fd[c] >= 0)
+        if (perf_has(c))
             r->counts[c] = (u64)((double)buf[3 + perf_slot[c]] * scale);
 }
 
 static int perf_available(void)  { return perf_leader >= 0; }
-static int perf_has(int ctr)     { return perf_fd[ctr] >= 0; }
 
 #else
 static void perf_init(void)       {}
