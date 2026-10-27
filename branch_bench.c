@@ -1222,12 +1222,18 @@ int main(int argc, char **argv)
 
     printf("See README.md for how to interpret these results.\n");
 
+    int report_failed = 0;
     if (report) {
-        fclose(report);
-        printf("\nFormatted report written to %s\n", out_path);
+        /* A previous buffered write may have failed even if close succeeds. */
+        report_failed = ferror(report) != 0;
+        if (fclose(report) != 0) report_failed = 1;
+        if (report_failed)
+            fprintf(stderr, "Error writing report to %s\n", out_path);
+        else
+            printf("\nFormatted report written to %s\n", out_path);
     }
 
     perf_close();
 
-    return sanity_failed ? 1 : 0;
+    return sanity_failed || report_failed ? 1 : 0;
 }
