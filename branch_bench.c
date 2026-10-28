@@ -1171,7 +1171,7 @@ static void raw_events_list(char *buf, size_t bufsz)
         if (!((perf_raw_mask >> c) & 1u) || len >= bufsz) continue;
         int written = snprintf(buf + len, bufsz - len, "%s%s (0x%" PRIx64 ")",
                                len ? ", " : "", counter_descs[c].console_label,
-                               (uint64_t)counter_descs[c].arm_raw);
+                               counter_descs[c].arm_raw);
         if (written < 0) break;
         len += (size_t)written;
     }
