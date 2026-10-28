@@ -6,9 +6,11 @@
 # version, and losing them silently invalidates results.  x86-64 and aarch64
 # only.
 #
-# The loop back-edge alone satisfies the conditional-branch requirement, so
-# the check relies on rejecting every known branchless form.  A pass is
-# necessary, not sufficient: a new branchless idiom could still slip through.
+# Tests 1-2 need a data branch: a forward conditional branch that starts and
+# lands inside a loop (between a backward branch and its target), so neither
+# the loop back-edge nor an early exit to the return path counts.  Known
+# branchless forms are rejected too.  A pass is necessary, not sufficient:
+# a branch inside the loop need not be the one on the data.
 #
 # Usage: check_kernels.sh <binary>
 # ARCH and OBJDUMP override the host architecture and objdump, e.g. for a
@@ -49,6 +51,37 @@ body() {
             in_fn            { sub(/^[^\t]*\t/, ""); print }'
 }
 
+# True if the function has a forward conditional branch that starts and
+# lands inside a loop.  Branch targets are the "<hex> <" operand.
+has_loop_branch() {
+    "$objdump" -d --no-show-raw-insn "$bin" |
+        awk -v re="^[0-9a-f]+ <($1)(\\\\.[^>]*)?>:\$" -v cond="^$cond_branch" '
+            function hex(s,    i, n) {
+                n = 0
+                for (i = 1; i <= length(s); i++)
+                    n = n * 16 + index("0123456789abcdef", substr(s, i, 1)) - 1
+                return n
+            }
+            $0 ~ re       { in_fn = 1; next }
+            in_fn && /^$/ { in_fn = 0 }
+            in_fn {
+                insn = $0; sub(/^[^\t]*\t/, "", insn)
+                if (insn !~ cond || !match(insn, /[0-9a-f]+ </)) next
+                at = $1; sub(/:$/, "", at); at = hex(at)
+                to = hex(substr(insn, RSTART, RLENGTH - 2))
+                n++; from[n] = at; dest[n] = to
+            }
+            END {
+                for (i = 1; i <= n; i++) {
+                    if (dest[i] <= from[i]) continue
+                    for (j = 1; j <= n; j++)
+                        if (dest[j] < from[j] && dest[j] <= from[i] && from[i] < from[j] && dest[i] <= from[j])
+                            exit 0
+                }
+                exit 1
+            }'
+}
+
 fail=0
 
 # check <label> <function regex> <required instruction regex>
@@ -64,14 +97,18 @@ check() {
     if printf '%s\n' "$insns" | grep -Eq "$simd"; then
         echo "FAIL $1: SIMD registers used"; bad=1
     fi
-    if ! printf '%s\n' "$insns" | grep -Eq "^$3"; then
+    if [ "$3" = loop-branch ]; then
+        if ! has_loop_branch "$2"; then
+            echo "FAIL $1: no conditional branch inside the loop (only the back-edge or exits)"; bad=1
+        fi
+    elif ! printf '%s\n' "$insns" | grep -Eq "^$3"; then
         echo "FAIL $1: required instruction missing ($3)"; bad=1
     fi
     if [ "$bad" -eq 0 ]; then echo "ok   $1"; else fail=1; fi
 }
 
-check "Test 1/4 sum_threshold/sum_branch" 'sum_threshold|sum_branch' "$cond_branch"
-check "Test 2 count_decisions"            'count_decisions'           "$cond_branch"
+check "Test 1/4 sum_threshold/sum_branch" 'sum_threshold|sum_branch' loop-branch
+check "Test 2 count_decisions"            'count_decisions'           loop-branch
 check "Test 3 dispatch_sequential"        'dispatch_sequential'       "$indirect_call"
 check "Test 3 dispatch_random"            'dispatch_random'           "$indirect_call"
 

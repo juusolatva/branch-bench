@@ -73,6 +73,33 @@ jobs:
             exit 1
           fi
 
+  # Ubuntu 24.04's GCC 13 lags the GCC people build with locally, and codegen
+  # (lost branches, jump layout) changes between versions.
+  gcc-latest:
+    name: GCC latest build and codegen (container)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build and check kernels
+        run: |
+          image=$(sed -n 's/^FROM //p' .github/gcc-latest/Dockerfile)
+          docker run --rm -v "$PWD:/src:ro" -w /src \
+            -e BENCH_FLAGS -e JCC_FLAGS -e WARN_FLAGS -e SMALL_RUN "$image" sh -ec '
+              gcc --version
+              gcc $BENCH_FLAGS $JCC_FLAGS $WARN_FLAGS -o /tmp/branch_bench branch_bench.c
+              /tmp/branch_bench $SMALL_RUN > /dev/null
+              .github/scripts/check_kernels.sh /tmp/branch_bench
+              hits=$(.github/scripts/check_jcc.sh /tmp/branch_bench)
+              if [ -n "$hits" ]; then
+                printf "%s\n" "$hits"
+                echo "kernel jumps cross or end on a 32-byte boundary (JCC erratum)"
+                exit 1
+              fi'
+
   clang:
     name: Clang build and static analysis
     runs-on: ubuntu-24.04
@@ -154,6 +181,13 @@ jobs:
       - name: Smoke test
         run: .github/scripts/smoke_test.sh ./branch_bench_san "$RUNNER_TEMP/smoke"
 
+      - name: Perf regression tests
+        run: |
+          ${{ matrix.cc }} -std=c99 -O1 -g -fno-omit-frame-pointer \
+            -fno-sanitize-recover=all ${{ matrix.flags }} \
+            -o "$RUNNER_TEMP/perf_test_san" .github/scripts/perf_test.c
+          "$RUNNER_TEMP/perf_test_san"
+
   sonarqube:
     name: Coverage and SonarQube Cloud
     runs-on: ubuntu-24.04
@@ -212,11 +246,20 @@ jobs:
             FAKE_PERF_EVENTS=$ev ./branch_bench_cov -t 1 $SMALL_RUN -o "$dir/part.md"
           done
 
+      # Covers perf_stop()'s error paths, which need failing counter reads.
+      - name: Perf regression tests with coverage
+        run: |
+          gcc -std=c99 -O0 -g --coverage -fno-tree-vectorize -fno-if-conversion \
+            -o perf_test_cov .github/scripts/perf_test.c
+          ./perf_test_cov
+
       # When no data matches the filter, gcovr writes an empty report and exits
       # 0; the minimum (the quality gate's 80%) makes that fail here instead.
+      # perf_test.c renames main(), so --merge-lines counts each line once
+      # instead of once per function name.
       - name: Coverage report
         run: >
-          gcovr --root . --filter 'branch_bench\.c$'
+          gcovr --root . --filter 'branch_bench\.c$' --merge-lines
           --sonarqube coverage.xml --print-summary --fail-under-line 80
 
       # Pull requests from forks get no secrets, and Dependabot's pull requests
