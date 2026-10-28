@@ -1,0 +1,125 @@
+name: Release
+
+# A version tag (v*) builds static binaries for x86-64 and arm64 with the
+# gcc-latest image, checks them as CI checks its builds and publishes them,
+# with SHA256SUMS and build provenance attestations, as a GitHub release.
+# Pull requests that change this workflow or the image run the builds and
+# checks only, so a broken release build shows up before the next tag.
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - .github/gcc-latest/**
+
+permissions:
+  contents: read
+
+env:
+  # Same flags as run.sh and ci.yml (see AGENTS.md, "Critical Compiler Flags").
+  BENCH_FLAGS: -std=c99 -O2 -fno-tree-vectorize -fno-if-conversion
+  JCC_FLAGS: -Wa,-mbranches-within-32B-boundaries,-malign-branch=jcc+fused+jmp+call+ret+indirect
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    env:
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Static, so one binary runs on any Linux of its architecture, whatever
+      # its libc (glibc version, or musl on OpenWrt).
+      - name: Build static binary
+        run: |
+          flags="$BENCH_FLAGS -static"
+          if [ "$ARCH" = x86_64 ]; then flags="$flags $JCC_FLAGS"; fi
+          commit=$(git describe --tags --always --dirty)
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$commit" != "$GITHUB_REF_NAME" ]; then
+            echo "git describe gives $commit, not the tag $GITHUB_REF_NAME"
+            exit 1
+          fi
+          echo "BUILD_COMMIT=$commit" >> "$GITHUB_ENV"
+          echo "BIN=branch_bench-$commit-linux-$ARCH" >> "$GITHUB_ENV"
+          export flags commit
+          mkdir dist
+          image=$(sed -n 's/^FROM //p' .github/gcc-latest/Dockerfile)
+          docker run --rm -u "$(id -u):$(id -g)" -v "$PWD:/src" -w /src \
+            -e flags -e commit -e ARCH "$image" sh -ec '
+              gcc --version
+              gcc $flags -DBUILD_FLAGS="\"$flags\"" -DBUILD_COMMIT="\"$commit\"" \
+                -o "dist/branch_bench-$commit-linux-$ARCH" branch_bench.c'
+
+      # The checks run outside the build container, which also shows that the
+      # binary needs nothing from it.
+      - name: Check binary
+        run: |
+          bin="dist/$BIN"
+          if readelf -l "$bin" | grep -q INTERP; then
+            echo "$bin is dynamically linked"
+            exit 1
+          fi
+          "./$bin" -t 1 --size 64K --reps 1 > banner.txt
+          grep -qxF "  Commit:          $BUILD_COMMIT" banner.txt
+          .github/scripts/smoke_test.sh "$bin"
+          .github/scripts/check_kernels.sh "$bin"
+          if [ "$ARCH" = x86_64 ]; then
+            hits=$(.github/scripts/check_jcc.sh "$bin")
+            if [ -n "$hits" ]; then
+              printf '%s\n' "$hits"
+              echo "kernel jumps cross or end on a 32-byte boundary (JCC erratum)"
+              exit 1
+            fi
+          fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.BIN }}
+          path: dist/${{ env.BIN }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write     # create the release
+      id-token: write     # sign the attestations
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: branch_bench-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum branch_bench-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/branch_bench-*
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" --generate-notes --verify-tag

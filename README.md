@@ -16,7 +16,7 @@ A simple benchmark for testing out gains from branch prediction or conversely lo
 
 ## Notes
 
-You **MUST** run this with ./run.sh or build it with exactly `gcc -std=c99 -O2 -fno-tree-vectorize -fno-if-conversion -o branch_bench branch_bench.c`, adding `-Wa,-mbranches-within-32B-boundaries,-malign-branch=jcc+fused+jmp+call+ret+indirect` on x86-64 as `./run.sh` does. Without *-fno-tree-vectorize* and *-fno-if-conversion* the compiler optimizes the mispredictions away, and other optimization levels give results that cannot be compared with [RESULTS.md](RESULTS.md). The x86-64 assembler flags keep every jump in the kernels off 32-byte boundaries, which Intel's JCC-erratum fix slows on Skylake-derived CPUs. `./run.sh` builds and then runs the benchmark with any options you give it (e.g. `./run.sh -n 5 -o report.md`); after that, `./branch_bench` runs it directly. Build with GCC: Clang has no equivalent of *-fno-if-conversion* and makes Tests 1, 2 and Test 4's branch variant branchless, so its timings show no misprediction cost (see [AGENTS.md](AGENTS.md)).
+You **MUST** run this with ./run.sh, use a [prebuilt binary](#prebuilt-binaries), or build it with exactly `gcc -std=c99 -O2 -fno-tree-vectorize -fno-if-conversion -o branch_bench branch_bench.c`, adding `-Wa,-mbranches-within-32B-boundaries,-malign-branch=jcc+fused+jmp+call+ret+indirect` on x86-64 as `./run.sh` does. Without *-fno-tree-vectorize* and *-fno-if-conversion* the compiler optimizes the mispredictions away, and other optimization levels give results that cannot be compared with [RESULTS.md](RESULTS.md). The x86-64 assembler flags keep every jump in the kernels off 32-byte boundaries, which Intel's JCC-erratum fix slows on Skylake-derived CPUs. `./run.sh` builds and then runs the benchmark with any options you give it (e.g. `./run.sh -n 5 -o report.md`); after that, `./branch_bench` runs it directly. Build with GCC: Clang has no equivalent of *-fno-if-conversion* and makes Tests 1, 2 and Test 4's branch variant branchless, so its timings show no misprediction cost (see [AGENTS.md](AGENTS.md)).
 
 The benchmark builds on Linux with GCC; on Windows, use WSL2. Other POSIX systems build with GCC too but show times only. On macOS `gcc` is Clang, so install GCC (e.g. from Homebrew) and build with the command above using its versioned `gcc-<N>` (`./run.sh` calls plain `gcc`), without the `-Wa,...` flags: they need the GNU assembler (binutils 2.34 or later), which macOS does not use.
 
@@ -25,6 +25,18 @@ Branch, miss and cycle counts need Linux hardware performance counters, which re
 If a trial's counter read fails or its group never gets scheduled, that
 trial still reports its wall-clock time. Its hardware counts show as –
 in the report and are excluded from the cost per miss and average clock.
+
+## Prebuilt binaries
+
+Each [release](https://github.com/juusolatva/branch-bench/releases) has static Linux binaries for x86-64 and arm64 (aarch64), built with the newest GCC release and the flags above. Being static, they run on any Linux of that architecture, including musl systems such as OpenWrt. The banner shows the compiler, flags and release tag. Download the one for your machine (`uname -m`) and `SHA256SUMS`, then:
+
+```sh
+sha256sum -c --ignore-missing SHA256SUMS
+chmod +x branch_bench-*-linux-x86_64
+./branch_bench-*-linux-x86_64 -n 6 -o report.md
+```
+
+`gh attestation verify <file> --repo juusolatva/branch-bench` checks that a binary was built by this repository's release workflow.
 
 ## Saving results
 

@@ -3,7 +3,8 @@
 # commit SHA and its "# vX.Y.Z" comment) and the Python packages locked in
 # .github/requirements.txt (gcovr and its dependencies; it reruns
 # pip-compile on requirements.in, so the hashes are updated too) and the
-# gcc image in .github/gcc-latest/Dockerfile (tag and digest).
+# gcc image in .github/gcc-latest/Dockerfile (tag and digest), which
+# also builds the release binaries.
 # The cooldown skips releases younger than 7 days, giving a broken or
 # compromised release time to be noticed and pulled first. It does not
 # delay security updates.
