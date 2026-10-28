@@ -114,6 +114,31 @@ static void failed_measurements(void)
     puts("ok   failed reads, unscheduled trials, ioctl errors and recovery");
 }
 
+/* On ARM a counter can open only as its raw PMU event; the banner and report
+ * must say which ones did. */
+static void raw_event_reporting(void)
+{
+    perf_raw_mask = (1u << CTR_BRANCHES) | (1u << CTR_CYCLES);
+    char list[96];
+    raw_events_list(list, sizeof list);
+    assert(strcmp(list, "branches (0x12), cycles (0x11)") == 0);
+
+    FILE *f = tmpfile();
+    assert(f);
+    write_report_header(f, "");
+    rewind(f);
+    char line[256];
+    int found = 0;
+    while (fgets(line, sizeof line, f))
+        found |= strcmp(line, "_Raw ARM PMU events (generic events failed): "
+                              "branches (0x12), cycles (0x11)_\n") == 0;
+    fclose(f);
+    assert(found);
+    print_banner("");
+    perf_raw_mask = 0;
+    puts("ok   raw PMU events named in banner and report");
+}
+
 int main(void)
 {
     perf_leader = 42;
@@ -139,5 +164,6 @@ int main(void)
     puts("ok   per-trial perf scaling with changing multiplexing");
     invalid_reporting(first);
     failed_measurements();
+    raw_event_reporting();
     return 0;
 }
