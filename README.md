@@ -16,7 +16,7 @@ A simple benchmark for testing out gains from branch prediction or conversely lo
 
 ## Notes
 
-You **MUST** run this with ./run.sh or build it with exactly `gcc -std=c99 -O2 -fno-tree-vectorize -fno-if-conversion -o branch_bench branch_bench.c`. Without *-fno-tree-vectorize* and *-fno-if-conversion* the compiler optimizes the mispredictions away, and other optimization levels give results that cannot be compared with [RESULTS.md](RESULTS.md). `./run.sh` builds and then runs the benchmark with any options you give it (e.g. `./run.sh -n 5 -o report.md`); after that, `./branch_bench` runs it directly. Build with GCC: Clang has no equivalent of *-fno-if-conversion* and makes Tests 1, 2 and Test 4's branch variant branchless, so its timings show no misprediction cost (see [AGENTS.md](AGENTS.md)).
+You **MUST** run this with ./run.sh or build it with exactly `gcc -std=c99 -O2 -fno-tree-vectorize -fno-if-conversion -o branch_bench branch_bench.c`, adding `-Wa,-mbranches-within-32B-boundaries,-malign-branch=jcc+fused+jmp+call+ret+indirect` on x86-64 as `./run.sh` does. Without *-fno-tree-vectorize* and *-fno-if-conversion* the compiler optimizes the mispredictions away, and other optimization levels give results that cannot be compared with [RESULTS.md](RESULTS.md). The x86-64 assembler flags keep every jump in the kernels off 32-byte boundaries, which Intel's JCC-erratum fix slows on Skylake-derived CPUs. `./run.sh` builds and then runs the benchmark with any options you give it (e.g. `./run.sh -n 5 -o report.md`); after that, `./branch_bench` runs it directly. Build with GCC: Clang has no equivalent of *-fno-if-conversion* and makes Tests 1, 2 and Test 4's branch variant branchless, so its timings show no misprediction cost (see [AGENTS.md](AGENTS.md)).
 
 The benchmark builds on Linux with GCC; on Windows, use WSL2. Other POSIX systems build with GCC too but show times only. On macOS `gcc` is Clang, so install GCC (e.g. from Homebrew) and build with the command above using its versioned `gcc-<N>` (`./run.sh` calls plain `gcc`).
 
@@ -82,8 +82,9 @@ Run `./branch_bench --help` for all options.
 The current entries in [RESULTS.md](RESULTS.md) are default-size runs
 with `-n 6` on an otherwise idle machine. Write the report to a separate
 file (never `-o RESULTS.md`) and paste its `## <CPU>` section under
-`# NEW RESULTS`, or under `# VPS RESULTS` for a virtual server. Mention
-the GCC version, since codegen can change timings. `# OLD RESULTS` holds
+`# NEW RESULTS`, or under `# VPS RESULTS` for a virtual server. The report
+records the compiler (and, when built by `./run.sh`, the flags and commit),
+since codegen can change timings. `# OLD RESULTS` holds
 runs from an earlier version (single trial, no cycle counter, older
 Test 3 labels). Suffixes such as `(WSL2)` in headings, and clocks where
 Linux reports none, were added by hand.

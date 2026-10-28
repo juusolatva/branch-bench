@@ -3,8 +3,9 @@
 # boundary.  Intel's JCC-erratum microcode (Skylake-derived CPUs) slows such
 # jumps; a macro-fused cmp/test/add/sub/and/inc/dec + jcc pair counts as one
 # jump.  A hit inside a kernel's hot loop can change timings; hits in setup
-# code outside the loop do not matter.  Layout depends on the compiler, so
-# this is a local check, not a CI one.  x86-64 only.
+# code outside the loop do not matter.  Builds with run.sh's alignment flags
+# (-Wa,-mbranches-within-32B-boundaries,...) have no hits at all, and CI's
+# x86-64 gcc job fails on any.  x86-64 only.
 #
 # Usage: check_jcc.sh <binary>
 # Prints one line per hit (function, address, instruction) and exits 0 with or

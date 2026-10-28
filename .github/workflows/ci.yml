@@ -18,6 +18,9 @@ concurrency:
 env:
   # Flags the benchmark needs (see AGENTS.md, "Critical Compiler Flags").
   BENCH_FLAGS: -std=c99 -O2 -fno-tree-vectorize -fno-if-conversion
+  # x86-64 only, as in run.sh: keeps every kernel jump off 32-byte boundaries
+  # (JCC erratum, see AGENTS.md).
+  JCC_FLAGS: -Wa,-mbranches-within-32B-boundaries,-malign-branch=jcc+fused+jmp+call+ret+indirect
   # Clang has no -fno-if-conversion (see AGENTS.md, "Compiler Support").
   CLANG_FLAGS: -std=c99 -O2 -fno-vectorize -fno-slp-vectorize
   WARN_FLAGS: -Wall -Wextra -pedantic -Werror
@@ -42,7 +45,9 @@ jobs:
         run: gcc --version
 
       - name: Build
-        run: gcc $BENCH_FLAGS $WARN_FLAGS -o branch_bench branch_bench.c
+        run: |
+          if [ "$(uname -m)" = x86_64 ]; then BENCH_FLAGS="$BENCH_FLAGS $JCC_FLAGS"; fi
+          gcc $BENCH_FLAGS $WARN_FLAGS -o branch_bench branch_bench.c
 
       - name: Build without perf support (non-Linux path)
         run: gcc $BENCH_FLAGS $WARN_FLAGS -U__linux__ -c -o /dev/null branch_bench.c
@@ -57,6 +62,16 @@ jobs:
 
       - name: Check Test 1-3 kernels keep real branches
         run: .github/scripts/check_kernels.sh ./branch_bench
+
+      - name: Check no kernel jump crosses a 32-byte boundary
+        if: runner.arch == 'X64'
+        run: |
+          hits=$(.github/scripts/check_jcc.sh ./branch_bench)
+          if [ -n "$hits" ]; then
+            printf '%s\n' "$hits"
+            echo "::error::kernel jumps cross or end on a 32-byte boundary (JCC erratum)"
+            exit 1
+          fi
 
   clang:
     name: Clang build and static analysis
@@ -175,6 +190,7 @@ jobs:
           "$BUILD_WRAPPER"
           --out-dir build_wrapper_output
           gcc -std=c99 -O0 -g --coverage -fno-tree-vectorize -fno-if-conversion
+          -DBUILD_FLAGS='"--coverage"' -DBUILD_COMMIT="\"$GITHUB_SHA\""
           -o branch_bench_cov branch_bench.c
 
       - name: Smoke test
