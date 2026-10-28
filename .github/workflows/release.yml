@@ -114,9 +114,17 @@ jobs:
             echo "$GITHUB_REF_NAME is a lightweight tag; push a signed one (git tag -s)"
             exit 1
           fi
-          reason=$(gh api "$api/tags/$sha" --jq .verification.reason)
+          read -r reason target <<EOF
+          $(gh api "$api/tags/$sha" --jq '.verification.reason + " " + .object.sha')
+          EOF
           if [ "$reason" != valid ]; then
             echo "$GITHUB_REF_NAME is not a verified signed tag ($reason); push a signed one (git tag -s)"
+            exit 1
+          fi
+          # The tag may have been replaced since this run started; its
+          # signature must cover the commit the binaries were built from.
+          if [ "$target" != "$GITHUB_SHA" ]; then
+            echo "$GITHUB_REF_NAME now points to $target, but this run built $GITHUB_SHA"
             exit 1
           fi
 
