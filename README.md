@@ -28,11 +28,11 @@ in the report and are excluded from the cost per miss and average clock.
 
 ## Prebuilt binaries
 
-Each [release](https://github.com/juusolatva/branch-bench/releases) has static Linux binaries for x86-64 and arm64 (aarch64), built with the newest GCC release and the flags above. Being static, they run on any Linux of that architecture, including musl systems such as OpenWrt. The banner shows the compiler, flags and release tag. Download the one for your machine (`uname -m`) and `SHA256SUMS`, then:
+Each [release](https://github.com/juusolatva/branch-bench/releases) has static Linux binaries for x86-64 and arm64 (aarch64), built with the newest GCC release and the flags above. Being static, they run on any Linux of that architecture, including musl systems such as OpenWrt. The banner shows the compiler, flags and release tag. Download the one for your machine (`uname -m`) and its `.sha256` file, then:
 
 ```sh
-sha256sum -c --ignore-missing SHA256SUMS
 bin=$(ls branch_bench-*-linux-"$(uname -m)")
+sha256sum -c "$bin.sha256"
 chmod +x "$bin"
 ./"$bin" -n 6 -o report.md
 ```
