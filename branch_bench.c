@@ -183,6 +183,10 @@ static const int counter_display_order[] = {
 };
 CHECK_LEN(counter_display_order_len_check, counter_display_order, CTR_COUNT);
 
+/* Bit c set when counter c opened only as its ARM raw event because the
+ * generic one failed; stays 0 on other architectures and without HAVE_PERF. */
+static unsigned perf_raw_mask = 0;
+
 #ifdef HAVE_PERF
 /* All counters are opened as one perf group so the kernel schedules them
  * together and they cover exactly the same window.  The first counter that
@@ -222,15 +226,19 @@ static void perf_add(int ctr)
 {
     const CounterDesc *d = &counter_descs[ctr];
     int fd = perf_open(PERF_TYPE_HARDWARE, d->generic, perf_leader);
+    unsigned raw = 0;
 #if defined(__aarch64__) || defined(__arm__)
-    if (fd < 0)
+    if (fd < 0) {
         fd = perf_open(PERF_TYPE_RAW, d->arm_raw, perf_leader);
+        raw = 1;
+    }
 #endif
     if (fd < 0) return;
     if (perf_leader < 0) perf_leader = fd;
     perf_fd[ctr]    = fd;
     perf_slot[ctr]  = perf_members++;
     perf_open_mask |= 1u << ctr;
+    perf_raw_mask  |= raw << ctr;
 }
 
 static void perf_init(void)
@@ -248,7 +256,7 @@ static void perf_close(void)
 /* Scheduling times are cumulative: PERF_EVENT_IOC_RESET resets counts only. */
 static int perf_read_group(u64 *buf)
 {
-    ssize_t want = (ssize_t)((3 + perf_members) * sizeof(u64));
+    ssize_t want = (ssize_t)((3 + (size_t)perf_members) * sizeof(u64));
     return read(perf_leader, buf, (size_t)want) == want &&
            buf[0] == (u64)perf_members;
 }
@@ -751,10 +759,6 @@ static void run_test1(FILE *report)
  *
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/* Pre-generated branch decision arrays (avoids RNG in hot loop) */
-static u8 *decisions_periodic = NULL;  /* 1 at every 4th position           */
-static u8 *decisions_random   = NULL;  /* 1 with 25% probability, random    */
-
 __attribute__((noinline))
 static u64 count_decisions(const u8 *decisions, size_t n, unsigned n_reps)
 {
@@ -769,8 +773,9 @@ static u64 count_decisions(const u8 *decisions, size_t n, unsigned n_reps)
 static void run_test2(FILE *report)
 {
     const size_t len = size;
-    decisions_periodic = malloc(len);
-    decisions_random   = malloc(len);
+    /* Pre-generated branch decision arrays (avoids RNG in hot loop) */
+    u8 *decisions_periodic = malloc(len);  /* 1 at every 4th position        */
+    u8 *decisions_random   = malloc(len);  /* 1 with 25% probability, random */
     if (!decisions_periodic || !decisions_random) { perror("malloc"); exit(1); }
 
     for (size_t i = 0; i < len; i++) {
@@ -789,8 +794,8 @@ static void run_test2(FILE *report)
 
     anti_dce_sink(rp.result + rr.result);
 
-    free(decisions_periodic); decisions_periodic = NULL;
-    free(decisions_random);   decisions_random   = NULL;
+    free(decisions_periodic);
+    free(decisions_random);
 
     const Work work = { (u64)len * reps, "elem" };
     const ReportRow rows[] = {
@@ -848,9 +853,6 @@ FOR_EACH_LEAF(DEF_LEAF)
 #define PTR_LEAF(n) leaf_##n,
 static leaf_fn_t leaf_table[NUM_FUNCS] = { FOR_EACH_LEAF(PTR_LEAF) };
 
-/* Pre-built random index sequence (uint8_t → 1 byte/call → cache-friendly) */
-static u8 *dispatch_indices = NULL;
-
 __attribute__((noinline))
 static u64 dispatch_sequential(size_t n)
 {
@@ -872,7 +874,8 @@ static u64 dispatch_random(const u8 *idx, size_t n)
 static void run_test3(FILE *report)
 {
     const size_t len = size;
-    dispatch_indices = malloc(len);
+    /* Pre-built random index sequence (uint8_t → 1 byte/call → cache-friendly) */
+    u8 *dispatch_indices = malloc(len);
     if (!dispatch_indices) { perror("malloc"); exit(1); }
     for (size_t i = 0; i < len; i++)
         dispatch_indices[i] = (u8)((rng64() >> 32) % NUM_FUNCS);
@@ -892,7 +895,7 @@ static void run_test3(FILE *report)
 
     anti_dce_sink(rs.result + rr.result);
 
-    free(dispatch_indices); dispatch_indices = NULL;
+    free(dispatch_indices);
 
     const Work work = { len, "call" };
     const ReportRow rows[] = {
@@ -1153,7 +1156,24 @@ static void selected_tests_list(char *buf, size_t bufsz)
     buf[0] = '\0';
     for (int n = 1; n <= NUM_TESTS; n++) {
         if (!test_selected(n) || len >= bufsz) continue;
-        len += snprintf(buf + len, bufsz - len, "%s%d", len ? ", " : "", n);
+        int written = snprintf(buf + len, bufsz - len, "%s%d", len ? ", " : "", n);
+        if (written < 0) break;
+        len += (size_t)written;
+    }
+}
+
+/* Counters that opened as raw events, e.g. "branches (0x12), cycles (0x11)". */
+static void raw_events_list(char *buf, size_t bufsz)
+{
+    size_t len = 0;
+    buf[0] = '\0';
+    for (int c = 0; c < CTR_COUNT; c++) {
+        if (!((perf_raw_mask >> c) & 1u) || len >= bufsz) continue;
+        int written = snprintf(buf + len, bufsz - len, "%s%s (0x%" PRIx64 ")",
+                               len ? ", " : "", counter_descs[c].console_label,
+                               counter_descs[c].arm_raw);
+        if (written < 0) break;
+        len += (size_t)written;
     }
 }
 
@@ -1171,6 +1191,11 @@ static void print_banner(const char *tests_list)
     printf("  Perf counters:   %s\n",
            perf_available() ? "AVAILABLE (hardware branch-miss counts shown)"
                             : "unavailable — showing wall-clock timing only");
+    if (perf_raw_mask) {
+        char raw[96];
+        raw_events_list(raw, sizeof raw);
+        printf("  Raw PMU events:  %s (generic events failed)\n", raw);
+    }
     printf("  Compiler:        %s\n", COMPILER_VERSION);
     if (BUILD_FLAGS[0])
         printf("  Build flags:     %s\n", BUILD_FLAGS);
@@ -1197,6 +1222,11 @@ static void write_report_header(FILE *report, const char *tests_list)
             size, reps,
             perf_available() ? "available (hardware counts)" : "unavailable (wall-clock only)",
             COMPILER_VERSION);
+    if (perf_raw_mask) {
+        char raw[96];
+        raw_events_list(raw, sizeof raw);
+        fprintf(report, "_Raw ARM PMU events (generic events failed): %s_\n\n", raw);
+    }
     if (BUILD_FLAGS[0])
         fprintf(report, "_Build flags: `%s`_\n\n", BUILD_FLAGS);
     if (BUILD_COMMIT[0])
