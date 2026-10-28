@@ -2,7 +2,8 @@ name: Release
 
 # A version tag (v*) builds static binaries for x86-64 and arm64 with the
 # gcc-latest image, checks them as CI checks its builds and publishes them,
-# with SHA256SUMS and build provenance attestations, as a GitHub release.
+# with a .sha256 file each and build provenance attestations, as a GitHub
+# release. Only signed tags that GitHub verifies are published.
 # Pull requests that change this workflow or the image run the builds and
 # checks only, so a broken release build shows up before the next tag.
 on:
@@ -101,21 +102,43 @@ jobs:
       id-token: write     # sign the attestations
       attestations: write
     steps:
+      - name: Require a verified signed tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          api="repos/$GITHUB_REPOSITORY/git"
+          read -r type sha <<EOF
+          $(gh api "$api/ref/tags/$GITHUB_REF_NAME" --jq '.object.type + " " + .object.sha')
+          EOF
+          if [ "$type" != tag ]; then
+            echo "$GITHUB_REF_NAME is a lightweight tag; push a signed one (git tag -s)"
+            exit 1
+          fi
+          reason=$(gh api "$api/tags/$sha" --jq .verification.reason)
+          if [ "$reason" != valid ]; then
+            echo "$GITHUB_REF_NAME is not a verified signed tag ($reason); push a signed one (git tag -s)"
+            exit 1
+          fi
+
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: branch_bench-*
           path: dist
           merge-multiple: true
 
-      - name: Checksums
-        run: |
-          cd dist
-          sha256sum branch_bench-* > SHA256SUMS
-          cat SHA256SUMS
-
+      # Before the checksums, so the glob matches only the binaries.
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/branch_bench-*
+
+      # One <binary>.sha256 per binary, in sha256sum -c format.
+      - name: Checksums
+        run: |
+          cd dist
+          for f in branch_bench-*; do
+            sha256sum "$f" > "$f.sha256"
+            cat "$f.sha256"
+          done
 
       - name: Create release
         env:
