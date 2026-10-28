@@ -42,6 +42,9 @@ expect 0 -t 3 --size 1000 --reps 1
 for t in 1 2 3 4; do
     grep -q "^### Test $t " "$dir/report.md" || { echo "FAIL report.md lacks Test $t"; fail=1; }
 done
+# ... and record the compiler that built it.
+grep -q '^| Array size | Repetitions | Perf counters | Compiler |$' "$dir/report.md" ||
+    { echo "FAIL report.md lacks a Compiler column"; fail=1; }
 
 # Invalid input: exit code 1 with a message
 expect 1 --size 0

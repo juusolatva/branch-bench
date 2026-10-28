@@ -72,6 +72,8 @@ Same sum, computed via conditional jump vs. arithmetic mask, on sorted and rando
 
 _2026-10-08_
 
+_Built before `run.sh` aligned the kernels' jumps: this Skylake-derived CPU has the JCC erratum, so some kernels may include its penalty. Needs a rerun._
+
 | Array size | Repetitions | Perf counters |
 |---:|---:|---|
 | 4194304 elements | 64/trial | available (hardware counts) |
@@ -383,6 +385,8 @@ Same sum, computed via conditional jump vs. arithmetic mask, on sorted and rando
 ## Intel Xeon Processor (Skylake)
 
 _2026-10-08_
+
+_Built before `run.sh` aligned the kernels' jumps: Skylake has the JCC erratum, so some kernels may include its penalty. Needs a rerun._
 
 | Array size | Repetitions | Perf counters |
 |---:|---:|---|

@@ -14,8 +14,10 @@
  * many cloud VPSes don't).  Falls back to wall-clock timing
  * automatically, which is meaningful everywhere including containers and VMs.
  *
- * Build:
+ * Build (or use run.sh, which adds the x86-64 flags and build provenance):
  *   gcc -std=c99 -O2 -fno-tree-vectorize -fno-if-conversion -o branch_bench branch_bench.c
+ * On x86-64 add, to keep kernel jumps off 32-byte boundaries (JCC erratum):
+ *   -Wa,-mbranches-within-32B-boundaries,-malign-branch=jcc+fused+jmp+call+ret+indirect
  *
  * Note: -fno-tree-vectorize prevents SIMD rewriting that would bypass branches.
  *       -fno-if-conversion keeps if-else as actual branch instructions (not CMOV),
@@ -62,6 +64,23 @@
 #define MAX_TRIALS    99           /* upper limit for -n/--trials             */
 #define MAX_SIZE      (1UL << 30)  /* upper limit for --size                  */
 #define MAX_REPS      100000UL     /* upper limit for --reps                  */
+
+/* ── Build provenance (printed in the banner and report) ────────────────── */
+/* Clang's __VERSION__ already names the compiler; GCC's is only the number. */
+#if defined(__clang__)
+#  define COMPILER_VERSION __VERSION__
+#elif defined(__GNUC__)
+#  define COMPILER_VERSION "GCC " __VERSION__
+#else
+#  define COMPILER_VERSION "unknown compiler"
+#endif
+/* run.sh passes its compiler flags and git commit; other builds leave them out. */
+#ifndef BUILD_FLAGS
+#  define BUILD_FLAGS ""
+#endif
+#ifndef BUILD_COMMIT
+#  define BUILD_COMMIT ""
+#endif
 
 /* Run-time settings, changed only by command-line options. */
 static size_t   size  = DEFAULT_SIZE;  /* --size: elements per array (tests 1/2/4),
@@ -636,6 +655,12 @@ static int cmp_u8_asc(const void *a, const void *b)
     return (int)*(const u8*)a - (int)*(const u8*)b;
 }
 
+static void fill_random_bytes(u8 *arr, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+        arr[i] = (u8)(rng64() & 0xff);
+}
+
 static void shuffle_u8(u8 *arr, size_t n)
 {
     for (size_t i = n - 1; i > 0; --i) {
@@ -680,8 +705,7 @@ static void run_test1(FILE *report)
     if (!sorted || !shuffled) { perror("malloc"); exit(1); }
 
     /* Fill with uniform random bytes, then sort one copy */
-    for (size_t i = 0; i < len; i++)
-        sorted[i] = (u8)(rng64() & 0xff);
+    fill_random_bytes(sorted, len);
     memcpy(shuffled, sorted, len);
     qsort(sorted, len, 1, cmp_u8_asc);
     shuffle_u8(shuffled, len);
@@ -943,12 +967,9 @@ static void run_test4(FILE *report)
     u8 *random_d = malloc(len);
     if (!sorted || !random_d) { perror("malloc"); exit(1); }
 
-    for (size_t i = 0; i < len; i++)
-        sorted[i] = (u8)(rng64() & 0xff);
+    fill_random_bytes(sorted, len);
     qsort(sorted, len, 1, cmp_u8_asc);
-
-    for (size_t i = 0; i < len; i++)
-        random_d[i] = (u8)(rng64() & 0xff);
+    fill_random_bytes(random_d, len);
 
     printf("TEST 4 — Branch vs Branchless  (sorted and random data, %zu×%u reps)\n",
            len, reps);
@@ -1150,6 +1171,11 @@ static void print_banner(const char *tests_list)
     printf("  Perf counters:   %s\n",
            perf_available() ? "AVAILABLE (hardware branch-miss counts shown)"
                             : "unavailable — showing wall-clock timing only");
+    printf("  Compiler:        %s\n", COMPILER_VERSION);
+    if (BUILD_FLAGS[0])
+        printf("  Build flags:     %s\n", BUILD_FLAGS);
+    if (BUILD_COMMIT[0])
+        printf("  Commit:          %s\n", BUILD_COMMIT);
     printf("══════════════════════════════════════════════════════════════\n\n");
 }
 
@@ -1165,11 +1191,16 @@ static void write_report_header(FILE *report, const char *tests_list)
 
     fprintf(report, "## %s\n\n", cpu);
     fprintf(report, "_%s_\n\n", date);
-    fprintf(report, "| Array size | Repetitions | Perf counters |\n");
-    fprintf(report, "|---:|---:|---|\n");
-    fprintf(report, "| %zu elements | %u/trial | %s |\n\n",
+    fprintf(report, "| Array size | Repetitions | Perf counters | Compiler |\n");
+    fprintf(report, "|---:|---:|---|---|\n");
+    fprintf(report, "| %zu elements | %u/trial | %s | %s |\n\n",
             size, reps,
-            perf_available() ? "available (hardware counts)" : "unavailable (wall-clock only)");
+            perf_available() ? "available (hardware counts)" : "unavailable (wall-clock only)",
+            COMPILER_VERSION);
+    if (BUILD_FLAGS[0])
+        fprintf(report, "_Build flags: `%s`_\n\n", BUILD_FLAGS);
+    if (BUILD_COMMIT[0])
+        fprintf(report, "_Commit: `%s`_\n\n", BUILD_COMMIT);
     if (trials > 1)
         fprintf(report, "_Median of %d trials per variant, after one warm-up run. "
                         "Range is the fastest–slowest trial._\n\n", trials);
