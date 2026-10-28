@@ -46,7 +46,7 @@ jobs:
 
       - name: Build
         run: |
-          if [ "$(uname -m)" = x86_64 ]; then BENCH_FLAGS="$BENCH_FLAGS $JCC_FLAGS"; fi
+          if [ "$RUNNER_ARCH" = X64 ]; then BENCH_FLAGS="$BENCH_FLAGS $JCC_FLAGS"; fi
           gcc $BENCH_FLAGS $WARN_FLAGS -o branch_bench branch_bench.c
 
       - name: Build without perf support (non-Linux path)
