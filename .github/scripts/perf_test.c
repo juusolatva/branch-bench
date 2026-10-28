@@ -1,5 +1,11 @@
 /* Deterministic tests of the real perf code; no hardware PMU is needed.
- * Reads return Linux-style cumulative scheduling times. */
+ * Reads return Linux-style cumulative scheduling times.
+ *
+ * The #defines below rename every read() and ioctl() in branch_bench.c and
+ * the system headers it includes, so all of them reach the stubs, which
+ * serve only perf counter reads (test_read asserts when it runs out of
+ * samples).  If branch_bench.c starts calling read() or ioctl() for anything
+ * else, e.g. sysfs, make the stubs pass those calls through. */
 #define main benchmark_main
 #define read test_read
 #define ioctl test_ioctl
