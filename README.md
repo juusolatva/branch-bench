@@ -32,8 +32,9 @@ Each [release](https://github.com/juusolatva/branch-bench/releases) has static L
 
 ```sh
 sha256sum -c --ignore-missing SHA256SUMS
-chmod +x branch_bench-*-linux-x86_64
-./branch_bench-*-linux-x86_64 -n 6 -o report.md
+bin=$(ls branch_bench-*-linux-"$(uname -m)")
+chmod +x "$bin"
+./"$bin" -n 6 -o report.md
 ```
 
 `gh attestation verify <file> --repo juusolatva/branch-bench` checks that a binary was built by this repository's release workflow.
