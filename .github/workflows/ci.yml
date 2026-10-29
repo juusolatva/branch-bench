@@ -261,7 +261,8 @@ jobs:
           grep -q '^\*\*Cost per miss:\*\*' "$dir/report.md"
           grep -q '^\*\*Average clock during measurements:\*\*' "$dir/report.md"
           grep -q '^\*\*Periods at' "$dir/t5.md"
-          grep -q '^\*\*Correlation used' "$dir/t6.md"
+          grep -q '^\*\*Correlation used:\*\* d=4 [0-9]*%, d=8 n/a' "$dir/t6.md"
+          grep -q '^_n/a: ' "$dir/t6.md"
           # Only some counters open.  Tests 1-2 come first: the shim fails the
           # first and third counter reads, and their four measurements absorb
           # them.  The Test 5-6 summaries need misses, and only misses.
