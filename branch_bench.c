@@ -79,6 +79,7 @@
 #define D6_MAX_DIST    1024
 #define D6_DISTS       9
 #define D6_MIN_BLOCKS  64
+#define D6_MIN_SAMPLE  65536  /* blocks per pass for a "Correlation used" figure */
 #define D6_SEED_A      0x6a09e667f3bcc908ULL  /* nonzero, distinct seeds */
 #define D6_SEED_B      0xbb67ae8584caa73bULL
 
@@ -1336,22 +1337,34 @@ static void measure_distances(const u8 *a, u8 *b, size_t len, u64 total,
 
 /* Per distance, how much of B's randomness the correlation removed, and the
  * largest d at 90% or more; needs the miss counter on every row.  These are
- * descriptive thresholds, not a measured history length. */
-static void print_correlation_used(FILE *report, const ReportRow *rows)
+ * descriptive thresholds, not a measured history length.  A distance with
+ * fewer than D6_MIN_SAMPLE blocks per pass shows n/a: the predictor could
+ * learn its short random sequences, so B would look predictable either way. */
+static void print_correlation_used(FILE *report, const ReportRow *rows,
+                                   size_t len, u64 total)
 {
     char list[256] = "";
     size_t used = 0;
     unsigned best = 0;
+    int any_short = 0;
     for (int i = 0; i < 2 * D6_DISTS; i++)
         if (!result_has(&rows[i].r, CTR_MISSES)) return;
     for (int i = 0; i < D6_DISTS; i++) {
         const unsigned d = (unsigned)D6_MIN_DIST << i;
-        const double pct = correlation_used_pct(&rows[2 * i].r, &rows[2 * i + 1].r,
-                                                rows[2 * i].work->count);
+        size_t blocks;
+        unsigned passes;
+        d6_layout(total, len, d, &blocks, &passes);
         char entry[32];
-        snprintf(entry, sizeof entry, "d=%u %.0f%%", d, pct);
+        if (blocks < D6_MIN_SAMPLE) {
+            snprintf(entry, sizeof entry, "d=%u n/a", d);
+            any_short = 1;
+        } else {
+            const double pct = correlation_used_pct(&rows[2 * i].r, &rows[2 * i + 1].r,
+                                                    (u64)blocks * passes);
+            snprintf(entry, sizeof entry, "d=%u %.0f%%", d, pct);
+            if (pct >= 90.0) best = d;
+        }
         list_append(list, sizeof list, &used, entry);
-        if (pct >= 90.0) best = d;
     }
     char best_d[16];
     snprintf(best_d, sizeof best_d, "%u", best);
@@ -1360,6 +1373,13 @@ static void print_correlation_used(FILE *report, const ReportRow *rows)
     if (report)
         fprintf(report, "**Correlation used:** %s\n\n**Largest d with ≥ 90%%:** %s\n\n",
                 list, shown);
+    if (any_short) {
+        printf("  → n/a: fewer than %d blocks per pass, short enough to be learned\n",
+               D6_MIN_SAMPLE);
+        if (report)
+            fprintf(report, "_n/a: fewer than %d blocks per pass, short enough to be learned._\n\n",
+                    D6_MIN_SAMPLE);
+    }
 }
 
 static void run_test6(FILE *report)
@@ -1399,7 +1419,7 @@ static void run_test6(FILE *report)
 
     emit_rows(report, D6_TITLE, D6_DESC, rows, 2 * D6_DISTS, &works[0]);
     print_miss_cost(report, &rows[0].r, &rows[1].r);
-    print_correlation_used(report, rows);
+    print_correlation_used(report, rows, len, (u64)len * r);
     printf("\n");
 }
 

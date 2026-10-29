@@ -270,6 +270,31 @@ static void bounded_list(void)
     puts("ok   bounded summary lists");
 }
 
+/* Distances with too few blocks per pass report n/a: a predictor could
+ * learn their short random sequences, so the percentage would mislead. */
+static void short_correlation_samples(void)
+{
+    /* len 64K, budget 6 × 64K: only d = 4 gets 65536 blocks (1 pass). */
+    ReportRow rows[2 * D6_DISTS];
+    for (int i = 0; i < 2 * D6_DISTS; i++) {
+        rows[i].label = "x";
+        rows[i].r = with_misses(i == 1 ? 16384 : 0);   /* d=4: 50% */
+        rows[i].work = NULL;
+    }
+    FILE *f = tmpfile();
+    assert(f);
+    print_correlation_used(f, rows, 65536, 6ULL * 65536);
+    rewind(f);
+    char output[1024] = {0};
+    assert(fread(output, 1, sizeof(output) - 1, f) > 0);
+    assert(fclose(f) == 0);
+    assert(strstr(output, "**Correlation used:** d=4 50%, d=8 n/a, "));
+    assert(strstr(output, "d=1024 n/a\n"));
+    assert(strstr(output, "**Largest d with ≥ 90%:** none\n"));
+    assert(strstr(output, "_n/a: fewer than 65536 blocks per pass"));
+    puts("ok   short Test 6 samples report n/a");
+}
+
 int main(void)
 {
     perf_leader = 42;
@@ -300,5 +325,6 @@ int main(void)
     pattern_learnability();
     correlation_distance();
     bounded_list();
+    short_correlation_samples();
     return 0;
 }

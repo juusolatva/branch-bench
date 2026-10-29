@@ -50,8 +50,10 @@ expect 0 -t 2 -t 5 --size 1000 --reps 1 -o "$dir/mixed.md"
 grep -q '^### Test 2 ' "$dir/mixed.md" || { echo "FAIL mixed.md lacks Test 2"; fail=1; }
 grep -q 'Skipped:' "$dir/mixed.md" || { echo "FAIL mixed.md lacks Test 5's skip reason"; fail=1; }
 # Test 6 is opt-in; it skips when --size < 64 or --size × --reps < 65664.
-# shellcheck disable=SC2086
-expect 0 -t 4 -t 6 $small -o "$dir/t6.md"
+# At 64K × 6 only d = 4 gets the 65536 blocks per pass that a "Correlation
+# used" figure needs, so the report has both a figure and n/a entries.
+expect 0 -t 4 -t 6 --size 64K --reps 6 -o "$dir/t6.md"
+grep -q '^_n/a: ' "$dir/t6.md" || { echo "FAIL t6.md lacks the n/a note"; fail=1; }
 grep -q '^### Test 6 ' "$dir/t6.md" || { echo "FAIL t6.md lacks Test 6"; fail=1; }
 expect 0 -t 6 --size 1000 --reps 1 -o "$dir/skip6.md"
 grep -q 'Skipped:' "$dir/skip6.md" || { echo "FAIL skip6.md lacks the skip reason"; fail=1; }

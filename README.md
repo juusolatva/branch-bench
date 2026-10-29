@@ -213,5 +213,8 @@ Ryzen 5 9600X under WSL2).
   d counts filler iterations, not history bits: each adds two conditional
   branches (the filler and the loop back-edge), one of them taken. The
   percentage need not fall steadily with d, and "Largest d with ≥ 90%" is
-  a description of this run, not a measured history length. Rows do
+  a description of this run, not a measured history length. A distance
+  with fewer than 65536 blocks per pass shows n/a: its random sequences
+  repeat so often that the predictor could learn them, making B
+  predictable without A. At the defaults every distance has enough. Rows do
   different amounts of work, so compare times only within a pair.
