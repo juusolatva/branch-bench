@@ -60,6 +60,7 @@ static void reset_log(int test)
 {
     trial_log_len = 0;
     pair_count = 0;
+    variant_count = 0;
     begin_test(test);
 }
 
@@ -672,6 +673,28 @@ static void paired_cost(void)
     puts("ok   paired effective cost: signed, partial, inconclusive, unavailable");
 }
 
+/* JSON strings escape quotes, backslashes and control bytes and pass UTF-8
+ * through; -o and --json must never name one file. */
+static void json_escaping(void)
+{
+    FILE *f = tmpfile();
+    assert(f);
+    json_string(f, "a\"b\\c\n\x01é");
+    rewind(f);
+    char out[64] = {0};
+    size_t n = fread(out, 1, sizeof out - 1, f);
+    (void)n;
+    assert(fclose(f) == 0);
+    assert(strcmp(out, "\"a\\\"b\\\\c\\n\\u0001é\"") == 0);
+    assert(same_file("x", "x") == 1);
+    assert(same_file("/", "/.") == 1);
+    assert(same_file("/no/such/a", "/no/such/b") == 0);
+    assert(strcmp(perf_status_name(PERF_NOT_SCHEDULED), "not_scheduled") == 0);
+    assert(strcmp(perf_status_name(PERF_NONE), "none") == 0);
+    assert(strcmp(semantics_name(SEM_SPECULATIVE), "speculative") == 0);
+    puts("ok   JSON string escaping and same-file detection");
+}
+
 static void seeds(void)
 {
     const u64 saved = base_seed;
@@ -744,5 +767,6 @@ int main(void)
     counter_metadata();
     pair_schedule();
     paired_cost();
+    json_escaping();
     return 0;
 }

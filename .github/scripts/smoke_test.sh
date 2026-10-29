@@ -107,6 +107,33 @@ if grep -q 'CPU affinity\|Pinned to' "$dir/report.md"; then echo "FAIL default r
 grep -q '^| Array size | Repetitions | Perf counters | Compiler |$' "$dir/report.md" ||
     { echo "FAIL report.md lacks a Compiler column"; fail=1; }
 
+# --json: every trial and summary as JSON Lines; check_export.py rebuilds
+# the summaries from the trials and compares them with the report.
+check_export=$(dirname "$0")/check_export.py
+export_ok() {
+    if ! python3 "$check_export" "$@" >"$dir/check.out" 2>&1; then
+        echo "FAIL check_export.py $*"; cat "$dir/check.out"; fail=1
+    else
+        echo "ok   check_export.py $*"
+    fi
+}
+# shellcheck disable=SC2086
+expect 0 $small -n 3 -o "$dir/report3.md" --json "$dir/run.jsonl"
+export_ok "$dir/run.jsonl" --report "$dir/report3.md"
+# shellcheck disable=SC2086
+expect 0 --hard $small -o "$dir/hard3.md" --json "$dir/hard.jsonl"
+export_ok "$dir/hard.jsonl" --report "$dir/hard3.md"
+# Selecting more tests does not change Test 3's input; --seed does.
+expect 0 -t 3 --size 4K --reps 1 --json "$dir/a.jsonl"
+expect 0 -t 1 -t 3 --size 4K --reps 1 --json "$dir/b.jsonl"
+export_ok "$dir/a.jsonl" --same-results "$dir/b.jsonl" --test 3
+expect 0 -t 3 --seed 7 --size 4K --reps 1 --json "$dir/c.jsonl"
+export_ok "$dir/a.jsonl" --different-results "$dir/c.jsonl" --test 3
+# -o and --json must be different files, also through a hard link.
+expect 1 -t 3 --size 1K --reps 1 -o "$dir/same.out" --json "$dir/same.out"
+: > "$dir/x.md"; ln -f "$dir/x.md" "$dir/y.json"
+expect 1 -t 3 --size 1K --reps 1 -o "$dir/x.md" --json "$dir/y.json"
+
 # Invalid input: exit code 1 with a message
 expect 1 --size 0
 expect 1 --size 5X
@@ -119,6 +146,8 @@ expect 1 -t 7
 expect 1 --cpu 1024
 expect 1 --cpu
 expect 1 --cpu x
+expect 1 --json
+expect 1 --json "$dir/no/such/dir/x.jsonl"
 expect 1 --seed
 expect 1 --seed -1
 expect 1 --seed 18446744073709551616
@@ -135,6 +164,10 @@ if [ -c /dev/full ]; then
     fi
     if ! grep -q 'Error writing report' "$dir/stderr"; then
         echo "FAIL report write failure lacks a diagnostic"; fail=1
+    fi
+    expect 1 -t 3 --size 1 --reps 1 --json /dev/full
+    if ! grep -q 'Error writing JSON export' "$dir/stderr"; then
+        echo "FAIL JSON write failure lacks a diagnostic"; fail=1
     fi
 fi
 

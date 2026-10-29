@@ -48,6 +48,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/stat.h>
+#include <sys/utsname.h>
 
 /* ── Linux perf_event support (optional) ────────────────────────────────── */
 #ifdef __linux__
@@ -120,6 +122,7 @@ static int      hard_selected = 0;     /* --hard: all tests, including 5 and 6 *
 static u64      base_seed = DEFAULT_SEED;  /* --seed: every test's input derives from it */
 static int      seed_given = 0;        /* --seed was on the command line */
 static int      cpu_requested = -1;    /* --cpu: CPU to pin to, -1 = none */
+static const char *json_path = NULL;   /* --json: JSON Lines export file */
 
 /* ── Types ───────────────────────────────────────────────────────────────── */
 
@@ -148,6 +151,15 @@ enum {
     PERF_TIMES_INVALID,   /* scheduling times went backwards          */
     PERF_NOT_SCHEDULED    /* the group never ran during the trial     */
 };
+
+static const char *perf_status_name(int s)
+{
+    static const char *const names[] = {
+        "none", "ok", "start_failed", "stop_failed", "read_failed",
+        "times_invalid", "not_scheduled"
+    };
+    return s >= 0 && s <= PERF_NOT_SCHEDULED ? names[s] : "unknown";
+}
 
 typedef struct {
     double time_ms;
@@ -234,6 +246,12 @@ CHECK_LEN(counter_display_order_len_check, counter_display_order, CTR_COUNT);
  * branches and misses count the same one. */
 enum { SEM_UNKNOWN, SEM_RETIRED, SEM_SPECULATIVE, SEM_CYCLES };
 enum { ARCH_X86, ARCH_ARM, ARCH_OTHER };
+
+static const char *semantics_name(int sem)
+{
+    static const char *const names[] = { "unknown", "retired", "speculative", "cycles" };
+    return names[sem];
+}
 
 static int host_arch(void)
 {
@@ -408,6 +426,7 @@ static void perf_stop(Result *r)
 }
 
 static int perf_available(void)  { return perf_leader >= 0; }
+static unsigned perf_mask(void)  { return perf_open_mask; }
 
 #else
 static void perf_init(void)       {}
@@ -415,6 +434,7 @@ static void perf_close(void)      {}
 static void perf_start(void)      {}
 static void perf_stop(Result *r)  { r->perf_status = PERF_NONE; r->raw_mask = perf_raw_mask; }
 static int  perf_available(void)  { return 0; }
+static unsigned perf_mask(void)   { return 0; }
 #endif
 
 /* Opening a counter doesn't guarantee that a particular trial could read it. */
@@ -483,6 +503,14 @@ static int trial_count(void)
     if (trials > MAX_TRIALS) return MAX_TRIALS;
     return trials;
 }
+
+/* Work done per trial, for the misses-per-item column: elements processed
+ * (tests 1/2/4/5, all passes), indirect calls made (test 3) or blocks run
+ * (test 6, all passes). */
+typedef struct {
+    u64         count;
+    const char *unit;      /* "elem", "call" or "block" */
+} Work;
 
 /* ─────────────────────────────────────────────────────────────────────────
  * Measurement log
@@ -556,6 +584,32 @@ static int new_pair(int a, int b)
     p->ratio_label = NULL;
     p->cost_shown = 0;
     return pair_count++;
+}
+
+/* What each variant's rows describe, for the export: registered by
+ * emit_rows(), once per (test, variant). */
+#define MAX_VARIANTS 64
+
+typedef struct {
+    int         test, variant;
+    const char *label;
+    Work        work;
+} VariantInfo;
+
+static VariantInfo variant_info[MAX_VARIANTS];
+static int         variant_count = 0;
+
+static void log_variant(int variant, const char *label, const Work *w)
+{
+    for (int i = 0; i < variant_count; i++)
+        if (variant_info[i].test == current_test && variant_info[i].variant == variant)
+            return;
+    if (variant_count >= MAX_VARIANTS) log_full("variant table");
+    VariantInfo *v = &variant_info[variant_count++];
+    v->test = current_test;
+    v->variant = variant;
+    v->label = label;
+    v->work = *w;
 }
 
 /* The reported row for a variant: its median trial by time over all its
@@ -875,14 +929,6 @@ static void cpu_heading(char *buf, size_t bufsz)
     snprintf(buf + len, bufsz - len, " @ %.2f GHz", ghz);
 }
 
-/* Work done per trial, for the misses-per-item column: elements processed
- * (tests 1/2/4/5, all passes), indirect calls made (test 3) or blocks run
- * (test 6, all passes). */
-typedef struct {
-    u64         count;
-    const char *unit;      /* "elem", "call" or "block" */
-} Work;
-
 typedef struct {
     const char *label;
     Result      r;
@@ -1010,8 +1056,10 @@ static void print_pair_cost(FILE *report, int pair)
 static void emit_rows(FILE *report, const char *title, const char *desc,
                       const ReportRow *rows, int n, const Work *w)
 {
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < n; i++) {
         print_row(rows[i].label, &rows[i].r, row_work(&rows[i], w));
+        log_variant(i, rows[i].label, row_work(&rows[i], w));
+    }
     report_table(report, title, desc, rows, n, w);
 }
 
@@ -1845,6 +1893,365 @@ static void run_test6(FILE *report)
     printf("\n");
 }
 
+static int test_selected(int n)
+{
+    return ((tests_selected ? tests_selected : DEFAULT_TESTS) >> (n - 1)) & 1u;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * JSON Lines export (--json), schema 1
+ *
+ * One object per line: a meta record, then the kernel, variant, trial and
+ * pair records.  Written after all tests from the measurement log, so every
+ * summary in it (and in the report) can be rebuilt from its trials;
+ * .github/scripts/check_export.py does exactly that.  u64 values are bare
+ * integers, doubles use %.17g, and anything absent is null.
+ * ───────────────────────────────────────────────────────────────────────── */
+#define JSON_SCHEMA 1
+
+/* What each kernel's code is declared to contain.  check_kernels.sh
+ * --counts measures the same fields from the binary; -1 is "not declared".
+ * No function pointers here: taking a kernel's address stops GCC folding
+ * sum_branch into sum_threshold, which moves the kernels.  Entry
+ * addresses therefore come from the binary (check_kernels.sh), and the
+ * export's "entry" is null. */
+typedef struct {
+    const char *id;
+    int         revision;
+    const char *backend;
+    const char *unit;
+    int         data_branches;
+    int         indirect_calls;
+    int         inner_loop_branches;
+    const char *tests;
+} KernelDesc;
+
+#define KERNEL(fn) #fn, 1, "c"
+static const KernelDesc kernel_descs[] = {
+    { KERNEL(sum_threshold),       "elem",  1, 0,  2, "1"   },
+    { KERNEL(sum_branch),          "elem",  1, 0,  2, "4"   },
+    { KERNEL(sum_branchless),      "elem",  0, 0,  1, "4"   },
+    { KERNEL(count_decisions),     "elem",  1, 0,  2, "2,5" },
+    { KERNEL(dispatch_sequential), "call",  0, 1,  2, "3"   },
+    { KERNEL(dispatch_random),     "call",  0, 1,  2, "3"   },
+    { KERNEL(correlate_distance),  "block", 3, 0, -1, "6"   },
+};
+#undef KERNEL
+
+/* Writes s as a JSON string, escaping quotes, backslashes and control
+ * bytes; other bytes (UTF-8) pass through. */
+static void json_string(FILE *f, const char *s)
+{
+    fputc('"', f);
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p == '"' || *p == '\\') fprintf(f, "\\%c", *p);
+        else if (*p == '\n') fputs("\\n", f);
+        else if (*p == '\t') fputs("\\t", f);
+        else if (*p < 0x20) fprintf(f, "\\u%04x", *p);
+        else fputc(*p, f);
+    }
+    fputc('"', f);
+}
+
+static void json_string_or_null(FILE *f, const char *s)
+{
+    if (s && *s) json_string(f, s);
+    else fputs("null", f);
+}
+
+/* A double, or null where JSON has no number (inf, nan) or none applies. */
+static void json_double(FILE *f, int has, double v)
+{
+    if (has && v == v && v - v == 0) fprintf(f, "%.17g", v);
+    else fputs("null", f);
+}
+
+static void json_int(FILE *f, int has, long long v)
+{
+    if (has) fprintf(f, "%lld", v);
+    else fputs("null", f);
+}
+
+/* Same file: equal paths, or both exist and share device and inode (e.g.
+ * hard links or "a" vs "./a"). */
+static int same_file(const char *a, const char *b)
+{
+    struct stat sa, sb;
+    if (strcmp(a, b) == 0) return 1;
+    return stat(a, &sa) == 0 && stat(b, &sb) == 0 &&
+           sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+}
+
+/* First line of a text file, without its newline; 0 if unreadable. */
+static int sysfs_line(const char *path, char *buf, size_t n)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    const int ok = fgets(buf, (int)n, f) != NULL;
+    fclose(f);
+    if (!ok) return 0;
+    buf[strcspn(buf, "\r\n")] = '\0';
+    return buf[0] != '\0';
+}
+
+/* Value of the first /proc/cpuinfo line whose key is exactly `key`. */
+static int cpuinfo_value(const char *key, char *buf, size_t n)
+{
+    int found = 0;
+#ifdef __linux__
+    FILE *f = fopen("/proc/cpuinfo", "r");
+    if (!f) return 0;
+    char line[1024];
+    const size_t klen = strlen(key);
+    while (!found && fgets(line, sizeof line, f)) {
+        const char *colon = strchr(line, ':');
+        if (!colon || strncmp(line, key, klen) != 0 ||
+            strspn(line + klen, " \t") != (size_t)(colon - line) - klen)
+            continue;
+        const char *v = colon + 1 + strspn(colon + 1, " \t");
+        snprintf(buf, n, "%s", v);
+        buf[strcspn(buf, "\r\n")] = '\0';
+        found = buf[0] != '\0';
+    }
+    fclose(f);
+#else
+    (void)key; (void)buf; (void)n;
+#endif
+    return found;
+}
+
+/* 1 or 0 if /proc/cpuinfo's flags list has `flag`, -1 without a flags line. */
+static int cpuinfo_has_flag(const char *flag)
+{
+    char flags[1024];
+    if (!cpuinfo_value("flags", flags, sizeof flags)) return -1;
+    const size_t len = strlen(flag);
+    for (const char *p = flags; (p = strstr(p, flag)) != NULL; p += len)
+        if ((p == flags || p[-1] == ' ') && (p[len] == ' ' || p[len] == '\0'))
+            return 1;
+    return 0;
+}
+
+static void write_counters_meta(FILE *f)
+{
+    fputs(",\"counters\":[", f);
+    for (int c = 0; c < CTR_COUNT; c++) {
+        const int open = (int)((perf_mask() >> c) & 1u);
+        const int raw  = (int)((perf_raw_mask >> c) & 1u);
+        const CounterDesc *d = &counter_descs[c];
+        fprintf(f, "%s{\"name\":", c ? "," : "");
+        json_string(f, d->console_label);
+        fprintf(f, ",\"open\":%s,\"type\":", open ? "true" : "false");
+        json_string_or_null(f, open ? (raw ? "raw" : "hardware") : NULL);
+        fputs(",\"config\":", f);
+        json_int(f, open, (long long)(raw ? d->arm_raw : d->generic));
+        fputs(",\"semantics\":", f);
+        json_string_or_null(f, open ? semantics_name(counter_semantics(c, raw, host_arch())) : NULL);
+        fputs(",\"exclude_kernel\":true,\"exclude_hv\":true}", f);
+    }
+    fputs("]", f);
+}
+
+static void write_tests_meta(FILE *f)
+{
+    fputs(",\"test_seeds\":{", f);
+    int first = 1;
+    for (int n = 1; n <= NUM_TESTS; n++) {
+        if (!test_selected(n)) continue;
+        fprintf(f, "%s\"%d\":%" PRIu64, first ? "" : ",", n, test_seed(n, 0, 0));
+        first = 0;
+    }
+    fputs("},\"tests\":[", f);
+    first = 1;
+    for (int n = 1; n <= NUM_TESTS; n++) {
+        if (!test_selected(n)) continue;
+        fprintf(f, "%s%d", first ? "" : ",", n);
+        first = 0;
+    }
+    fputs("]", f);
+}
+
+static void write_affinity_meta(FILE *f)
+{
+    static const char *const status[] = { "not_requested", "pinned", "failed", "unsupported" };
+    fputs(",\"affinity\":{\"requested\":", f);
+    json_int(f, cpu_requested >= 0, cpu_requested);
+    fprintf(f, ",\"status\":\"%s\",\"error\":", status[affinity_status]);
+    json_string_or_null(f, affinity_status == AFF_FAILED ? affinity_error() : NULL);
+    fputs("}", f);
+}
+
+/* Governor, SMT siblings and hypervisor flag, for the pinned CPU (else 0). */
+static void write_system_meta(FILE *f)
+{
+    const int cpu = affinity_status == AFF_PINNED ? cpu_requested : 0;
+    char path[96], buf[256];
+    fprintf(f, ",\"metadata_cpu\":%d,\"hypervisor\":", cpu);
+    const int hv = cpuinfo_has_flag("hypervisor");
+    fputs(hv < 0 ? "null" : hv ? "true" : "false", f);
+    snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu);
+    fputs(",\"smt_siblings\":", f);
+    json_string_or_null(f, sysfs_line(path, buf, sizeof buf) ? buf : NULL);
+    snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_governor", cpu);
+    fputs(",\"governor\":", f);
+    json_string_or_null(f, sysfs_line(path, buf, sizeof buf) ? buf : NULL);
+    const double max_ghz = cpu_max_ghz(), eff_ghz = measured_ghz();
+    fputs(",\"max_ghz\":", f);
+    json_double(f, max_ghz > 0, max_ghz);
+    fputs(",\"effective_user_cycle_ghz\":", f);
+    json_double(f, eff_ghz > 0, eff_ghz);
+}
+
+static void write_meta(FILE *f)
+{
+    char cpu[192], microcode[64], kernel[160];
+    struct utsname u;
+    const int have_uname = uname(&u) == 0;
+    get_cpu_model(cpu, sizeof cpu);
+    if (have_uname) snprintf(kernel, sizeof kernel, "%s %s", u.sysname, u.release);
+    fprintf(f, "{\"type\":\"meta\",\"schema\":%d,\"revision\":%d,\"cpu\":", JSON_SCHEMA, BENCH_REVISION);
+    json_string(f, cpu);
+    fputs(",\"microcode\":", f);
+    json_string_or_null(f, cpuinfo_value("microcode", microcode, sizeof microcode) ? microcode : NULL);
+    fputs(",\"arch\":", f);
+    json_string_or_null(f, have_uname ? u.machine : NULL);
+    fputs(",\"kernel\":", f);
+    json_string_or_null(f, have_uname ? kernel : NULL);
+    fputs(",\"compiler\":", f);
+    json_string(f, COMPILER_VERSION);
+    fputs(",\"build_flags\":", f);
+    json_string_or_null(f, BUILD_FLAGS);
+    fputs(",\"commit\":", f);
+    json_string_or_null(f, BUILD_COMMIT);
+    fprintf(f, ",\"alignment_policy\":\"%s\",\"seed\":%" PRIu64,
+            strstr(BUILD_FLAGS, "mbranches-within-32B-boundaries") ? "jcc-32B" : "undeclared",
+            base_seed);
+    write_tests_meta(f);
+    fprintf(f, ",\"size\":%zu,\"reps\":%u,\"trials\":%d,\"training_runs\":%d,"
+               "\"schedule\":\"AB/BA\"", size, reps, trial_count(), TRAIN_RUNS);
+    write_affinity_meta(f);
+    write_system_meta(f);
+    write_counters_meta(f);
+    fputs("}\n", f);
+}
+
+static void write_kernels(FILE *f)
+{
+    for (size_t i = 0; i < sizeof kernel_descs / sizeof kernel_descs[0]; i++) {
+        const KernelDesc *k = &kernel_descs[i];
+        fputs("{\"type\":\"kernel\",\"id\":", f);
+        json_string(f, k->id);
+        fprintf(f, ",\"revision\":%d,\"backend\":", k->revision);
+        json_string(f, k->backend);
+        fputs(",\"entry\":null,\"unit\":", f);
+        json_string(f, k->unit);
+        fputs(",\"data_branches\":", f);
+        json_int(f, k->data_branches >= 0, k->data_branches);
+        fputs(",\"indirect_calls\":", f);
+        json_int(f, k->indirect_calls >= 0, k->indirect_calls);
+        fputs(",\"inner_loop_branches\":", f);
+        json_int(f, k->inner_loop_branches >= 0, k->inner_loop_branches);
+        fputs(",\"tests\":", f);
+        json_string(f, k->tests);
+        fputs("}\n", f);
+    }
+}
+
+/* Kernel name of a variant: its first trial's call text up to "(". */
+static void variant_kernel(int test, int variant, char *buf, size_t n)
+{
+    buf[0] = '\0';
+    for (int i = 0; i < trial_log_len; i++) {
+        if (trial_log[i].test != test || trial_log[i].variant != variant) continue;
+        snprintf(buf, n, "%.*s", (int)strcspn(trial_log[i].call, "("), trial_log[i].call);
+        return;
+    }
+}
+
+static void write_variants(FILE *f)
+{
+    for (int i = 0; i < variant_count; i++) {
+        const VariantInfo *v = &variant_info[i];
+        char label[128], kernel[64];
+        size_t n = 0;
+        for (const char *p = v->label; *p && n + 1 < sizeof label; p++)
+            if (!(p[0] == ' ' && p[1] == ' ')) label[n++] = *p;
+        label[n] = '\0';
+        variant_kernel(v->test, v->variant, kernel, sizeof kernel);
+        fprintf(f, "{\"type\":\"variant\",\"test\":%d,\"variant\":%d,\"label\":", v->test, v->variant);
+        json_string(f, label);
+        fputs(",\"kernel\":", f);
+        json_string_or_null(f, kernel);
+        fprintf(f, ",\"work\":%" PRIu64 ",\"unit\":", v->work.count);
+        json_string(f, v->work.unit);
+        fputs("}\n", f);
+    }
+}
+
+/* {"branches":…,"misses":…,"cycles":…} from a trial's counts or raw counts. */
+static void write_counts(FILE *f, const Result *r, const u64 *v)
+{
+    fputc('{', f);
+    for (int c = 0; c < CTR_COUNT; c++) {
+        fprintf(f, "%s\"%s\":", c ? "," : "", counter_descs[c].console_label);
+        if (result_has(r, c)) fprintf(f, "%" PRIu64, v[c]);
+        else fputs("null", f);
+    }
+    fputc('}', f);
+}
+
+static void write_trials(FILE *f)
+{
+    for (int i = 0; i < trial_log_len; i++) {
+        const TrialRecord *t = &trial_log[i];
+        fprintf(f, "{\"type\":\"trial\",\"test\":%d,\"variant\":%d,\"pair\":", t->test, t->variant);
+        json_int(f, t->pair >= 0, t->pair);
+        fprintf(f, ",\"seq\":%d,\"trial\":%d,\"train_runs\":%d,\"time_ms\":%.17g,"
+                   "\"result\":%" PRIu64 ",\"perf_status\":\"%s\",\"enabled_ns\":%" PRIu64
+                   ",\"running_ns\":%" PRIu64 ",\"counts\":",
+                t->seq, t->trial, TRAIN_RUNS, t->r.time_ms, t->r.result,
+                perf_status_name(t->r.perf_status), t->r.enabled_ns, t->r.running_ns);
+        write_counts(f, &t->r, t->r.counts);
+        fputs(",\"raw_counts\":", f);
+        write_counts(f, &t->r, t->r.raw_counts);
+        fputs("}\n", f);
+    }
+}
+
+static void write_pairs(FILE *f)
+{
+    static const char *const cost_status[] = { "unavailable", "inconclusive", "resolved" };
+    for (int p = 0; p < pair_count; p++) {
+        const PairInfo *pi = &pair_info[p];
+        const PairStats s = pair_stats(p);
+        double cost = 0;
+        const int status = pair_cost(&s, &cost);
+        fprintf(f, "{\"type\":\"pair\",\"test\":%d,\"pair\":%d,\"a\":%d,\"b\":%d,"
+                   "\"pairs\":%d,\"valid\":%d,\"time_ms_a\":%.17g,\"time_ms_b\":%.17g,"
+                   "\"slowdown\":", pi->test, p, pi->a, pi->b, s.pairs, s.valid, s.ms_a, s.ms_b);
+        json_double(f, 1, s.ms_b / s.ms_a);
+        fputs(",\"delta\":{", f);
+        for (int c = 0; c < CTR_COUNT; c++) {
+            fprintf(f, "%s\"%s\":", c ? "," : "", counter_descs[c].console_label);
+            json_double(f, (int)((s.open_mask >> c) & 1u), s.delta[c]);
+        }
+        fputs("},\"effective_cost\":", f);
+        json_double(f, status > 0, cost);
+        fprintf(f, ",\"cost_status\":\"%s\",\"ratio_label\":", cost_status[status + 1]);
+        json_string_or_null(f, pi->ratio_label);
+        fprintf(f, ",\"cost_shown\":%s}\n", pi->cost_shown ? "true" : "false");
+    }
+}
+
+static void write_export(FILE *f)
+{
+    write_meta(f);
+    write_kernels(f);
+    write_variants(f);
+    write_trials(f);
+    write_pairs(f);
+}
+
 /* ─────────────────────────────────────────────────────────────────────────
  * main
  * ───────────────────────────────────────────────────────────────────────── */
@@ -1929,6 +2336,7 @@ static void print_usage(const char *prog)
            "      --reps <N>       passes over the array per trial, tests 1/2/4/5;\n"
            "                       scales test 6's branch budget with --size\n"
            "                       (default: %u, max: %lu)\n"
+           "      --json <file>    write every trial and summary as JSON Lines (schema 1)\n"
            "      --cpu <N>        pin the benchmark to CPU N (0–1023) before measuring\n"
            "      --seed <N>       base seed for all test inputs (default: 16045690984503054900)\n"
            "  -h, --help           show this help\n",
@@ -1983,6 +2391,10 @@ static int apply_option(int argc, char **argv, int *i, const char **out_path)
         reps = (unsigned)v;
         return -1;
     }
+    if (is_opt(arg, NULL, "--json")) {
+        json_path = option_value(argc, argv, i, arg, "file name");
+        return json_path ? -1 : 1;
+    }
     if (is_opt(arg, NULL, "--cpu")) {
         if (!option_number(argc, argv, i, "CPU number", 0, MAX_CPU, &v)) return 1;
         cpu_requested = (int)v;
@@ -2008,11 +2420,6 @@ static int parse_args(int argc, char **argv, const char **out_path)
         if (rc >= 0) return rc;
     }
     return -1;
-}
-
-static int test_selected(int n)
-{
-    return ((tests_selected ? tests_selected : DEFAULT_TESTS) >> (n - 1)) & 1u;
 }
 
 /* Comma-separated list of the selected tests, e.g. "1, 3". */
@@ -2146,19 +2553,42 @@ static void print_clock_summary(FILE *report)
         fprintf(report, "**Effective user-cycle rate during measurements:** %.2f GHz\n\n", avg_ghz);
 }
 
+/* Creates or truncates an output file, owner-only when new: open() rather
+ * than fopen() (0666).  NULL after printing why. */
+static FILE *open_output(const char *path)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) { perror(path); return NULL; }
+    FILE *f = fdopen(fd, "w");
+    if (!f) { perror("fdopen"); close(fd); }
+    return f;
+}
+
+/* Closes an output file; nonzero if any write failed.  A previous buffered
+ * write may have failed even if close succeeds. */
+static int close_output(FILE *f)
+{
+    int failed = ferror(f) != 0;
+    if (fclose(f) != 0) failed = 1;
+    return failed;
+}
+
 int main(int argc, char **argv)
 {
     const char *out_path = NULL;
     int rc = parse_args(argc, argv, &out_path);
     if (rc >= 0) return rc;
 
+    if (out_path && json_path && same_file(out_path, json_path)) {
+        fprintf(stderr, "Report and JSON export must be different files\n");
+        return 1;
+    }
     FILE *report = NULL;
-    if (out_path) {
-        /* open() rather than fopen() (0666), so a new report is owner-only. */
-        int fd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-        if (fd < 0) { perror(out_path); return 1; }
-        report = fdopen(fd, "w");
-        if (!report) { perror("fdopen"); close(fd); return 1; }
+    FILE *json = NULL;
+    if (out_path && !(report = open_output(out_path))) return 1;
+    if (json_path && !(json = open_output(json_path))) {
+        if (report) fclose(report);
+        return 1;
     }
 
     apply_affinity();
@@ -2183,13 +2613,20 @@ int main(int argc, char **argv)
 
     int report_failed = 0;
     if (report) {
-        /* A previous buffered write may have failed even if close succeeds. */
-        report_failed = ferror(report) != 0;
-        if (fclose(report) != 0) report_failed = 1;
+        report_failed = close_output(report);
         if (report_failed)
             fprintf(stderr, "Error writing report to %s\n", out_path);
         else
             printf("\nFormatted report written to %s\n", out_path);
+    }
+    if (json) {
+        write_export(json);
+        if (close_output(json)) {
+            fprintf(stderr, "Error writing JSON export to %s\n", json_path);
+            report_failed = 1;
+        } else {
+            printf("JSON export written to %s\n", json_path);
+        }
     }
 
     perf_close();

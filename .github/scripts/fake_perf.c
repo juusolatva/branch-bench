@@ -14,7 +14,8 @@
  *    1 branch and 3 cycles per ns, 1 miss per 20 ns.  The first three reads
  *    exercise the error paths: a group that never ran, counters that were
  *    time-shared, and a short read.
- *  - fopen() of /proc/cpuinfo and of cpufreq's cpuinfo_max_freq returns
+ *  - fopen() of /proc/cpuinfo, of cpufreq's cpuinfo_max_freq and
+ *    scaling_governor, and of topology's thread_siblings_list returns
  *    fixed contents.
  *
  * Counts are for coverage only and mean nothing.  Not for measurements.
@@ -186,12 +187,16 @@ ssize_t read(int fd, void *buf, size_t count)
 }
 
 /* An empty Model line (skipped), then Hardware and model name entries; the
- * " @ " base clock must be replaced by the cpufreq maximum. */
+ * " @ " base clock must be replaced by the cpufreq maximum.  The quotes in
+ * the model name must be escaped in the JSON export; microcode and the
+ * hypervisor flag are recorded there too. */
 static char cpuinfo[] =
     "processor\t: 0\n"
     "Model\t\t: \n"
     "Hardware\t: Fake SoC\n"
-    "model name\t: Fake CPU 1234 @ 2.40GHz\n"
+    "model name\t: Fake \"Quoted\" CPU 1234 @ 2.40GHz\n"
+    "microcode\t: 0xf4\n"
+    "flags\t\t: fpu hypervisor\n"
     "Model\t\t: Not used after model name\n";
 
 /* Per-CPU maximum clock in kHz: a lower value, a higher one, an unparsable
@@ -199,6 +204,8 @@ static char cpuinfo[] =
 static char khz_low[]  = "2400000\n";
 static char khz_high[] = "3600000\n";
 static char khz_bad[]  = "n/a\n";
+static char governor[] = "performance\n";
+static char siblings[] = "0,4\n";
 
 FILE *fopen(const char *path, const char *mode)
 {
@@ -211,6 +218,12 @@ FILE *fopen(const char *path, const char *mode)
         char *s = cpu == 1 ? khz_high : cpu == 2 ? khz_bad : khz_low;
         return fmemopen(s, strlen(s), "r");
     }
+    if (sscanf(path, "/sys/devices/system/cpu/cpu%ld/cpufreq/%31s", &cpu, tail) == 2 &&
+        strcmp(tail, "scaling_governor") == 0)
+        return fmemopen(governor, strlen(governor), "r");
+    if (sscanf(path, "/sys/devices/system/cpu/cpu%ld/topology/%31s", &cpu, tail) == 2 &&
+        strcmp(tail, "thread_siblings_list") == 0)
+        return fmemopen(siblings, strlen(siblings), "r");
 
     static FILE *(*real)(const char *, const char *);
     if (!real) real = (FILE *(*)(const char *, const char *))dlsym(RTLD_NEXT, "fopen");

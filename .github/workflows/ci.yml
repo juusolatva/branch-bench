@@ -261,6 +261,8 @@ jobs:
           grep -q '^\*\*Effective extra cycles per additional miss:\*\* -\{0,1\}[0-9]' "$dir/report.md"
           grep -q '^\*\*Effective user-cycle rate during measurements:\*\*' "$dir/report.md"
           grep -q '^\*\*Periods at' "$dir/t5.md"
+          grep -q '"governor":"performance"' "$dir/run.jsonl"
+          grep -q '"hypervisor":true' "$dir/run.jsonl"
           grep -q '^\*\*Correlation used:\*\* d=4 [0-9][0-9]*%, d=8 n/a' "$dir/t6.md"
           grep -q '^_n/a: ' "$dir/t6.md"
           # Only some counters open.  Tests 1-2 come first: the shim fails the

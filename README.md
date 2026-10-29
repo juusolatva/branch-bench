@@ -69,6 +69,30 @@ and often explains why timings differ between runs on the same machine.
 Time spent in the kernel or preempted lowers it, so it is not the core's
 instantaneous clock.
 
+## Machine-readable export
+
+`--json <file>` writes every measured trial and every summary as JSON
+Lines (one JSON object per line, schema 1), next to the console output
+and any `-o` report (which must be a different file):
+
+```sh
+./branch_bench -n 5 -o report.md --json run.jsonl
+```
+
+| `type` | One record per | Main fields |
+|---|---|---|
+| `meta` (first line) | run | `schema` 1, `revision`, CPU, microcode, arch, kernel, compiler, build flags, commit, `alignment_policy`, `seed` and `test_seeds`, size/reps/trials, `training_runs`, `schedule` (`AB/BA`), `affinity`, `hypervisor`, `smt_siblings`, `governor`, `max_ghz`, `effective_user_cycle_ghz`, and per counter its event type, config and `semantics` (`retired`, `speculative`, `cycles`, `unknown`) |
+| `kernel` | kernel | declared `data_branches`, `indirect_calls`, `inner_loop_branches`, unit, tests |
+| `variant` | report row | `test`, `variant` (row index), `label`, `kernel`, `work` and `unit` per trial |
+| `trial` | measured trial | `test`, `variant`, `pair`, run-wide `seq`, `trial`, `train_runs`, `time_ms`, `result` (the kernel's checksum), `perf_status`, `enabled_ns`/`running_ns`, `counts` (scaled) and `raw_counts` |
+| `pair` | compared pair | `a`/`b` variants, `pairs`, `valid`, summed times, `slowdown`, signed `delta` per counter, `effective_cost` and `cost_status` (`resolved`, `inconclusive`, `unavailable`) |
+
+Counters print as exact integers; a value that does not exist (a counter
+that is not open, a trial whose read failed, a ratio without data) is
+`null`, never 0. `.github/scripts/check_export.py run.jsonl --report
+report.md` rebuilds every pair summary from the trials and checks the
+report's medians, ranges, ratios and costs against them.
+
 ## Repeated measurements
 
 By default each variant is measured once. For steadier numbers use
