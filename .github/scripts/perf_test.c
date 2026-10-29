@@ -389,6 +389,71 @@ static void test5_summary(void)
     puts("ok   Test 5 summary: list, none, missing counts, n/a");
 }
 
+static u64 count_ones(const u8 *p, size_t n)
+{
+    u64 ones = 0;
+    for (size_t i = 0; i < n; i++) ones += p[i];
+    return ones;
+}
+
+/* Tests 5 and 6 feed their kernels the data their labels describe:
+ * whole de Bruijn periods and the seeded random row; B a copy of A in each
+ * correlated row and independently seeded in each reference row. */
+static void measured_data(void)
+{
+    const int saved_leader = perf_leader;
+    const unsigned saved_reps = reps;
+    perf_leader = -1;   /* MEASURE without counters */
+    reps = 1;
+
+    static u8 buf[4096], expect[4096];
+    const Result none = {0};
+    ReportRow rows5[DB_ORDERS + 1];
+    for (int i = 0; i <= DB_ORDERS; i++) {
+        rows5[i].label = "x";
+        rows5[i].r = none;
+        rows5[i].work = NULL;
+    }
+    assert(measure_patterns(buf, sizeof buf, rows5) == 1);
+    for (int i = 0; i < DB_ORDERS; i++)
+        assert(rows5[i].r.result == sizeof buf / 2);   /* half ones per period */
+    fill_random_bits(expect, sizeof expect, DB_RANDOM_SEED);
+    assert(rows5[DB_ORDERS].r.result == count_ones(expect, sizeof expect));
+
+    static u8 a[1024], b[1024], ref_b[1024];
+    const u64 total = 1024ULL * 1026;
+    ReportRow rows6[2 * D6_DISTS];
+    D6Point pts[D6_DISTS];
+    for (int i = 0; i < 2 * D6_DISTS; i++) {
+        rows6[i].label = "x";
+        rows6[i].r = none;
+        rows6[i].work = NULL;
+    }
+    assert(D6_SEED_A != D6_SEED_B);
+    fill_random_bits(a, sizeof a, D6_SEED_A);
+    measure_distances(a, b, sizeof a, total, rows6, pts);
+    for (int i = 0; i < D6_DISTS; i++) {
+        const unsigned d = (unsigned)D6_MIN_DIST << i;
+        size_t blocks;
+        unsigned passes;
+        d6_layout(total, sizeof a, d, &blocks, &passes);
+        assert(pts[i].blocks == blocks && pts[i].passes == passes);
+        assert(pts[i].work.count == (u64)blocks * passes);
+        assert(rows6[2 * i].work == &pts[i].work && rows6[2 * i + 1].work == &pts[i].work);
+        /* Per block: A adds 1 and B 3 when set, each filler 2. */
+        fill_random_bits(ref_b, blocks, D6_SEED_B);
+        const u64 ones_a = count_ones(a, blocks);
+        const u64 fillers = 2ULL * d * blocks;
+        assert(rows6[2 * i].r.result == passes * (fillers + 4 * ones_a));
+        assert(rows6[2 * i + 1].r.result ==
+               passes * (fillers + ones_a + 3 * count_ones(ref_b, blocks)));
+    }
+
+    perf_leader = saved_leader;
+    reps = saved_reps;
+    puts("ok   Test 5 and 6 rows measure the data their labels describe");
+}
+
 int main(void)
 {
     perf_leader = 42;
@@ -421,5 +486,6 @@ int main(void)
     bounded_list();
     test6_summary();
     test5_summary();
+    measured_data();
     return 0;
 }
