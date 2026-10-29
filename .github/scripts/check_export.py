@@ -490,42 +490,58 @@ def t5_matrices(section):
     return tables
 
 
-def check_t5_matrix(records, variants, sections):
-    """Every matrix cell is its row's median misses (3 decimals) or cycles
-    (2 decimals) per data-branch execution, "skip" or "–"; each table covers
-    exactly its group's random-word rows.  Returns how many cells."""
-    rows = t5_variants(variants)
+def t5_expected_cells(records, variants):
+    """{(what, blocks, E): {(N, L): cell}} as branch_bench.c prints Test 5's
+    matrices: one table per group, exposure and counter, printed only when
+    some cell of it holds a number."""
     trials = by_type(records, "trial")
-    cells_seen = 0
-    for (what, blocks, e), lines in t5_matrices(sections.get(5, "")).items():
+    tables = {}
+    for k, v in t5_variants(variants).items():
+        prm = v["params"]
+        if T5_FAMILIES[prm["family"]] != "random-words":
+            continue
+        med = None
+        if not prm["skipped"]:
+            med = representative([t for t in trials if t["test"] == 5 and t["variant"] == k])[0]
+        for what, counter, fmt in (("Misses", "misses", "{:.3f}"), ("Cycles", "cycles", "{:.2f}")):
+            if prm["skipped"]:
+                cell = "skip"
+            else:
+                count = med["counts"][counter]
+                cell = "–" if count is None else fmt.format(count / v["work"])
+            tables.setdefault((what, prm["blocks"], prm["exposure"]), {})[(prm["N"], prm["L"])] = cell
+    return {key: cells_ for key, cells_ in tables.items()
+            if any(c not in ("skip", "–") for c in cells_.values())}
+
+
+def check_t5_matrix(records, variants, sections):
+    """Test 5's matrices are exactly the expected ones: every expected
+    table present once, every cell of its group present once with its
+    row's median misses (3 decimals) or cycles (2 decimals) per data-branch
+    execution, "skip" or "–", and nothing else.  Returns how many cells."""
+    want = t5_expected_cells(records, variants)
+    got = t5_matrices(sections.get(5, ""))
+    check(set(got) == set(want),
+          f"Test 5 matrix tables {sorted(got)} differ from the expected {sorted(want)}")
+    n_cells = 0
+    for key, lines in got.items():
+        what, blocks, e = key
         header = cells(lines[0])
         cols = [int(h[2:]) for h in header[1:]]
-        covered = 0
+        seen = {}
         for line in lines[2:]:
             row = cells(line)
-            n = int(row[0])
             for l, cell in zip(cols, row[1:]):
-                where = f"Test 5 matrix {what.lower()} blocks {blocks} E={e} N={n} L={l}"
-                match = [(k, v) for k, v in rows.items()
-                         if v["params"]["N"] == n and v["params"]["L"] == l and
-                         v["params"]["blocks"] == blocks and v["params"]["exposure"] == e and
-                         T5_FAMILIES[v["params"]["family"]] == "random-words"]
-                check(len(match) == 1, f"{where}: {len(match)} matching rows")
-                k, v = match[0]
-                if v["params"]["skipped"]:
-                    want = "skip"
-                else:
-                    med = representative([t for t in trials if t["test"] == 5 and t["variant"] == k])[0]
-                    count = med["counts"]["misses" if what == "Misses" else "cycles"]
-                    fmt = "{:.3f}" if what == "Misses" else "{:.2f}"
-                    want = "–" if count is None else fmt.format(count / v["work"])
-                check(cell == want, f"{where}: {cell}, median trial gives {want}")
-                covered += 1
-                cells_seen += 1
-        group = [v for v in rows.values() if v["params"]["blocks"] == blocks and
-                 v["params"]["exposure"] == e and T5_FAMILIES[v["params"]["family"]] == "random-words"]
-        check(covered == len(group), f"Test 5 {what} table blocks {blocks} E={e}: {covered} cells for {len(group)} rows")
-    return cells_seen
+                nl = (int(row[0]), l)
+                where = f"Test 5 matrix {what.lower()} blocks {blocks} E={e} N={nl[0]} L={l}"
+                check(nl not in seen, f"{where}: repeated")
+                check(nl in want[key], f"{where}: no such row in the export")
+                check(cell == want[key][nl], f"{where}: {cell}, median trial gives {want[key][nl]}")
+                seen[nl] = cell
+                n_cells += 1
+        missing = sorted(set(want[key]) - set(seen))
+        check(not missing, f"Test 5 {what} table blocks {blocks} E={e}: missing cells {missing}")
+    return n_cells
 
 
 def check_threshold_note(variants, sections, test):

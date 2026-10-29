@@ -2279,7 +2279,11 @@ static int t5_family_ok(const T5Cell *c, const u8 *st)
 {
     const size_t ones = count_ones(st, c->l);
     switch (c->family) {
-    case T5_DEBRUIJN:     return debruijn_valid(st, log2_exact(c->l));
+    case T5_DEBRUIJN: {
+        const unsigned k = log2_exact(c->l);
+        return k >= DB_MIN_ORDER && k <= DB_MAX_ORDER && (1u << k) == c->l &&
+               debruijn_valid(st, k);
+    }
     case T5_BALANCED_REF: return ones == c->l / 2;
     case T5_CONSTANT0:    return ones == 0;
     case T5_ALTERNATING:
@@ -2290,6 +2294,28 @@ static int t5_family_ok(const T5Cell *c, const u8 *st)
     }
 }
 
+/* Copies site s's first period out of data into stream and checks that
+ * every byte is 0 or 1 and that the site repeats with period l over all
+ * blocks; 0 on a mismatch. */
+static int t5_site_stream(const T5Cell *c, const u8 *data, unsigned s, u8 *stream)
+{
+    const unsigned n = c->n;
+    for (size_t b = 0; b < c->blocks; b++) {
+        const u8 v = data[b * n + s];
+        if (b < c->l) stream[b] = v;
+        if (v > 1 || v != data[(b % c->l) * n + s]) return 0;
+    }
+    return 1;
+}
+
+/* 1 if stream s (of l bytes) equals an earlier stream in streams. */
+static int t5_seen_before(const u8 *streams, unsigned s, unsigned l)
+{
+    for (unsigned t = 0; t < s; t++)
+        if (memcmp(streams + (size_t)s * l, streams + (size_t)t * l, l) == 0) return 1;
+    return 0;
+}
+
 /* Rebuilds every site's stream from data alone (the first l blocks), checks
  * that each byte is 0 or 1, that each site repeats with period l over all
  * blocks and that each stream fits its family, and counts the statistics.
@@ -2298,25 +2324,20 @@ static int t5_validate(const T5Cell *c, const u8 *data, T5Stats *st)
 {
     const unsigned n = c->n;
     const unsigned l = c->l;
+    memset(st, 0, sizeof *st);
+    if (l == 0 || c->blocks < l || c->blocks % l != 0) return 0;   /* at least one period */
     u8 *streams = calloc((size_t)n * l, 1);
     if (!streams) { perror("calloc"); exit(1); }
-    int ok = l > 0 && c->blocks >= l && c->blocks % l == 0;   /* at least one period */
-    for (size_t b = 0; ok && b < c->blocks; b++)
-        for (unsigned s = 0; ok && s < n; s++) {
-            const u8 v = data[b * n + s];
-            if (b < l) streams[(size_t)s * l + b] = v;
-            ok = v <= 1 && v == data[(b % l) * n + s];
+    int ok = 1;
+    for (unsigned s = 0; s < n; s++) {
+        u8 *ss = streams + (size_t)s * l;
+        if (!t5_site_stream(c, data, s, ss) || !t5_family_ok(c, ss)) {
+            ok = 0;
+            break;
         }
-    memset(st, 0, sizeof *st);
-    for (unsigned s = 0; ok && s < n; s++) {
-        const u8 *ss = streams + (size_t)s * l;
-        ok = t5_family_ok(c, ss);
         st->ones += count_ones(ss, l) * (c->blocks / l);
         st->short_period += fundamental_period(ss, l) < l;
-        int seen = 0;
-        for (unsigned t = 0; t < s && !seen; t++)
-            seen = memcmp(ss, streams + (size_t)t * l, l) == 0;
-        st->distinct += !seen;
+        st->distinct += !t5_seen_before(streams, s, l);
     }
     free(streams);
     return ok;
@@ -2443,6 +2464,18 @@ static int t5_add(T5Row *rows, int k, const T5Profile *p, const T5Cell *c,
     return k + 1;
 }
 
+/* Adds group g's N × L random-word cells at one exposure. */
+static int t5_add_group(T5Row *rows, int k, const T5Profile *p, int g, unsigned exposure)
+{
+    const T5Group *gr = &p->groups[g];
+    for (int i = 0; i < gr->nn; i++)
+        for (int j = 0; j < gr->nl; j++) {
+            const T5Cell c = { gr->n[i], gr->l[j], gr->blocks, T5_RANDOM_WORDS };
+            k = t5_add(rows, k, p, &c, exposure, g);
+        }
+    return k;
+}
+
 /* The profile's rows: every group's N × L cells per exposure, then the
  * controls at the last exposure (constant-0, alternating, de Bruijn, the
  * balanced reference last).  Returns how many. */
@@ -2450,14 +2483,8 @@ static int t5_rows(const T5Profile *p, T5Row rows[T5_MAX_ROWS])
 {
     int k = 0;
     for (int e = 0; e < p->nexp; e++)
-        for (int g = 0; g < p->ngroups; g++) {
-            const T5Group *gr = &p->groups[g];
-            for (int i = 0; i < gr->nn; i++)
-                for (int j = 0; j < gr->nl; j++) {
-                    const T5Cell c = { gr->n[i], gr->l[j], gr->blocks, T5_RANDOM_WORDS };
-                    k = t5_add(rows, k, p, &c, p->exposures[e], g);
-                }
-        }
+        for (int g = 0; g < p->ngroups; g++)
+            k = t5_add_group(rows, k, p, g, p->exposures[e]);
     const unsigned last = p->exposures[p->nexp - 1];
     const T5Cell zero = { 1, 2, T5_CONTROL_BLOCKS, T5_CONSTANT0 };
     const T5Cell alt = { 1, 2, T5_CONTROL_BLOCKS, T5_ALTERNATING };
@@ -2684,12 +2711,14 @@ static int t5_number(T5Row *t, int n)
     return measured;
 }
 
-/* The index in t[] of the row with variant id v. */
+/* The index in t[] of the row with variant id v (t5_number() gave every
+ * row one, so a miss is an internal error). */
 static int t5_by_variant(const T5Row *t, int n, int v)
 {
     for (int i = 0; i < n; i++)
         if (t[i].variant == v) return i;
-    return -1;
+    fprintf(stderr, "Internal error: Test 5 has no row for variant %d\n", v);
+    exit(1);
 }
 
 /* Measures every unskipped row, the de Bruijn 32 and reference controls
@@ -2758,21 +2787,31 @@ static void t5_emit_skipped(FILE *report, const T5Row *t, int n, int measured)
     }
 }
 
+/* One matrix: the measured rows, a group at one exposure and a counter. */
+typedef struct {
+    const T5Row     *t;
+    int              n;
+    const ReportRow *rows;   /* indexed by variant id */
+    const T5Group   *gr;
+    int              g;
+    unsigned         e;
+    int              ctr;
+} T5Matrix;
+
 /* One matrix cell: misses (or cycles) per data-branch execution of the row
- * with group g, exposure e, N and L, "skip" or "–"; returns 1 if it holds a
- * number. */
-static int t5_cell(char *buf, size_t bn, const T5Row *t, int n, const ReportRow *rows,
-                   int g, unsigned e, unsigned nn, unsigned l, int ctr)
+ * with the matrix's group and exposure, N = nn and L = l, "skip" or "–";
+ * returns 1 if it holds a number. */
+static int t5_cell(char *buf, size_t bn, const T5Matrix *m, unsigned nn, unsigned l)
 {
-    for (int i = 0; i < n; i++) {
-        const T5Row *r = &t[i];
-        if (r->group != g || r->exposure != e || r->cell.n != nn || r->cell.l != l) continue;
+    for (int i = 0; i < m->n; i++) {
+        const T5Row *r = &m->t[i];
+        if (r->group != m->g || r->exposure != m->e || r->cell.n != nn || r->cell.l != l) continue;
         if (r->skip != T5_MEASURED) { snprintf(buf, bn, "skip"); return 0; }
-        const Result *res = &rows[r->variant].r;
-        const u64 work = rows[r->variant].work->count;
-        if (!result_has(res, ctr) || !work) break;
-        snprintf(buf, bn, ctr == CTR_MISSES ? "%.3f" : "%.2f",
-                 (double)res->counts[ctr] / (double)work);
+        const Result *res = &m->rows[r->variant].r;
+        const u64 work = m->rows[r->variant].work->count;
+        if (!result_has(res, m->ctr) || !work) break;
+        snprintf(buf, bn, m->ctr == CTR_MISSES ? "%.3f" : "%.2f",
+                 (double)res->counts[m->ctr] / (double)work);
         return 1;
     }
     snprintf(buf, bn, "–");
@@ -2780,16 +2819,17 @@ static int t5_cell(char *buf, size_t bn, const T5Row *t, int n, const ReportRow 
 }
 
 /* One N × L table of a group at one exposure, if any cell has the counter. */
-static void t5_matrix(FILE *report, const T5Row *t, int n, const ReportRow *rows,
-                      const T5Group *gr, int g, unsigned e, int ctr)
+static void t5_matrix(FILE *report, const T5Matrix *m)
 {
+    const T5Group *gr = m->gr;
+    const unsigned e = m->e;
     char cell[32];
     int any = 0;
     for (int i = 0; i < gr->nn; i++)
         for (int j = 0; j < gr->nl; j++)
-            any += t5_cell(cell, sizeof cell, t, n, rows, g, e, gr->n[i], gr->l[j], ctr);
+            any += t5_cell(cell, sizeof cell, m, gr->n[i], gr->l[j]);
     if (!any) return;
-    const char *what = ctr == CTR_MISSES ? "Misses" : "Cycles";
+    const char *what = m->ctr == CTR_MISSES ? "Misses" : "Cycles";
     printf("\n  %s per data branch (blocks %zu, E=%u):\n  %5s", what, gr->blocks, e, "N");
     if (report) fprintf(report, "**%s per data branch (blocks %zu, E=%u):**\n\n| N |",
                         what, gr->blocks, e);
@@ -2808,7 +2848,7 @@ static void t5_matrix(FILE *report, const T5Row *t, int n, const ReportRow *rows
         printf("  %5u", gr->n[i]);
         if (report) fprintf(report, "| %u |", gr->n[i]);
         for (int j = 0; j < gr->nl; j++) {
-            t5_cell(cell, sizeof cell, t, n, rows, g, e, gr->n[i], gr->l[j], ctr);
+            t5_cell(cell, sizeof cell, m, gr->n[i], gr->l[j]);
             printf(" %13s", cell);
             if (report) fprintf(report, " %s |", cell);
         }
@@ -2855,8 +2895,10 @@ static void t5_summary(FILE *report, const T5Row *t, int n, const ReportRow *row
 {
     for (int e = 0; e < p->nexp; e++)
         for (int g = 0; g < p->ngroups; g++) {
-            t5_matrix(report, t, n, rows, &p->groups[g], g, p->exposures[e], CTR_MISSES);
-            t5_matrix(report, t, n, rows, &p->groups[g], g, p->exposures[e], CTR_CYCLES);
+            T5Matrix m = { t, n, rows, &p->groups[g], g, p->exposures[e], CTR_MISSES };
+            t5_matrix(report, &m);
+            m.ctr = CTR_CYCLES;
+            t5_matrix(report, &m);
         }
     printf("\n");
     if (pair >= 0) {
@@ -2921,48 +2963,60 @@ static void run_test5(FILE *report)
     "this kernel on this machine, not a predictor's capacity."
 
 /* The whole body is one asm block, as in the data-branch kernels: the
- * exits for no loops or a zero count, the outer loop and the inner loop. */
+ * exits for no loops or a zero count, the outer loop and the inner loop.
+ * LOOP_EXIT_ASM(body) is that block with the inner loop's body; both
+ * kernels share it so their loop control is the same instructions. */
+#if KERNEL_ASM
+#  if defined(__x86_64__)
+#    define LOOP_EXIT_ASM(body)                                           \
+    __asm__ __volatile__(                                                 \
+        "test %[l], %[l]\n\t"                                             \
+        "jz 4f\n\t"                                                       \
+        "test %k[c], %k[c]\n\t"                                           \
+        "jz 4f\n"                                                         \
+        "1:\n\t"                                                          \
+        "mov %k[c], %k[i]\n"                                              \
+        "2:\n\t"                                                          \
+        body                                                              \
+        "dec %[i]\n\t"                                                    \
+        "jnz 2b\n\t"                 /* <── THE inner loop branch */      \
+        "dec %[l]\n\t"                                                    \
+        "jnz 1b\n"                                                        \
+        "4:"                                                              \
+        : [acc] "+r"(acc), [i] "=&r"(i), [l] "+r"(loops)                  \
+        : [c] "r"(c)                                                      \
+        : "cc")
+#    define LOOP_BODY1 "inc %[acc]\n\t"
+#    define LOOP_BODY2 "add %[i], %[acc]\n\tinc %[acc]\n\t"
+#  else
+#    define LOOP_EXIT_ASM(body)                                           \
+    __asm__ __volatile__(                                                 \
+        "cbz %[l], 4f\n\t"                                                \
+        "cbz %w[c], 4f\n"                                                 \
+        "1:\n\t"                                                          \
+        "mov %w[i], %w[c]\n"                                              \
+        "2:\n\t"                                                          \
+        body                                                              \
+        "subs %[i], %[i], #1\n\t"                                         \
+        "b.ne 2b\n\t"                /* <── THE inner loop branch */      \
+        "subs %[l], %[l], #1\n\t"                                         \
+        "b.ne 1b\n"                                                       \
+        "4:"                                                              \
+        : [acc] "+r"(acc), [i] "=&r"(i), [l] "+r"(loops)                  \
+        : [c] "r"(c)                                                      \
+        : "cc")
+#    define LOOP_BODY1 "add %[acc], %[acc], #1\n\t"
+#    define LOOP_BODY2 "add %[acc], %[acc], %[i]\n\tadd %[acc], %[acc], #1\n\t"
+#  endif
+#endif
+
 __attribute__((noinline))
 static u64 loop_exit(unsigned c, u64 loops)
 {
     u64 acc = 0;
 #if KERNEL_ASM
     u64 i;
-#  if defined(__x86_64__)
-    __asm__ __volatile__(
-        "test %[l], %[l]\n\t"
-        "jz 4f\n\t"
-        "test %k[c], %k[c]\n\t"
-        "jz 4f\n"
-        "1:\n\t"
-        "mov %k[c], %k[i]\n"
-        "2:\n\t"
-        "inc %[acc]\n\t"
-        "dec %[i]\n\t"
-        "jnz 2b\n\t"                 /* <── THE inner loop branch */
-        "dec %[l]\n\t"
-        "jnz 1b\n"
-        "4:"
-        : [acc] "+r"(acc), [i] "=&r"(i), [l] "+r"(loops)
-        : [c] "r"(c)
-        : "cc");
-#  else
-    __asm__ __volatile__(
-        "cbz %[l], 4f\n\t"
-        "cbz %w[c], 4f\n"
-        "1:\n\t"
-        "mov %w[i], %w[c]\n"
-        "2:\n\t"
-        "add %[acc], %[acc], #1\n\t"
-        "subs %[i], %[i], #1\n\t"
-        "b.ne 2b\n\t"                /* <── THE inner loop branch */
-        "subs %[l], %[l], #1\n\t"
-        "b.ne 1b\n"
-        "4:"
-        : [acc] "+r"(acc), [i] "=&r"(i), [l] "+r"(loops)
-        : [c] "r"(c)
-        : "cc");
-#  endif
+    LOOP_EXIT_ASM(LOOP_BODY1);
 #else
     if (c == 0) return 0;   /* else GCC keeps an empty outer loop for c = 0 */
     for (u64 l = 0; l < loops; l++)
@@ -2981,43 +3035,7 @@ static u64 loop_exit_body2(unsigned c, u64 loops)
     u64 acc = 0;
 #if KERNEL_ASM
     u64 i;
-#  if defined(__x86_64__)
-    __asm__ __volatile__(
-        "test %[l], %[l]\n\t"
-        "jz 4f\n\t"
-        "test %k[c], %k[c]\n\t"
-        "jz 4f\n"
-        "1:\n\t"
-        "mov %k[c], %k[i]\n"
-        "2:\n\t"
-        "add %[i], %[acc]\n\t"
-        "inc %[acc]\n\t"
-        "dec %[i]\n\t"
-        "jnz 2b\n\t"                 /* <── THE inner loop branch */
-        "dec %[l]\n\t"
-        "jnz 1b\n"
-        "4:"
-        : [acc] "+r"(acc), [i] "=&r"(i), [l] "+r"(loops)
-        : [c] "r"(c)
-        : "cc");
-#  else
-    __asm__ __volatile__(
-        "cbz %[l], 4f\n\t"
-        "cbz %w[c], 4f\n"
-        "1:\n\t"
-        "mov %w[i], %w[c]\n"
-        "2:\n\t"
-        "add %[acc], %[acc], %[i]\n\t"
-        "add %[acc], %[acc], #1\n\t"
-        "subs %[i], %[i], #1\n\t"
-        "b.ne 2b\n\t"                /* <── THE inner loop branch */
-        "subs %[l], %[l], #1\n\t"
-        "b.ne 1b\n"
-        "4:"
-        : [acc] "+r"(acc), [i] "=&r"(i), [l] "+r"(loops)
-        : [c] "r"(c)
-        : "cc");
-#  endif
+    LOOP_EXIT_ASM(LOOP_BODY2);
 #else
     if (c == 0) return 0;   /* else GCC keeps an empty outer loop for c = 0 */
     for (u64 l = 0; l < loops; l++)
@@ -3159,9 +3177,10 @@ static void run_test6(FILE *report)
            profile_names[profile], n, t6_budget());
     printf("  %s\n\n", T6_DESC);
 
-    ReportRow *rows = malloc((size_t)n * sizeof *rows);
-    Work *works = malloc((size_t)n * sizeof *works);
-    if (!rows || !works) { perror("malloc"); exit(1); }
+    /* calloc: GCC 13 cannot see that the loop below sets every row. */
+    ReportRow *rows = calloc((size_t)n, sizeof *rows);
+    Work *works = calloc((size_t)n, sizeof *works);
+    if (!rows || !works) { perror("calloc"); exit(1); }
     const Result none = {0};
     for (int i = 0; i < n; i++) {
         snprintf(t6_labels[i], sizeof t6_labels[i],

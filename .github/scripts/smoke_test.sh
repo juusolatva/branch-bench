@@ -160,6 +160,23 @@ elif grep -q '^FAIL Test 5 matrix misses blocks 256 E=8 N=1 L=8:' "$dir/check.ou
 else
     echo "FAIL check_export.py failed for another reason:"; cat "$dir/check.out"; fail=1
 fi
+# A missing Test 5 table and a repeated matrix row must be caught too.
+awk '/^\*\*Misses per data branch \(blocks 96/ { skip = 1 }
+     skip && /^$/ && ++blank == 2 { skip = 0; next }
+     !skip' "$dir/t5j.md" > "$dir/t5drop.md"
+awk '{ print } /^\| 256 \|/ && !done { print; done = 1 }' "$dir/t5j.md" > "$dir/t5dup.md"
+for c in drop:'^FAIL Test 5 matrix tables ' dup:'^FAIL Test 5 matrix .* repeated$'; do
+    f=${c%%:*} want=${c#*:}
+    if cmp -s "$dir/t5j.md" "$dir/t5$f.md"; then
+        echo "skip $f-matrix case: no miss counter"
+    elif python3 "$check_export" "$dir/t5.jsonl" --report "$dir/t5$f.md" > "$dir/check.out" 2>&1; then
+        echo "FAIL check_export.py accepted a Test 5 report with a $f matrix part"; fail=1
+    elif grep -q "$want" "$dir/check.out"; then
+        echo "ok   check_export.py rejects a Test 5 report with a $f matrix part"
+    else
+        echo "FAIL check_export.py failed for another reason:"; cat "$dir/check.out"; fail=1
+    fi
+done
 # Test 6's loop-exit curve is rebuilt from the export too.
 expect 0 -t 6 --profile quick -o "$dir/t6j.md" --json "$dir/t6.jsonl"
 export_ok "$dir/t6.jsonl" --report "$dir/t6j.md"
