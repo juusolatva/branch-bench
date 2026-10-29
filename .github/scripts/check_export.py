@@ -6,11 +6,12 @@ C code, and compares it with the pair records, and checks each trial's
 scaled counts against its raw counts and scheduling times.  With --report,
 also checks that the Markdown report shows the same medians, ranges,
 counter columns, Miss %, misses per item, ratios and effective-cost lines
-(resolved and inconclusive).  Test 6's "Correlation used" values are not
-checked.  Every check must have something to compare: an empty export or
-report fails.  Standard library only.  The schema, revision and the
-1000-miss gate below must change together with branch_bench.c
-(JSON_SCHEMA, BENCH_REVISION, COST_MIN_MISSES_PER_PAIR).
+(resolved and inconclusive) and Test 6's "Correlation used" lines.  Every
+pair must compare equal work and inputs.  Every check must have something
+to compare: an empty export or report fails.  Standard library only.  The
+schema, revision and the constants below must change together with
+branch_bench.c (JSON_SCHEMA, BENCH_REVISION, COST_MIN_MISSES_PER_PAIR,
+D6_MIN_SAMPLE).
 
 Usage: check_export.py EXPORT [--report REPORT.md] [--kernel-counts FILE]
                        [--same-results OTHER --test N]
@@ -24,6 +25,7 @@ import math
 import sys
 
 COST_MIN_MISSES_PER_PAIR = 1000.0
+D6_MIN_SAMPLE = 65536
 COST_LABEL = "**Effective extra cycles per additional miss:**"
 
 
@@ -168,6 +170,21 @@ def check_pairs(records):
     ok(f"{len(pairs)} pair records rebuilt from {len(trials)} trials")
 
 
+def check_pair_inputs(records, variants):
+    """Both sides of a pair do the same work on inputs of the same size and,
+    where recorded, the same number of condition-true items."""
+    n = 0
+    for p in by_type(records, "pair"):
+        a, b = variants[(p["test"], p["a"])], variants[(p["test"], p["b"])]
+        where = f"pair {p['pair']} (test {p['test']})"
+        check(a["work"] == b["work"], f"{where}: work {a['work']} vs {b['work']}")
+        for field in ("pass_items", "cond_true"):
+            if a[field] is not None and b[field] is not None:
+                check(a[field] == b[field], f"{where}: {field} {a[field]} vs {b[field]}")
+        n += 1
+    ok(f"{n} pairs compare equal work and inputs")
+
+
 def report_sections(path):
     """Report text per test number, from each "### Test N " heading on."""
     sections = {}
@@ -245,6 +262,55 @@ def cost_line(p):
     return text
 
 
+def correlation_lines(records, variants):
+    """The lines print_correlation_used() writes for Test 6, or None when no
+    pair has miss counts."""
+    entries = []
+    counted = short_na = evaluated = 0
+    best = 0
+    for p in sorted((p for p in by_type(records, "pair") if p["test"] == 6),
+                    key=lambda p: p["pair"]):
+        a = variants[(6, p["a"])]
+        d = int(a["label"].split("=")[1].split()[0])
+        has_misses = p["valid"] > 0 and p["delta"]["misses"] is not None
+        counted += has_misses
+        if not has_misses or a["pass_items"] < D6_MIN_SAMPLE:
+            short_na += has_misses
+            entries.append(f"d={d} n/a")
+            continue
+        avoided = p["delta"]["misses"] / p["valid"]
+        pct = min(100.0, max(0.0, 100.0 * avoided / (0.5 * a["work"])))
+        entries.append(f"d={d} {pct:.0f}%")
+        evaluated += 1
+        if pct >= 90.0:
+            best = d
+    if not counted:
+        return None
+    shown = (str(best) if best else "none") if evaluated else "n/a"
+    lines = [f"**Correlation used:** {', '.join(entries)}\n\n"
+             f"**Largest d with ≥ 90%:** {shown}\n\n"]
+    if short_na:
+        lines.append(f"_n/a: fewer than {D6_MIN_SAMPLE} blocks per pass, so a predictor "
+                     f"may learn the sequences._\n")
+    return lines
+
+
+def check_correlation(records, variants, sections):
+    """Test 6's correlation lines, rebuilt from its pairs; returns how many
+    lines were compared."""
+    section = sections.get(6, "")
+    want = correlation_lines(records, variants)
+    if want is None:
+        check("**Correlation used:**" not in section,
+              "Test 6: report has a Correlation used line without miss counts")
+        return 0
+    for line in want:
+        check(line in section, f"Test 6: report lacks {line.strip()!r}")
+    if len(want) == 1:
+        check("_n/a: fewer than" not in section, "Test 6: report has an n/a note no pair needs")
+    return len(want)
+
+
 def check_report(records, variants, path):
     sections = report_sections(path)
     trials = by_type(records, "trial")
@@ -284,6 +350,8 @@ def check_report(records, variants, path):
             want = cost_line(p)
             check(want + "\n" in section, f"Test {p['test']}: report lacks {want!r}")
             lines += 1
+    if any(t["test"] == 6 for t in trials):
+        lines += check_correlation(records, variants, sections)
     check(rows, "report check compared no table rows")
     ok(f"report matches the export: {rows} table rows, {lines} summary lines")
 
@@ -318,8 +386,12 @@ def check_kernel_counts(records, path):
 
 
 def results(records, test):
+    """A test's trial results and its variants' input hashes."""
     trials = [t for t in by_type(records, "trial") if t["test"] == test]
-    return [(t["variant"], t["result"]) for t in sorted(trials, key=lambda t: (t["variant"], t["seq"]))]
+    hashes = {v["variant"]: v.get("input_hash") for v in by_type(records, "variant")
+              if v["test"] == test}
+    return ([(t["variant"], t["result"]) for t in sorted(trials, key=lambda t: (t["variant"], t["seq"]))],
+            hashes)
 
 
 def main():
@@ -336,6 +408,7 @@ def main():
         variants = check_structure(records)
         check_trials(records)
         check_pairs(records)
+        check_pair_inputs(records, variants)
         if args.report:
             check_report(records, variants, args.report)
         if args.kernel_counts:
@@ -345,8 +418,8 @@ def main():
                 continue
             check(args.test is not None, "--same-results/--different-results need --test")
             mine, theirs = results(records, args.test), results(load(other), args.test)
-            check(mine, f"no Test {args.test} trials in {args.export}")
-            check(theirs, f"no Test {args.test} trials in {other}")
+            check(mine[0], f"no Test {args.test} trials in {args.export}")
+            check(theirs[0], f"no Test {args.test} trials in {other}")
             check((mine == theirs) == same,
                   f"Test {args.test} results {'differ' if same else 'are equal'}: {mine} vs {theirs}")
             ok(f"Test {args.test} results {'equal' if same else 'differ'}")

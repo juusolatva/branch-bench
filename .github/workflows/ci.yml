@@ -305,10 +305,14 @@ jobs:
           # Only some counters open.  Tests 1-2 come first: the shim fails the
           # first and third counter reads, and their four measurements absorb
           # them.  The Test 5-6 summaries need misses, and only misses.
-          FAKE_PERF_EVENTS=misses ./branch_bench_cov -t 1 -t 2 -t 5 -t 6 $SMALL_RUN -o "$dir/part.md"
+          # check_export.py must accept both: the Test 6 line with misses,
+          # its absence without.
+          FAKE_PERF_EVENTS=misses ./branch_bench_cov -t 1 -t 2 -t 5 -t 6 $SMALL_RUN -o "$dir/part.md" --json "$dir/part.jsonl"
           grep -q '^\*\*Periods at' "$dir/part.md"
           grep -q '^\*\*Correlation used' "$dir/part.md"
-          FAKE_PERF_EVENTS=branches,cycles ./branch_bench_cov -t 1 -t 2 -t 5 -t 6 $SMALL_RUN -o "$dir/part.md"
+          python3 .github/scripts/check_export.py "$dir/part.jsonl" --report "$dir/part.md"
+          FAKE_PERF_EVENTS=branches,cycles ./branch_bench_cov -t 1 -t 2 -t 5 -t 6 $SMALL_RUN -o "$dir/part.md" --json "$dir/part.jsonl"
+          python3 .github/scripts/check_export.py "$dir/part.jsonl" --report "$dir/part.md"
           if grep -q 'Periods at\|Correlation used' "$dir/part.md"; then
             echo "Test 5-6 summaries printed without the miss counter"; exit 1
           fi

@@ -589,31 +589,77 @@ static int new_pair(int a, int b)
     return pair_count++;
 }
 
-/* What each variant's rows describe, for the export: registered by
- * emit_rows(), once per (test, variant). */
+/* What each variant's rows describe, for the export: its label and work,
+ * registered by emit_rows(), and its input, registered by log_input() at
+ * setup.  One entry per (test, variant). */
 #define MAX_VARIANTS 64
 
 typedef struct {
     int         test;
     int         variant;
-    const char *label;
+    const char *label;       /* NULL until emit_rows() registers the row */
     Work        work;
+    int         has_input;
+    u64         pass_items;  /* items per pass (elements, blocks or calls) */
+    int         has_cond;
+    u64         cond_true;   /* items per pass whose source condition holds */
+    u64         input_hash;  /* fnv1a64() of the input buffer */
 } VariantInfo;
 
 static VariantInfo variant_info[MAX_VARIANTS];
 static int         variant_count = 0;
 
-static void log_variant(int variant, const char *label, const Work *w)
+/* FNV-1a, 64-bit: identifies an input buffer in the export. */
+static u64 fnv1a64(const u8 *p, size_t n)
+{
+    u64 h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < n; i++) {
+        h ^= p[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+/* The entry for (current_test, variant), created zeroed on first use. */
+static VariantInfo *variant_entry(int variant)
 {
     for (int i = 0; i < variant_count; i++)
         if (variant_info[i].test == current_test && variant_info[i].variant == variant)
-            return;
+            return &variant_info[i];
     if (variant_count >= MAX_VARIANTS) log_full("variant table");
     VariantInfo *v = &variant_info[variant_count++];
+    memset(v, 0, sizeof *v);
     v->test = current_test;
     v->variant = variant;
+    return v;
+}
+
+static void log_variant(int variant, const char *label, const Work *w)
+{
+    VariantInfo *v = variant_entry(variant);
+    if (v->label) return;
     v->label = label;
     v->work = *w;
+}
+
+/* Records a variant's input before it is measured: pass_items items per
+ * pass from buf, of which cond_true (when has_cond) meet the kernel's
+ * source condition.  A variant measured in two pairs logs it once, or
+ * twice with the same values. */
+static void log_input(int variant, const u8 *buf, size_t pass_items, int has_cond, u64 cond_true)
+{
+    VariantInfo *v = variant_entry(variant);
+    const u64 hash = fnv1a64(buf, pass_items);
+    if (v->has_input && (v->pass_items != pass_items || v->has_cond != has_cond ||
+                         v->cond_true != cond_true || v->input_hash != hash)) {
+        fprintf(stderr, "Internal error: variant %d input logged twice\n", variant);
+        exit(1);
+    }
+    v->has_input  = 1;
+    v->pass_items = pass_items;
+    v->has_cond   = has_cond;
+    v->cond_true  = has_cond ? cond_true : 0;
+    v->input_hash = hash;
 }
 
 /* The reported row for a variant: its median trial by time over all its
@@ -1757,7 +1803,8 @@ static void d6_layout(u64 total, size_t len, unsigned d, size_t *blocks, unsigne
     const u64 per_block = (u64)d + 2;
     const u64 fit = total / per_block;
     *blocks = fit < len ? (size_t)fit : len;
-    *passes = (unsigned)(total / (per_block * *blocks));
+    /* test6_size_ok() guarantees blocks > 0; the guard is for the analyzer. */
+    *passes = *blocks ? (unsigned)(total / (per_block * *blocks)) : 0;
 }
 
 /* One distance's layout, and the work each of its two rows does. */
@@ -1800,6 +1847,8 @@ static void measure_distances(const u8 *a, u8 *b_corr, u8 *b_ref, size_t len, u6
         const unsigned passes = pt->passes;
         memcpy(b_corr, a, blocks);
         fill_random_bits(b_ref, blocks, test_seed(6, 0, 1));
+        log_input(2 * i, b_corr, blocks, 0, 0);
+        log_input(2 * i + 1, b_ref, blocks, 0, 0);
         MEASURE_PAIR(rows[2 * i].r, 2 * i, correlate_distance(a, b_corr, fill, blocks, d, passes),
                      rows[2 * i + 1].r, 2 * i + 1,
                      correlate_distance(a, b_ref, fill, blocks, d, passes), pt->pair);
@@ -2223,6 +2272,7 @@ static void write_variants(FILE *f)
 {
     for (int i = 0; i < variant_count; i++) {
         const VariantInfo *v = &variant_info[i];
+        if (!v->label) continue;   /* input logged, but no row was emitted */
         char label[128];
         char kernel[64];
         collapse_spaces(v->label, label, sizeof label);
@@ -2233,6 +2283,13 @@ static void write_variants(FILE *f)
         json_string_or_null(f, kernel);
         fprintf(f, ",\"work\":%" PRIu64 ",\"unit\":", v->work.count);
         json_string(f, v->work.unit);
+        fputs(",\"pass_items\":", f);
+        json_int(f, v->has_input, (long long)v->pass_items);
+        fputs(",\"cond_true\":", f);
+        json_int(f, v->has_cond, (long long)v->cond_true);
+        fputs(",\"input_hash\":", f);
+        if (v->has_input) fprintf(f, "%" PRIu64, v->input_hash);
+        else fputs("null", f);
         fputs("}\n", f);
     }
 }

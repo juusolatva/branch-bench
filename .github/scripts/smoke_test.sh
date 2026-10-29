@@ -134,6 +134,19 @@ export_ok "$dir/run.jsonl" --report "$dir/report3.md"
 # shellcheck disable=SC2086
 expect 0 --hard $small -o "$dir/hard3.md" --json "$dir/hard.jsonl"
 export_ok "$dir/hard.jsonl" --report "$dir/hard3.md"
+# Test 6's "Correlation used" line is rebuilt from the export too.  At
+# 64K × 6, d = 4 has a figure and the other distances n/a (with counters).
+expect 0 -t 4 -t 6 --size 64K --reps 6 -o "$dir/t6j.md" --json "$dir/t6.jsonl"
+export_ok "$dir/t6.jsonl" --report "$dir/t6j.md"
+# The checker must notice a changed figure (none without the miss counter).
+sed 's/^\(\*\*Correlation used:\*\* d=4 \)[0-9]*%/\1101%/' "$dir/t6j.md" > "$dir/t6bad.md"
+if cmp -s "$dir/t6j.md" "$dir/t6bad.md"; then
+    echo "skip corrupted-correlation case: no miss counter"
+elif python3 "$check_export" "$dir/t6.jsonl" --report "$dir/t6bad.md" > "$dir/check.out" 2>&1; then
+    echo "FAIL check_export.py accepted a corrupted Correlation used line"; fail=1
+else
+    echo "ok   check_export.py rejects a corrupted Correlation used line"
+fi
 # Selecting more tests does not change Test 3's input; --seed does.
 expect 0 -t 3 --size 4K --reps 1 --json "$dir/a.jsonl"
 expect 0 -t 1 -t 3 --size 4K --reps 1 --json "$dir/b.jsonl"
