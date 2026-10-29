@@ -73,6 +73,7 @@
 #define DB_MAX_PERIOD  (1u << DB_MAX_ORDER)
 #define DB_ORDERS      (DB_MAX_ORDER - DB_MIN_ORDER + 1)
 #define DB_RANDOM_SEED 0x2545f4914f6cdd1dULL  /* nonzero: xorshift64 sticks at 0 */
+#define DB_MIN_SAMPLE  65536  /* elements for test 5's summary lines */
 
 /* Test 6: distances d (filler branches between A and B), powers of two */
 #define D6_MIN_DIST    4
@@ -1195,6 +1196,32 @@ static void print_low_miss_periods(FILE *report, const ReportRow *rows, const Wo
     if (report) fprintf(report, "**Periods at ≤ 0.05 misses/elem:** %s\n\n", shown);
 }
 
+/* Test 5's summary lines: random vs the shortest and longest period, cost
+ * per miss, and the low-miss periods.  Below DB_MIN_SAMPLE elements the
+ * random row repeats so often that a predictor may learn it, so a note
+ * replaces them. */
+static void print_test5_summary(FILE *report, const ReportRow *rows,
+                                const Work *w, size_t len)
+{
+    if (len < DB_MIN_SAMPLE) {
+        printf("\n  → n/a: --size below %d, so a predictor may learn the random row\n",
+               DB_MIN_SAMPLE);
+        if (report)
+            fprintf(report, "_n/a: --size below %d, so a predictor may learn the "
+                            "random row; summary omitted._\n\n", DB_MIN_SAMPLE);
+        return;
+    }
+    const Result *shortest = &rows[0].r;
+    const Result *longest  = &rows[DB_ORDERS - 1].r;
+    const Result *random_row = &rows[DB_ORDERS].r;
+    emit_ratio(report, "\n  Random vs period 32:    ", "Random vs period 32",
+               random_row->time_ms, shortest->time_ms, "");
+    emit_ratio(report, "  Random vs period 2048:  ", "Random vs period 2048",
+               random_row->time_ms, longest->time_ms, "");
+    print_miss_cost(report, shortest, random_row);
+    print_low_miss_periods(report, rows, w);
+}
+
 static void run_test5(FILE *report)
 {
     const size_t len = size;
@@ -1230,16 +1257,8 @@ static void run_test5(FILE *report)
     anti_dce_sink(sink);
 
     const Work work = { (u64)len * reps, "elem" };
-    const Result *shortest = &rows[0].r;
-    const Result *longest  = &rows[DB_ORDERS - 1].r;
-    const Result *random   = &rows[DB_ORDERS].r;
     emit_rows(report, DB_TITLE, DB_DESC, rows, DB_ORDERS + 1, &work);
-    emit_ratio(report, "\n  Random vs period 32:    ", "Random vs period 32",
-               random->time_ms, shortest->time_ms, "");
-    emit_ratio(report, "  Random vs period 2048:  ", "Random vs period 2048",
-               random->time_ms, longest->time_ms, "");
-    print_miss_cost(report, shortest, random);
-    print_low_miss_periods(report, rows, &work);
+    print_test5_summary(report, rows, &work, len);
     printf("\n");
 }
 
@@ -1302,6 +1321,13 @@ static void d6_layout(u64 total, size_t len, unsigned d, size_t *blocks, unsigne
     *passes = (unsigned)(total / (per_block * *blocks));
 }
 
+/* One distance's layout, and the work each of its two rows does. */
+typedef struct {
+    size_t   blocks;     /* per pass */
+    unsigned passes;
+    Work     work;       /* blocks × passes, unit "block" */
+} D6Point;
+
 /* Share of the reference row's B misses (0.5 per block) that the
  * correlated row avoided, clamped to 0–100%.  Needs both miss counts. */
 static double correlation_used_pct(const Result *corr, const Result *ref, u64 blocks_run)
@@ -1314,20 +1340,23 @@ static double correlation_used_pct(const Result *corr, const Result *ref, u64 bl
 }
 
 /* Measures each distance's correlated row (B a copy of A) and reference row
- * (B random), recording each pair's work in works[]. */
+ * (B random), recording each distance's layout in pts[] and pointing both
+ * of its rows at that work. */
 static void measure_distances(const u8 *a, u8 *b, size_t len, u64 total,
-                              ReportRow rows[2 * D6_DISTS], Work works[2 * D6_DISTS])
+                              ReportRow rows[2 * D6_DISTS], D6Point pts[D6_DISTS])
 {
     u8 fill[D6_MAX_DIST];
     memset(fill, 1, sizeof fill);
     for (int i = 0; i < D6_DISTS; i++) {
         const unsigned d = (unsigned)D6_MIN_DIST << i;
-        size_t blocks;
-        unsigned passes;
-        d6_layout(total, len, d, &blocks, &passes);
-        const Work w = { (u64)blocks * passes, "block" };
-        works[2 * i] = w;
-        works[2 * i + 1] = w;
+        D6Point *pt = &pts[i];
+        d6_layout(total, len, d, &pt->blocks, &pt->passes);
+        pt->work.count = (u64)pt->blocks * pt->passes;
+        pt->work.unit  = "block";
+        rows[2 * i].work = &pt->work;
+        rows[2 * i + 1].work = &pt->work;
+        const size_t blocks = pt->blocks;
+        const unsigned passes = pt->passes;
         memcpy(b, a, blocks);
         MEASURE(rows[2 * i].r, correlate_distance(a, b, fill, blocks, d, passes));
         fill_random_bits(b, blocks, D6_SEED_B);
@@ -1338,48 +1367,57 @@ static void measure_distances(const u8 *a, u8 *b, size_t len, u64 total,
 /* Per distance, how much of B's randomness the correlation removed, and the
  * largest d at 90% or more; needs the miss counter on every row.  These are
  * descriptive thresholds, not a measured history length.  A distance with
- * fewer than D6_MIN_SAMPLE blocks per pass shows n/a: the predictor could
- * learn its short random sequences, so B would look predictable either way. */
+ * fewer than D6_MIN_SAMPLE blocks per pass shows n/a: its random sequences
+ * repeat so often that a predictor may learn them, which would make B
+ * predictable without A. */
 static void print_correlation_used(FILE *report, const ReportRow *rows,
-                                   size_t len, u64 total)
+                                   const D6Point *pts)
 {
     char list[256] = "";
     size_t used = 0;
     unsigned best = 0;
-    int any_short = 0;
-    for (int i = 0; i < 2 * D6_DISTS; i++)
-        if (!result_has(&rows[i].r, CTR_MISSES)) return;
+    int evaluated = 0;
     for (int i = 0; i < D6_DISTS; i++) {
         const unsigned d = (unsigned)D6_MIN_DIST << i;
-        size_t blocks;
-        unsigned passes;
-        d6_layout(total, len, d, &blocks, &passes);
         char entry[32];
-        if (blocks < D6_MIN_SAMPLE) {
+        if (pts[i].blocks < D6_MIN_SAMPLE) {
             snprintf(entry, sizeof entry, "d=%u n/a", d);
-            any_short = 1;
         } else {
             const double pct = correlation_used_pct(&rows[2 * i].r, &rows[2 * i + 1].r,
-                                                    (u64)blocks * passes);
+                                                    pts[i].work.count);
             snprintf(entry, sizeof entry, "d=%u %.0f%%", d, pct);
+            evaluated++;
             if (pct >= 90.0) best = d;
         }
         list_append(list, sizeof list, &used, entry);
     }
     char best_d[16];
     snprintf(best_d, sizeof best_d, "%u", best);
-    const char *shown = best ? best_d : "none";
+    const char *shown = "n/a";
+    if (evaluated) shown = best ? best_d : "none";
     printf("  → Correlation used: %s\n  → Largest d with ≥ 90%%: %s\n", list, shown);
     if (report)
         fprintf(report, "**Correlation used:** %s\n\n**Largest d with ≥ 90%%:** %s\n\n",
                 list, shown);
-    if (any_short) {
-        printf("  → n/a: fewer than %d blocks per pass, short enough to be learned\n",
+    if (evaluated < D6_DISTS) {
+        printf("  → n/a: fewer than %d blocks per pass, so a predictor may learn the sequences\n",
                D6_MIN_SAMPLE);
         if (report)
-            fprintf(report, "_n/a: fewer than %d blocks per pass, short enough to be learned._\n\n",
-                    D6_MIN_SAMPLE);
+            fprintf(report, "_n/a: fewer than %d blocks per pass, so a predictor may "
+                            "learn the sequences._\n\n", D6_MIN_SAMPLE);
     }
+}
+
+/* Test 6's summary lines: cost per miss from the d = 4 pair (same work,
+ * only B's predictability differs) when its sample is long enough, and the
+ * correlation used per distance; both need the miss counter on every row. */
+static void print_test6_summary(FILE *report, const ReportRow *rows, const D6Point *pts)
+{
+    for (int i = 0; i < 2 * D6_DISTS; i++)
+        if (!result_has(&rows[i].r, CTR_MISSES)) return;
+    if (pts[0].blocks >= D6_MIN_SAMPLE)
+        print_miss_cost(report, &rows[0].r, &rows[1].r);
+    print_correlation_used(report, rows, pts);
 }
 
 static void run_test6(FILE *report)
@@ -1404,22 +1442,21 @@ static void run_test6(FILE *report)
     fill_random_bits(a, len, D6_SEED_A);
     const Result none = {0};
     ReportRow rows[2 * D6_DISTS];
-    Work works[2 * D6_DISTS];
+    D6Point pts[D6_DISTS];
     for (int i = 0; i < 2 * D6_DISTS; i++) {
         rows[i].label = d6_labels[i];
         rows[i].r     = none;
-        rows[i].work  = &works[i];
+        rows[i].work  = NULL;   /* set by measure_distances() */
     }
-    measure_distances(a, b, len, (u64)len * r, rows, works);
+    measure_distances(a, b, len, (u64)len * r, rows, pts);
     free(a);
     free(b);
     u64 sink = 0;
     for (int i = 0; i < 2 * D6_DISTS; i++) sink += rows[i].r.result;
     anti_dce_sink(sink);
 
-    emit_rows(report, D6_TITLE, D6_DESC, rows, 2 * D6_DISTS, &works[0]);
-    print_miss_cost(report, &rows[0].r, &rows[1].r);
-    print_correlation_used(report, rows, len, (u64)len * r);
+    emit_rows(report, D6_TITLE, D6_DESC, rows, 2 * D6_DISTS, &pts[0].work);
+    print_test6_summary(report, rows, pts);
     printf("\n");
 }
 

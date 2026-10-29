@@ -43,9 +43,12 @@ expect 0 -t 3 --size 1000 --reps 1
 # four measurements absorb them, so every Test 5 row gets counts.
 # shellcheck disable=SC2086
 expect 0 -t 4 -t 5 $small -o "$dir/t5.md"
-grep -q '^### Test 5 ' "$dir/t5.md" || { echo "FAIL t5.md lacks Test 5"; fail=1; }
+grep -q '^| Period 2048 (k=11) |' "$dir/t5.md" || { echo "FAIL t5.md lacks Test 5's table"; fail=1; }
 expect 0 -t 5 --size 1000 --reps 1 -o "$dir/skip5.md"
 grep -q 'Skipped:' "$dir/skip5.md" || { echo "FAIL skip5.md lacks the skip reason"; fail=1; }
+# Below 64K elements Test 5 measures, but replaces its summary with a note.
+expect 0 -t 5 --size 2048 --reps 1 -o "$dir/short5.md"
+grep -q '^_n/a: --size below' "$dir/short5.md" || { echo "FAIL short5.md lacks the n/a note"; fail=1; }
 expect 0 -t 2 -t 5 --size 1000 --reps 1 -o "$dir/mixed.md"
 grep -q '^### Test 2 ' "$dir/mixed.md" || { echo "FAIL mixed.md lacks Test 2"; fail=1; }
 grep -q 'Skipped:' "$dir/mixed.md" || { echo "FAIL mixed.md lacks Test 5's skip reason"; fail=1; }
@@ -54,7 +57,7 @@ grep -q 'Skipped:' "$dir/mixed.md" || { echo "FAIL mixed.md lacks Test 5's skip 
 # used" figure needs, so with the miss counter (CI's fake_perf.so step
 # checks this) the report has both a figure and n/a entries.
 expect 0 -t 4 -t 6 --size 64K --reps 6 -o "$dir/t6.md"
-grep -q '^### Test 6 ' "$dir/t6.md" || { echo "FAIL t6.md lacks Test 6"; fail=1; }
+grep -q '^| d= 4 correlated |' "$dir/t6.md" || { echo "FAIL t6.md lacks Test 6's table"; fail=1; }
 expect 0 -t 6 --size 1000 --reps 1 -o "$dir/skip6.md"
 grep -q 'Skipped:' "$dir/skip6.md" || { echo "FAIL skip6.md lacks the skip reason"; fail=1; }
 expect 0 -t 6 --size 32 --reps 100000 -o "$dir/skip6b.md"

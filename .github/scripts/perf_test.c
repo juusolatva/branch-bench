@@ -270,29 +270,123 @@ static void bounded_list(void)
     puts("ok   bounded summary lists");
 }
 
-/* Distances with too few blocks per pass report n/a: a predictor could
- * learn their short random sequences, so the percentage would mislead. */
-static void short_correlation_samples(void)
+static Result with_misses_cycles(u64 misses, u64 cycles)
 {
-    /* len 64K, budget 6 × 64K: only d = 4 gets 65536 blocks (1 pass). */
-    ReportRow rows[2 * D6_DISTS];
-    for (int i = 0; i < 2 * D6_DISTS; i++) {
-        rows[i].label = "x";
-        rows[i].r = with_misses(i == 1 ? 16384 : 0);   /* d=4: 50% */
-        rows[i].work = NULL;
-    }
+    Result r = with_misses(misses);
+    r.counts[CTR_CYCLES] = cycles;
+    return r;
+}
+
+/* Renders the Test 6 summary for rows and points into buf. */
+static void test6_summary_text(const ReportRow *rows, const D6Point *pts,
+                               char *buf, size_t bufsz)
+{
     FILE *f = tmpfile();
     assert(f);
-    print_correlation_used(f, rows, 65536, 6ULL * 65536);
+    print_test6_summary(f, rows, pts);
     rewind(f);
-    char output[1024] = {0};
-    assert(fread(output, 1, sizeof(output) - 1, f) > 0);
+    memset(buf, 0, bufsz);
+    size_t n = fread(buf, 1, bufsz - 1, f);
+    (void)n;
     assert(fclose(f) == 0);
-    assert(strstr(output, "**Correlation used:** d=4 50%, d=8 n/a, "));
-    assert(strstr(output, "d=1024 n/a\n"));
-    assert(strstr(output, "**Largest d with ≥ 90%:** none\n"));
-    assert(strstr(output, "_n/a: fewer than 65536 blocks per pass"));
-    puts("ok   short Test 6 samples report n/a");
+}
+
+static void set_points(D6Point pts[D6_DISTS], size_t blocks, unsigned passes)
+{
+    for (int i = 0; i < D6_DISTS; i++) {
+        pts[i].blocks = blocks;
+        pts[i].passes = passes;
+        pts[i].work.count = (u64)blocks * passes;
+        pts[i].work.unit = "block";
+    }
+}
+
+/* Test 6's summary: n/a below 64K blocks per pass, multi-pass figures, the
+ * 90% boundary, and no cost per miss from a short d = 4 sample. */
+static void test6_summary(void)
+{
+    ReportRow rows[2 * D6_DISTS];
+    D6Point pts[D6_DISTS];
+    char out[2048];
+    for (int i = 0; i < 2 * D6_DISTS; i++) {
+        rows[i].label = "x";
+        rows[i].r = with_misses_cycles(0, 1000000);
+        rows[i].work = NULL;
+    }
+    /* d = 4 has 65536 blocks over 2 passes (50%); the rest are too short. */
+    set_points(pts, 4096, 1);
+    pts[0].blocks = 65536; pts[0].passes = 2; pts[0].work.count = 131072;
+    rows[0].r = with_misses_cycles(32768, 1000000);
+    rows[1].r = with_misses_cycles(65536, 2000000);
+    test6_summary_text(rows, pts, out, sizeof out);
+    assert(strstr(out, "**Correlation used:** d=4 50%, d=8 n/a, "));
+    assert(strstr(out, "d=1024 n/a\n"));
+    assert(strstr(out, "**Largest d with ≥ 90%:** none\n"));
+    assert(strstr(out, "_n/a: fewer than 65536 blocks per pass"));
+    assert(strstr(out, "**Cost per miss:**"));
+
+    /* Nothing evaluated: n/a, not "none", and no cost from d = 4. */
+    pts[0] = pts[1];
+    test6_summary_text(rows, pts, out, sizeof out);
+    assert(strstr(out, "**Largest d with ≥ 90%:** n/a\n"));
+    assert(!strstr(out, "Cost per miss"));
+
+    /* Every distance evaluated; exactly 90% counts, 89.9% does not. */
+    set_points(pts, 100000, 1);
+    for (int i = 0; i < D6_DISTS; i++) {
+        rows[2 * i].r = with_misses(i == D6_DISTS - 1 ? 5050 : 5000);
+        rows[2 * i + 1].r = with_misses(50000);
+    }
+    test6_summary_text(rows, pts, out, sizeof out);
+    assert(strstr(out, "d=512 90%, d=1024 90%\n"));
+    assert(strstr(out, "**Largest d with ≥ 90%:** 512\n"));
+    assert(!strstr(out, "_n/a:"));
+    puts("ok   Test 6 summary: n/a, passes, 90% boundary, cost gate");
+}
+
+/* Renders the Test 5 summary into buf. */
+static void test5_summary_text(const ReportRow *rows, const Work *w, size_t len,
+                               char *buf, size_t bufsz)
+{
+    FILE *f = tmpfile();
+    assert(f);
+    print_test5_summary(f, rows, w, len);
+    rewind(f);
+    memset(buf, 0, bufsz);
+    size_t n = fread(buf, 1, bufsz - 1, f);
+    (void)n;
+    assert(fclose(f) == 0);
+}
+
+/* Test 5's summary: the low-miss list, "none", missing counts, and n/a
+ * below 64K elements. */
+static void test5_summary(void)
+{
+    ReportRow rows[DB_ORDERS + 1];
+    const Work w = {1000, "elem"};
+    char out[2048];
+    for (int i = 0; i <= DB_ORDERS; i++) {
+        rows[i].label = "x";
+        rows[i].r = with_misses(i < 3 ? 40 : 400);
+        rows[i].r.time_ms = 1;
+        rows[i].work = NULL;
+    }
+    test5_summary_text(rows, &w, 65536, out, sizeof out);
+    assert(strstr(out, "**Random vs period 32:**"));
+    assert(strstr(out, "**Periods at ≤ 0.05 misses/elem:** 32, 64, 128\n"));
+    for (int i = 0; i < 3; i++) {
+        rows[i].r = with_misses(400);
+        rows[i].r.time_ms = 1;
+    }
+    test5_summary_text(rows, &w, 65536, out, sizeof out);
+    assert(strstr(out, "**Periods at ≤ 0.05 misses/elem:** none\n"));
+    rows[2].r.counts_valid = 0;
+    test5_summary_text(rows, &w, 65536, out, sizeof out);
+    assert(!strstr(out, "Periods at"));
+    test5_summary_text(rows, &w, 2048, out, sizeof out);
+    assert(strstr(out, "_n/a: --size below 65536"));
+    assert(!strstr(out, "Random vs") && !strstr(out, "Periods at"));
+    puts("ok   Test 5 summary: list, none, missing counts, n/a");
 }
 
 int main(void)
@@ -325,6 +419,7 @@ int main(void)
     pattern_learnability();
     correlation_distance();
     bounded_list();
-    short_correlation_samples();
+    test6_summary();
+    test5_summary();
     return 0;
 }
