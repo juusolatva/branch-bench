@@ -16,7 +16,7 @@ A simple benchmark for testing out gains from branch prediction or conversely lo
 5. **Pattern Learnability** (opt-in) runs Test 2's kernel on repeating de Bruijn patterns with periods 32 to 2048, and on random 50% ones.
 6. **Correlation Distance** (opt-in) makes a branch repeat the random outcome of a branch d = 4 to 1024 constant-outcome branches earlier, against a reference where it is random.
 
-A run without `-t` runs Tests 1–4. It takes longer than before revision 3 (Test 2 measures 17 rows instead of 2): about RUNTIME_TBD on a laptop i5-8350U at the defaults. Tests 5 and 6 run only when selected with `-t` or `--hard` (all six tests), so default runs stay comparable with [RESULTS.md](RESULTS.md).
+A run without `-t` runs Tests 1–4. It takes longer than before revision 3 (Test 2 measures 17 rows instead of 2): about 30 s instead of 10 s at the defaults on an i5-8350U laptop. Tests 5 and 6 run only when selected with `-t` or `--hard` (all six tests). Results are comparable only within one benchmark revision; RESULTS.md holds revision 1 (see [Seeds and revisions](#seeds-and-revisions)).
 
 ## Notes
 

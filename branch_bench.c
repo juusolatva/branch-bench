@@ -23,14 +23,14 @@
  *   -Wa,-mbranches-within-32B-boundaries,-malign-branch=jcc+fused+jmp+call+ret+indirect
  *
  * Note: -fno-tree-vectorize prevents SIMD rewriting that would bypass branches.
- *       -fno-if-conversion keeps if-else as actual branch instructions (not CMOV),
- *       which is required for tests 1-3, 5, 6 and Test 4's branch variant to
- *       show misprediction cost.
+ *       -fno-if-conversion keeps if-else as actual branch instructions (not CMOV)
+ *       in the C kernels (Tests 3 and 6, and the C fallback of Tests 1, 2, 4
+ *       and 5 on architectures without the asm kernels).
  *       Test 4's branchless variant uses arithmetic masks — unaffected by these flags.
  *       clang rejects -fno-if-conversion and has no equivalent; it builds with
- *       -fno-vectorize -fno-slp-vectorize instead, but (as of clang 18-21)
- *       makes Tests 1, 2, 5, 6 and 4's branch variant branchless (CMOV, SBB),
- *       so clang timings don't show the misprediction cost.
+ *       -fno-vectorize -fno-slp-vectorize instead.  The asm kernels keep their
+ *       branches, but clang (18-22) makes Test 6's C kernel branchless, so its
+ *       clang timings don't show the misprediction cost.
  *
  * Run:
  *   ./branch_bench
