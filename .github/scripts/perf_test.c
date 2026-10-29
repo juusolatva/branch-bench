@@ -184,6 +184,37 @@ static void per_row_work(void)
     puts("ok   per-row work in report tables");
 }
 
+/* Test 5's pattern generator and checker, size rule and seeded fill. */
+static void pattern_learnability(void)
+{
+    u8 p[DB_MAX_PERIOD];
+    for (unsigned k = DB_MIN_ORDER; k <= DB_MAX_ORDER; k++) {
+        assert(debruijn_prefer_one(k, p) == 1);
+        assert(debruijn_valid(p, k) == 1);
+        for (unsigned i = 0; i < k; i++) assert(p[i] == 0);
+    }
+    assert(debruijn_prefer_one(DB_MIN_ORDER - 1, p) == 0);
+    assert(debruijn_prefer_one(DB_MAX_ORDER + 1, p) == 0);
+    /* 16 ones in 32, but only two distinct 5-bit windows. */
+    u8 alt[32];
+    for (unsigned i = 0; i < 32; i++) alt[i] = (u8)(i & 1u);
+    assert(debruijn_valid(alt, 5) == 0);
+
+    assert(test5_size_ok(2048) && test5_size_ok(4194304));
+    assert(!test5_size_ok(1000) && !test5_size_ok(1024) && !test5_size_ok(3072));
+
+    static u8 x[65536], y[65536];
+    const u64 before = rng_state;
+    fill_random_bits(x, sizeof x, 0x1234ULL);
+    assert(rng_state == before);
+    fill_random_bits(y, sizeof y, 0x1234ULL);
+    assert(memcmp(x, y, sizeof x) == 0);
+    size_t ones = 0;
+    for (size_t i = 0; i < sizeof x; i++) ones += x[i];
+    assert(ones > sizeof x * 45 / 100 && ones < sizeof x * 55 / 100);
+    puts("ok   Test 5 patterns and size rule");
+}
+
 int main(void)
 {
     perf_leader = 42;
@@ -211,5 +242,6 @@ int main(void)
     failed_measurements();
     raw_event_reporting();
     per_row_work();
+    pattern_learnability();
     return 0;
 }

@@ -108,7 +108,7 @@ check() {
 }
 
 check "Test 1/4 sum_threshold/sum_branch" 'sum_threshold|sum_branch' loop-branch
-check "Test 2 count_decisions"            'count_decisions'           loop-branch
+check "Test 2/5 count_decisions"          'count_decisions'           loop-branch
 check "Test 3 dispatch_sequential"        'dispatch_sequential'       "$indirect_call"
 check "Test 3 dispatch_random"            'dispatch_random'           "$indirect_call"
 

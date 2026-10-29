@@ -13,6 +13,9 @@ A simple benchmark for testing out gains from branch prediction or conversely lo
 2. **Stride Conditional** counts the ones in a 0/1 array that has them at every 4th position, or at random with the same 25% rate.
 3. **Indirect Dispatch** calls 32 functions through a pointer table, in sequential `i % 32` order or at random.
 4. **Branch vs Branchless** computes Test 1's sum with a conditional jump and with an arithmetic mask, on sorted and random data, and checks that both give the same result.
+5. **Pattern Learnability** (opt-in) runs Test 2's kernel on repeating de Bruijn patterns with periods 32 to 2048, and on random 50% ones.
+
+A run without `-t` runs Tests 1–4. Test 5 runs only when selected with `-t 5`, so default runs stay comparable with [RESULTS.md](RESULTS.md).
 
 ## Notes
 
@@ -82,7 +85,12 @@ run to take about N+1 times as long.
 ```sh
 ./branch_bench -t 3                 # run only Test 3 (repeat -t for more)
 ./branch_bench --size 1M --reps 8   # smaller, quicker run (e.g. small boards)
+./branch_bench -t 5                 # opt-in Test 5 (pattern learnability)
 ```
+
+Test 5 tiles whole periods of its longest pattern, so it needs a
+`--size` that is a multiple of 2048; at any other size it prints a skip
+note and the other selected tests still run.
 
 `--size` sets the elements per array (and the calls per trial for
 Test 3); `K`/`M` suffixes are allowed. `--reps` sets how many passes each
@@ -181,3 +189,13 @@ Ryzen 5 9600X under WSL2).
   on sorted data (319 ms vs 390 ms), but its QEMU model name hides the
   host's real core, so it neither confirms nor refutes this. The
   Raspberry Pi 4's reason has not been investigated.
+- **Test 5** feeds Test 2's branch binary de Bruijn sequences of order
+  k = 5 to 11. Each period of 2^k outcomes contains every k-bit word
+  exactly once, so the last k outcomes always identify the position, and
+  a long period does not need an equally long history. Read the misses
+  per element against the period: they show how well this kernel's branch
+  learns each pattern, compared with the random row's ~0.5. They do not
+  measure a predictor's capacity, history length or table structure. The
+  loop has two conditional branches per element (the data branch and the
+  back-edge), so a global history sees about 2k outcomes per k-bit
+  context, and results also depend on table sizes, hashing and training.

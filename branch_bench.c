@@ -56,14 +56,22 @@
 #endif
 
 /* ── Tuneable parameters ─────────────────────────────────────────────────── */
-#define DEFAULT_SIZE  (1u << 22)   /* 4 194 304 elements (tests 1/2/4) or calls (test 3) */
-#define DEFAULT_REPS  64           /* outer repetitions (tests 1/2/4)        */
+#define DEFAULT_SIZE  (1u << 22)   /* 4 194 304 elements (tests 1/2/4/5) or calls (test 3) */
+#define DEFAULT_REPS  64           /* outer repetitions (tests 1/2/4/5)      */
 #define THRESHOLD     128          /* byte comparison threshold               */
 #define NUM_FUNCS     32           /* distinct indirect call targets (test 3) */
-#define NUM_TESTS     4
+#define NUM_TESTS     5
+#define DEFAULT_TESTS 0xFu         /* tests run without -t: 1–4 (5 is opt-in) */
 #define MAX_TRIALS    99           /* upper limit for -n/--trials             */
 #define MAX_SIZE      (1UL << 30)  /* upper limit for --size                  */
 #define MAX_REPS      100000UL     /* upper limit for --reps                  */
+
+/* Test 5: de Bruijn pattern orders k (periods 2^k) and the random reference */
+#define DB_MIN_ORDER   5
+#define DB_MAX_ORDER   11
+#define DB_MAX_PERIOD  (1u << DB_MAX_ORDER)
+#define DB_ORDERS      (DB_MAX_ORDER - DB_MIN_ORDER + 1)
+#define DB_RANDOM_SEED 0x2545f4914f6cdd1dULL  /* nonzero: xorshift64 sticks at 0 */
 
 /* ── Build provenance (printed in the banner and report) ────────────────── */
 /* Clang's __VERSION__ already names the compiler; GCC's is only the number. */
@@ -83,11 +91,12 @@
 #endif
 
 /* Run-time settings, changed only by command-line options. */
-static size_t   size  = DEFAULT_SIZE;  /* --size: elements per array (tests 1/2/4),
+static size_t   size  = DEFAULT_SIZE;  /* --size: elements per array (tests 1/2/4/5),
                                           calls per trial (test 3) */
 static unsigned reps  = DEFAULT_REPS;  /* --reps: passes over the array per trial */
 static int      trials = 1;            /* -n/--trials: 1 = single measurement, no warm-up */
-static unsigned tests_selected = 0;    /* -t/--test bitmask (bit n-1 = test n); 0 = all */
+static unsigned tests_selected = 0;    /* -t/--test bitmask (bit n-1 = test n);
+                                          0 = DEFAULT_TESTS (1–4) */
 
 /* ── Types ───────────────────────────────────────────────────────────────── */
 typedef uint64_t        u64;
@@ -650,6 +659,14 @@ static void emit_ratio(FILE *report, const char *console_prefix,
         fprintf(report, "**%s:** %.2f×%s\n\n", md_label, ratio, suffix);
 }
 
+/* For a test that cannot run at this --size/--reps: says why, on the
+ * console and in the report, in place of its results. */
+static void emit_skip(FILE *report, const char *title, const char *reason)
+{
+    printf("  Skipped: %s\n\n", reason);
+    if (report) fprintf(report, "### %s\n\n_Skipped: %s_\n\n", title, reason);
+}
+
 /* Standard 2-row emission (predictable vs unpredictable): console rows,
  * Markdown table, slowdown ratio, and cost per miss. */
 static void emit_pair_summary(FILE *report, const char *title, const char *desc,
@@ -1024,6 +1041,184 @@ static void run_test4(FILE *report)
     printf("\n");
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ *
+ *  TEST 5 — Pattern Learnability: de Bruijn patterns vs random  (opt-in)
+ *
+ *  Runs Test 2's count_decisions() kernel on repeating binary de Bruijn
+ *  sequences of orders k = 5..11 (periods 32..2048, half ones), tiled over
+ *  the array, and on random 50% ones.  Every k-bit window of a period is
+ *  distinct, so k previous outcomes identify the position.  The results show
+ *  how well this kernel's data branch learns each period; they do not
+ *  measure a predictor's capacity or history length.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+#define DB_TITLE "Test 5 — Pattern Learnability"
+#define DB_DESC  "Repeating de Bruijn patterns (orders 5–11, 50% ones) vs. random 50% ones; same kernel as Test 2."
+
+static const char *const db_labels[] = {
+    "Period   32 (k=5)",  "Period   64 (k=6)",  "Period  128 (k=7)",
+    "Period  256 (k=8)",  "Period  512 (k=9)",  "Period 1024 (k=10)",
+    "Period 2048 (k=11)", "Random 50%",
+};
+CHECK_LEN(db_labels_len_check, db_labels, DB_ORDERS + 1);
+
+/* Fills buf with random 0/1 bytes from a fixed seed, leaving the shared RNG
+ * stream as it was, so other tests see the same numbers either way. */
+static void fill_random_bits(u8 *buf, size_t n, u64 seed)
+{
+    const u64 saved = rng_state;
+    rng_state = seed;
+    for (size_t i = 0; i < n; i++)
+        buf[i] = (u8)(rng64() >> 63);   /* top bit: xorshift64's low bit is weakest */
+    rng_state = saved;
+}
+
+/* Marks word w in a bitset; returns 1 if it was not marked before. */
+static int mark_new(u8 *set, unsigned w)
+{
+    const u8 bit = (u8)(1u << (w & 7));
+    if (set[w >> 3] & bit) return 0;
+    set[w >> 3] |= bit;
+    return 1;
+}
+
+/* Writes the first 2^k bits of the prefer-one de Bruijn sequence of order k
+ * (Martin, 1934): k zeros, then each next bit 1 if that makes a k-bit word
+ * not seen yet, else 0.  Run on, it would emit k - 1 more (wrap-around)
+ * bits; the first 2^k are a cyclic de Bruijn sequence.  Returns 0 for an
+ * unsupported k, or if neither bit gives a new word. */
+static int debruijn_prefer_one(unsigned k, u8 out[DB_MAX_PERIOD])
+{
+    if (k < DB_MIN_ORDER || k > DB_MAX_ORDER) return 0;
+    const unsigned period = 1u << k;
+    const unsigned mask = period - 1;
+    u8 seen[DB_MAX_PERIOD / 8] = {0};
+    unsigned state = 0;
+    for (unsigned i = 0; i < k; i++) out[i] = 0;
+    mark_new(seen, 0);
+    for (unsigned i = k; i < period; i++) {
+        const unsigned one = ((state << 1) | 1u) & mask;
+        if (mark_new(seen, one))            state = one;
+        else if (mark_new(seen, one & ~1u)) state = one & ~1u;
+        else return 0;
+        out[i] = (u8)(state & 1u);
+    }
+    return 1;
+}
+
+/* 1 if p[0..2^k-1] (bytes 0/1) is a cyclic de Bruijn sequence of order k:
+ * every k-bit word appears exactly once as a cyclic window, and half the
+ * bits are ones.  k must be in DB_MIN_ORDER..DB_MAX_ORDER. */
+static int debruijn_valid(const u8 *p, unsigned k)
+{
+    const unsigned period = 1u << k;
+    const unsigned mask = period - 1;
+    u8 seen[DB_MAX_PERIOD / 8] = {0};
+    unsigned state = 0;
+    unsigned ones = 0;
+    for (unsigned i = 0; i + 1 < k; i++) state = (state << 1) | p[i];
+    for (unsigned i = 0; i < period; i++) {
+        state = ((state << 1) | p[(i + k - 1) & mask]) & mask;
+        ones += p[i];
+        if (!mark_new(seen, state)) return 0;
+    }
+    return ones == period / 2;
+}
+
+/* Whole periods of the longest pattern; with --size >= 1 this also means
+ * at least one period. */
+static int test5_size_ok(size_t len)
+{
+    return len % DB_MAX_PERIOD == 0;
+}
+
+/* Measures count_decisions() on each de Bruijn pattern tiled over buf, then
+ * on random bits.  Returns 0, measuring nothing more, if a pattern fails its
+ * check. */
+static int measure_patterns(u8 *buf, size_t len, ReportRow rows[DB_ORDERS + 1])
+{
+    u8 pattern[DB_MAX_PERIOD];
+    for (unsigned k = DB_MIN_ORDER; k <= DB_MAX_ORDER; k++) {
+        const size_t mask = ((size_t)1 << k) - 1;
+        if (!debruijn_prefer_one(k, pattern) || !debruijn_valid(pattern, k)) {
+            fprintf(stderr, "  ERROR: de Bruijn sequence of order %u is invalid!\n", k);
+            return 0;
+        }
+        for (size_t i = 0; i < len; i++) buf[i] = pattern[i & mask];
+        MEASURE(rows[k - DB_MIN_ORDER].r, count_decisions(buf, len, reps));
+    }
+    fill_random_bits(buf, len, DB_RANDOM_SEED);
+    MEASURE(rows[DB_ORDERS].r, count_decisions(buf, len, reps));
+    return 1;
+}
+
+/* Lists the periods at or under 0.05 misses per element; needs the miss
+ * counter on every row.  A description of these results, not a capacity. */
+static void print_low_miss_periods(FILE *report, const ReportRow *rows, const Work *w)
+{
+    char list[64] = "";
+    size_t used = 0;
+    for (int i = 0; i <= DB_ORDERS; i++)
+        if (!result_has(&rows[i].r, CTR_MISSES)) return;
+    for (int i = 0; i < DB_ORDERS; i++)
+        if (misses_per_item(&rows[i].r, w) <= 0.05)
+            used += (size_t)snprintf(list + used, sizeof list - used, "%s%u",
+                                     used ? ", " : "", 1u << (i + DB_MIN_ORDER));
+    const char *shown = used ? list : "none";
+    printf("  → Periods at ≤ 0.05 misses/elem: %s\n", shown);
+    if (report) fprintf(report, "**Periods at ≤ 0.05 misses/elem:** %s\n\n", shown);
+}
+
+static void run_test5(FILE *report)
+{
+    const size_t len = size;
+    printf("TEST 5 — Pattern Learnability  (de Bruijn k=%d..%d vs random 50%%, %zu×%u reps)\n",
+           DB_MIN_ORDER, DB_MAX_ORDER, len, reps);
+    printf("  %s\n\n", DB_DESC);
+    if (!test5_size_ok(len)) {
+        char reason[96];
+        snprintf(reason, sizeof reason,
+                 "--size %zu is not a multiple of %u (whole de Bruijn periods are required).",
+                 len, DB_MAX_PERIOD);
+        emit_skip(report, DB_TITLE, reason);
+        return;
+    }
+
+    u8 *buf = malloc(len);
+    if (!buf) { perror("malloc"); exit(1); }
+    const Result none = {0};
+    ReportRow rows[DB_ORDERS + 1];
+    for (int i = 0; i <= DB_ORDERS; i++) {
+        rows[i].label = db_labels[i];
+        rows[i].r     = none;
+        rows[i].work  = NULL;
+    }
+    const int ok = measure_patterns(buf, len, rows);
+    free(buf);
+    if (!ok) {
+        sanity_failed = 1;
+        return;
+    }
+    u64 sink = 0;
+    for (int i = 0; i <= DB_ORDERS; i++) sink += rows[i].r.result;
+    anti_dce_sink(sink);
+
+    const Work work = { (u64)len * reps, "elem" };
+    const Result *shortest = &rows[0].r;
+    const Result *longest  = &rows[DB_ORDERS - 1].r;
+    const Result *random   = &rows[DB_ORDERS].r;
+    emit_rows(report, DB_TITLE, DB_DESC, rows, DB_ORDERS + 1, &work);
+    emit_ratio(report, "\n  Random vs period 32:    ", "Random vs period 32",
+               random->time_ms, shortest->time_ms, "");
+    emit_ratio(report, "  Random vs period 2048:  ", "Random vs period 2048",
+               random->time_ms, longest->time_ms, "");
+    print_miss_cost(report, shortest, random);
+    print_low_miss_periods(report, rows, &work);
+    printf("\n");
+}
+
 /* ─────────────────────────────────────────────────────────────────────────
  * main
  * ───────────────────────────────────────────────────────────────────────── */
@@ -1082,11 +1277,12 @@ static void print_usage(const char *prog)
            "                       warm-up run and report the median trial\n"
            "                       (default: 1, a single measurement, no warm-up)\n"
            "  -t, --test <N>       run only test N (1–%d); repeat to run several\n"
-           "                       (default: all tests)\n"
-           "      --size <N>       elements per array (tests 1/2/4) and calls\n"
+           "                       (default: tests 1–4; test 5 runs only when selected)\n"
+           "      --size <N>       elements per array (tests 1/2/4/5) and calls\n"
            "                       per trial (test 3); K/M suffixes allowed\n"
-           "                       (default: %u = 4M, max: %lu = 1024M)\n"
-           "      --reps <N>       passes over the array per trial, tests 1/2/4\n"
+           "                       (default: %u = 4M, max: %lu = 1024M;\n"
+           "                       test 5 needs a multiple of 2048)\n"
+           "      --reps <N>       passes over the array per trial, tests 1/2/4/5\n"
            "                       (default: %u, max: %lu)\n"
            "  -h, --help           show this help\n",
            prog, MAX_TRIALS, NUM_TESTS, DEFAULT_SIZE, MAX_SIZE, DEFAULT_REPS, MAX_REPS);
@@ -1153,7 +1349,7 @@ static int parse_args(int argc, char **argv, const char **out_path)
 
 static int test_selected(int n)
 {
-    return tests_selected == 0 || ((tests_selected >> (n - 1)) & 1u);
+    return ((tests_selected ? tests_selected : DEFAULT_TESTS) >> (n - 1)) & 1u;
 }
 
 /* Comma-separated list of the selected tests, e.g. "1, 3". */
@@ -1285,6 +1481,7 @@ int main(int argc, char **argv)
     if (test_selected(2)) run_test2(report);
     if (test_selected(3)) run_test3(report);
     if (test_selected(4)) run_test4(report);
+    if (test_selected(5)) run_test5(report);
 
     print_clock_summary(report);
 
