@@ -73,7 +73,9 @@ instantaneous clock.
 
 `--json <file>` writes every measured trial and every summary as JSON
 Lines (one JSON object per line, schema 1), next to the console output
-and any `-o` report (which must be a different file):
+and any `-o` report. The two must be different files; naming the same
+file (also via a hard link or `./`) is an error, and neither file is
+emptied until both have opened:
 
 ```sh
 ./branch_bench -n 5 -o report.md --json run.jsonl
@@ -85,13 +87,16 @@ and any `-o` report (which must be a different file):
 | `kernel` | kernel | declared `data_branches`, `indirect_calls`, `inner_loop_branches`, unit, tests |
 | `variant` | report row | `test`, `variant` (row index), `label`, `kernel`, `work` and `unit` per trial |
 | `trial` | measured trial | `test`, `variant`, `pair`, run-wide `seq`, `trial`, `train_runs`, `time_ms`, `result` (the kernel's checksum), `perf_status`, `enabled_ns`/`running_ns`, `counts` (scaled) and `raw_counts` |
-| `pair` | compared pair | `a`/`b` variants, `pairs`, `valid`, summed times, `slowdown`, signed `delta` per counter, `effective_cost` and `cost_status` (`resolved`, `inconclusive`, `unavailable`) |
+| `pair` | compared pair | `a`/`b` variants, `pairs`, `valid`, summed times, `slowdown`, signed `delta` per counter, `effective_cost` and `cost_status` (`resolved`, `inconclusive`, `unavailable`), and `cost_shown` (the cost line was printed) |
 
 Counters print as exact integers; a value that does not exist (a counter
 that is not open, a trial whose read failed, a ratio without data) is
 `null`, never 0. `.github/scripts/check_export.py run.jsonl --report
 report.md` rebuilds every pair summary from the trials and checks the
-report's medians, ranges, ratios and costs against them.
+report's medians, ranges, counter columns, ratios and cost lines against
+them. Seeds and counts are 64-bit integers, which exceed the 2⁵³ that
+JavaScript numbers (and `jq`) hold exactly; read them with a parser that
+keeps integers, such as Python's `json`.
 
 ## Repeated measurements
 
@@ -147,7 +152,7 @@ Run `./branch_bench --help` for all options.
 Every test builds its input from its own seed, derived from a base seed,
 the test number and the input stream. Selecting or reordering tests
 therefore never changes another test's input, and the same command gives
-the same data on every run. `--seed <N>` (decimal or `0x` hex) changes the
+the same data on every run. `--seed <N>` (decimal, or hex after `0x`; `010` is ten) changes the
 base seed; the banner and report show it when it is given.
 
 The banner and report also show the **benchmark revision**. It goes up

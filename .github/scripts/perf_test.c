@@ -306,13 +306,13 @@ static Result with_misses_cycles(u64 misses, u64 cycles)
     return r;
 }
 
-/* Renders the Test 6 summary for rows and points into buf. */
-static void test6_summary_text(const ReportRow *rows, const D6Point *pts,
+/* Renders the Test 6 summary for the logged pairs of pts into buf. */
+static void test6_summary_text(const D6Point *pts,
                                char *buf, size_t bufsz)
 {
     FILE *f = tmpfile();
     assert(f);
-    print_test6_summary(f, rows, pts);
+    print_test6_summary(f, pts);
     rewind(f);
     memset(buf, 0, bufsz);
     size_t n = fread(buf, 1, bufsz - 1, f);
@@ -339,7 +339,8 @@ static void set_points(D6Point pts[D6_DISTS], size_t blocks, unsigned passes)
 }
 
 /* Test 6's summary: n/a below 64K blocks per pass, multi-pass figures, the
- * 90% boundary, and no cost per miss from a short d = 4 sample. */
+ * 90% boundary, no effective cost from a short d = 4 sample, and a failed
+ * median row that must not hide its pair's valid trials. */
 static void test6_summary(void)
 {
     ReportRow rows[2 * D6_DISTS];
@@ -356,7 +357,7 @@ static void test6_summary(void)
     rows[0].r = with_misses_cycles(32768, 1000000);
     rows[1].r = with_misses_cycles(65536, 2000000);
     log_d6(rows, pts);
-    test6_summary_text(rows, pts, out, sizeof out);
+    test6_summary_text(pts, out, sizeof out);
     assert(strstr(out, "**Correlation used:** d=4 50%, d=8 n/a, "));
     assert(strstr(out, "d=1024 n/a\n"));
     assert(strstr(out, "**Largest d with ≥ 90%:** none\n"));
@@ -365,7 +366,7 @@ static void test6_summary(void)
 
     /* Nothing evaluated: n/a, not "none", and no cost from d = 4. */
     pts[0] = pts[1];
-    test6_summary_text(rows, pts, out, sizeof out);
+    test6_summary_text(pts, out, sizeof out);
     assert(strstr(out, "**Largest d with ≥ 90%:** n/a\n"));
     assert(!strstr(out, "Effective extra cycles"));
 
@@ -376,10 +377,23 @@ static void test6_summary(void)
         rows[2 * i + 1].r = with_misses(50000);
     }
     log_d6(rows, pts);
-    test6_summary_text(rows, pts, out, sizeof out);
+    test6_summary_text(pts, out, sizeof out);
     assert(strstr(out, "d=512 90%, d=1024 90%\n"));
     assert(strstr(out, "**Largest d with ≥ 90%:** 512\n"));
     assert(!strstr(out, "_n/a:"));
+
+    /* A median row whose own read failed must not hide its pair's valid
+     * trials, nor every other distance. */
+    rows[2].r.perf_status = PERF_READ_FAILED;
+    test6_summary_text(pts, out, sizeof out);
+    assert(strstr(out, "**Correlation used:** d=4 90%, d=8 90%"));
+    assert(!strstr(out, "_n/a:"));
+
+    /* No pair with valid miss counts: no summary at all. */
+    for (int i = 0; i < 2 * D6_DISTS; i++) rows[i].r.perf_status = PERF_READ_FAILED;
+    log_d6(rows, pts);
+    test6_summary_text(pts, out, sizeof out);
+    assert(out[0] == '\0');
     puts("ok   Test 6 summary: n/a, passes, 90% boundary, cost gate");
 }
 
@@ -658,7 +672,7 @@ static void paired_cost(void)
     pair_text(p, 0, out, sizeof out);
     assert(strcmp(out, "**Effective extra cycles per additional miss:** inconclusive "
                        "(Δcycles +850, Δmisses +30 over 3 valid pair(s))\n\n") == 0);
-    assert(!pair_info[p].cost_shown);
+    assert(pair_info[p].cost_shown);   /* the line was printed */
 
     p = log_cost_pair(cycles_b, 1000, -1, 1);
     pair_text(p, 1, out, sizeof out);
@@ -686,9 +700,11 @@ static void json_escaping(void)
     (void)n;
     assert(fclose(f) == 0);
     assert(strcmp(out, "\"a\\\"b\\\\c\\n\\u0001é\"") == 0);
-    assert(same_file("x", "x") == 1);
-    assert(same_file("/", "/.") == 1);
-    assert(same_file("/no/such/a", "/no/such/b") == 0);
+    FILE *a = tmpfile(), *b = tmpfile();
+    assert(a && b);
+    assert(same_open_file(a, a) == 1);
+    assert(same_open_file(a, b) == 0);
+    assert(fclose(a) == 0 && fclose(b) == 0);
     assert(strcmp(perf_status_name(PERF_NOT_SCHEDULED), "not_scheduled") == 0);
     assert(strcmp(perf_status_name(PERF_NONE), "none") == 0);
     assert(strcmp(semantics_name(SEM_SPECULATIVE), "speculative") == 0);
@@ -723,6 +739,10 @@ static void seeds(void)
     u64 v;
     assert(parse_seed("0", &v) && v == 0);
     assert(parse_seed("0x10", &v) && v == 16);
+    assert(parse_seed("0X1f", &v) && v == 31);
+    assert(parse_seed("010", &v) && v == 10);                    /* decimal, not octal */
+    assert(parse_seed("08", &v) && v == 8);
+    assert(!parse_seed("0x", &v) && !parse_seed("0xg", &v));
     assert(parse_seed("18446744073709551615", &v) && v == UINT64_MAX);
     assert(!parse_seed("18446744073709551616", &v));
     assert(!parse_seed("-1", &v) && !parse_seed("", &v) && !parse_seed("5x", &v));

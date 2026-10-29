@@ -12,6 +12,8 @@
 #   Test 3 leaves: leaf_0 ... leaf_31 at 32 distinct addresses.
 #   Test 6 correlate_distance: at least three conditional branches inside
 #       its loops (A, filler and B; mode loop-branch3).
+#   Every kernel except sum_branchless: no branchless instruction; every
+#       kernel: no SIMD.
 #   Every kernel: exactly one function body (no clone or duplicate; GCC
 #       folds sum_branch and sum_threshold into one, so they count as one).
 #
@@ -22,7 +24,9 @@
 #            with a memory operand, or one reading a register last written
 #            inside the loop by a load (mov* with a memory source);
 #   aarch64: a cbz/cbnz/tbz/tbnz on such a register (written by ldr*), or a
-#            b.cond whose nearest preceding cmp/cmn/tst/ands/subs reads one.
+#            b.cond whose nearest preceding flag setter (cmp, cmn, tst, ands,
+#            subs, adds, bics, ccmp, ccmn) reads one; adcs/sbcs/negs/ngcs
+#            in between make the branch not count.
 # Registers count by family (%al/%eax/%rax, w3/x3).  The loop back-edge,
 # early exits and loop guards on counters do not count.  A pass is still
 # necessary, not sufficient: a load-fed compare need not be the benchmark's
@@ -30,7 +34,8 @@
 #
 # Usage: check_kernels.sh <binary>           checks; exit 1 on any FAIL
 #        check_kernels.sh --counts <binary>  prints "id data_branches
-#            indirect_calls inner_loop_branches" per kernel, for comparison
+#            indirect_calls inner_loop_branches" for every kernel in
+#            branch_bench.c's kernel_descs[], for comparison
 #            with the JSON export's kernel records (check_export.py
 #            --kernel-counts); exit 2 if a kernel is missing
 # ARCH and OBJDUMP override the host architecture and objdump, e.g. for a
@@ -249,7 +254,7 @@ leaves() {
 
 if [ "$counts" -eq 1 ]; then
     missing=0
-    for k in sum_threshold sum_branch sum_branchless count_decisions dispatch_sequential dispatch_random; do
+    for k in sum_threshold sum_branch sum_branchless count_decisions dispatch_sequential dispatch_random correlate_distance; do
         re=$k
         case $k in sum_threshold|sum_branch) re='sum_threshold|sum_branch' ;; esac
         # Its own body, else the folded one listed under the other name.

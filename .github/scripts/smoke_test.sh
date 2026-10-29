@@ -39,15 +39,24 @@ expect 0 --trials 2 --test 2 --test 4 --output "$dir/report2.md" --size 4k --rep
 expect 0 -t 1 -t 3 --size 1m --reps 1
 expect 0 -t 3 --size 1000 --reps 1
 # --cpu pins the run; a CPU that cannot be used is reported, not fatal.
-expect 0 -t 3 --cpu 0 --size 4K --reps 1 -o "$dir/cpu0.md"
-grep -q '^_Pinned to CPU 0._$' "$dir/cpu0.md" || { echo "FAIL cpu0.md lacks the pinned line"; fail=1; }
-expect 0 -t 3 --cpu 1023 --size 4K --reps 1 -o "$dir/cpu1023.md"
-grep -q '^_CPU affinity request for CPU 1023 failed: ' "$dir/cpu1023.md" ||
-    { echo "FAIL cpu1023.md lacks the failed-pin line"; fail=1; }
-grep -q 'running unpinned' "$dir/stderr" || { echo "FAIL failed pin lacks its warning"; fail=1; }
+# The CPUs come from this process's own affinity mask, so the cases hold in
+# a cpuset-limited container and on hosts with up to 1024 CPUs.
+allowed=$(python3 -c 'import os; print(min(os.sched_getaffinity(0)))')
+expect 0 -t 3 --cpu "$allowed" --size 4K --reps 1 -o "$dir/cpu_ok.md"
+grep -q "^_Pinned to CPU $allowed._\$" "$dir/cpu_ok.md" || { echo "FAIL cpu_ok.md lacks the pinned line"; fail=1; }
+denied=$(python3 -c 'import os; s = os.sched_getaffinity(0); print(next((c for c in range(1024) if c not in s), ""))')
+if [ -n "$denied" ]; then
+    expect 0 -t 3 --cpu "$denied" --size 4K --reps 1 -o "$dir/cpu_bad.md"
+    grep -q "^_CPU affinity request for CPU $denied failed: " "$dir/cpu_bad.md" ||
+        { echo "FAIL cpu_bad.md lacks the failed-pin line"; fail=1; }
+    grep -q 'running unpinned' "$dir/stderr" || { echo "FAIL failed pin lacks its warning"; fail=1; }
+else
+    echo "skip failed-pin case: all of CPUs 0-1023 are allowed"
+fi
 # --seed takes a decimal or 0x hex base seed for every test's input.
 expect 0 -t 3 --seed 7 --size 4K --reps 1
 expect 0 -t 3 --seed 0x1f --size 4K --reps 1
+expect 0 -t 3 --seed 010 --size 4K --reps 1
 expect 0 -t 1 --size 4K --reps 1 -o "$dir/rev.md"
 grep -q '^_Benchmark revision 2._$' "$dir/rev.md" || { echo "FAIL rev.md lacks the revision line"; fail=1; }
 # Test 5 is opt-in; it skips (exit 0) when --size is not a multiple of 2048,
@@ -80,8 +89,10 @@ grep -q 'Skipped:' "$dir/skip6b.md" || { echo "FAIL skip6b.md lacks the skip rea
 expect 0 --hard $small -o "$dir/hard.md"
 grep -q '(all, with --hard)' "$dir/stdout" || { echo "FAIL --hard banner lacks its tests line"; fail=1; }
 expect 0 --hard -t 2 --size 4K --reps 1 -o "$dir/hard2.md"
-# The largest legal run fits the trial log (37 variants × 99 trials).
-expect 0 --hard -n 99 --size 4K --reps 1
+# The largest legal run fits the trial log: 37 (variant, pair) streams
+# (Test 5's random row is in two pairs) × 99 trials = 3663 records.  Large
+# enough that Test 6, the biggest user, runs.
+expect 0 --hard -n 99 --size 64K --reps 2 --json "$dir/max.jsonl"
 for f in hard.md hard2.md; do
     for t in 1 2 3 4 5 6; do
         grep -q "^### Test $t " "$dir/$f" || { echo "FAIL $f lacks Test $t"; fail=1; }
@@ -129,10 +140,52 @@ expect 0 -t 1 -t 3 --size 4K --reps 1 --json "$dir/b.jsonl"
 export_ok "$dir/a.jsonl" --same-results "$dir/b.jsonl" --test 3
 expect 0 -t 3 --seed 7 --size 4K --reps 1 --json "$dir/c.jsonl"
 export_ok "$dir/a.jsonl" --different-results "$dir/c.jsonl" --test 3
+# The same for every other test: its input must not depend on Test 1 having
+# run before it, and must change with --seed.
+for t in 1 2 4 5 6; do
+    expect 0 -t "$t" --size 64K --reps 2 --json "$dir/t$t-a.jsonl"
+    expect 0 -t 1 -t "$t" --size 64K --reps 2 --json "$dir/t$t-b.jsonl"
+    expect 0 -t "$t" --seed 7 --size 64K --reps 2 --json "$dir/t$t-c.jsonl"
+    export_ok "$dir/t$t-a.jsonl" --same-results "$dir/t$t-b.jsonl" --test "$t"
+    export_ok "$dir/t$t-a.jsonl" --different-results "$dir/t$t-c.jsonl" --test "$t"
+done
+export_ok "$dir/max.jsonl"
+# The checker must notice a report whose numbers differ from the export:
+# change the first counter cell that holds a number (none without counters).
+python3 - "$dir/report3.md" "$dir/bad.md" <<'PY'
+import re, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+header = None
+out = []
+done = False
+for line in text.splitlines(keepends=True):
+    if line.startswith("| Variant |"):
+        header = [c.strip() for c in line.strip().strip("|").split("|")]
+    elif not done and header and line.startswith("| ") and not line.startswith("|---"):
+        cells = line.rstrip("\n").split("|")
+        col = header.index("Cycles") + 1
+        if re.fullmatch(r" [0-9]+ ", cells[col]):
+            cells[col] = " 999 "
+            line = "|".join(cells) + "\n"
+            done = True
+    out.append(line)
+open(sys.argv[2], "w", encoding="utf-8").write("".join(out))
+PY
+if cmp -s "$dir/report3.md" "$dir/bad.md"; then
+    echo "skip corrupted-report case: no counter columns without perf counters"
+elif python3 "$check_export" "$dir/run.jsonl" --report "$dir/bad.md" > "$dir/check.out" 2>&1; then
+    echo "FAIL check_export.py accepted a corrupted counter column"; fail=1
+else
+    echo "ok   check_export.py rejects a corrupted counter column"
+fi
 # -o and --json must be different files, also through a hard link.
 expect 1 -t 3 --size 1K --reps 1 -o "$dir/same.out" --json "$dir/same.out"
 : > "$dir/x.md"; ln -f "$dir/x.md" "$dir/y.json"
 expect 1 -t 3 --size 1K --reps 1 -o "$dir/x.md" --json "$dir/y.json"
+# A --json path that cannot be opened must not empty an existing report.
+echo "keep me" > "$dir/keep.md"
+expect 1 -t 3 --size 1K --reps 1 -o "$dir/keep.md" --json "$dir/no/such/dir/x.jsonl"
+grep -q '^keep me$' "$dir/keep.md" || { echo "FAIL failed --json open truncated the report"; fail=1; }
 # ... and through two spellings of a file that does not exist yet.
 rm -f "$dir/fresh.md"
 expect 1 -t 3 --size 1K --reps 1 -o "$dir/fresh.md" --json "$dir/./fresh.md"

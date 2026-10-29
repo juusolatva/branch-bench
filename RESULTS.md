@@ -1,6 +1,6 @@
 # NEW RESULTS
 
-_Entries below are benchmark revision 1 (no training runs, unpaired cost per miss)._
+_All entries in this file are benchmark revision 1: one warm-up run per variant (with `-n` > 1) instead of a training run before every trial, unpaired variants, and a cost per miss taken from the median trials._
 
 ## Intel(R) Core(TM) i7-4770 CPU @ 3.90 GHz
 

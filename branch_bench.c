@@ -48,6 +48,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <math.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
 
@@ -115,7 +116,8 @@ static size_t   size  = DEFAULT_SIZE;  /* --size: elements per array (tests 1/2/
                                           calls per trial (test 3) */
 static unsigned reps  = DEFAULT_REPS;  /* --reps: passes over the array per trial;
                                           test 6: scales its branch budget */
-static int      trials = 1;            /* -n/--trials: 1 = single measurement, no warm-up */
+static int      trials = 1;            /* -n/--trials: measured trials per variant, each
+                                          after TRAIN_RUNS untimed runs */
 static unsigned tests_selected = 0;    /* -t/--test bitmask (bit n-1 = test n);
                                           0 = DEFAULT_TESTS (1–4) */
 static int      hard_selected = 0;     /* --hard: all tests, including 5 and 6 */
@@ -474,10 +476,9 @@ static Result median_trial(Result *t, int n)
     return m;
 }
 
-/* Cycles and time summed over every measured trial (warm-ups excluded), for
- * the average clock the results were actually produced at.  Cycles are
- * user-mode only, so time spent in the kernel or preempted slightly lowers
- * the figure; on an otherwise idle system that is well under 1%. */
+/* User-mode cycles and wall time summed over every measured trial (training
+ * runs excluded).  Their ratio is an effective rate, not the core clock:
+ * time spent in the kernel or preempted lowers it. */
 static double clock_cycles_sum = 0;
 static double clock_ms_sum     = 0;
 
@@ -488,7 +489,7 @@ static void account_clock(const Result *r)
     clock_ms_sum     += r->time_ms;
 }
 
-/* Average clock in GHz over all measured trials, or 0 if unknown. */
+/* Effective user-cycle rate in GHz over all measured trials, or 0 if unknown. */
 static double measured_ghz(void)
 {
     return clock_ms_sum > 0 ? clock_cycles_sum / (clock_ms_sum * 1e6) : 0;
@@ -540,9 +541,11 @@ static int         trial_log_len = 0;
 
 /* Two variants of one test measured in alternating order. */
 typedef struct {
-    int         test, a, b;
+    int         test;
+    int         a;
+    int         b;
     const char *ratio_label;   /* Markdown label of its printed ratio, if any */
-    int         cost_shown;    /* its effective cost was printed */
+    int         cost_shown;    /* its effective-cost line (value or inconclusive) was printed */
 } PairInfo;
 
 static PairInfo pair_info[MAX_PAIRS];
@@ -591,7 +594,8 @@ static int new_pair(int a, int b)
 #define MAX_VARIANTS 64
 
 typedef struct {
-    int         test, variant;
+    int         test;
+    int         variant;
     const char *label;
     Work        work;
 } VariantInfo;
@@ -618,9 +622,11 @@ static Result representative(int test, int variant)
 {
     Result t[2 * MAX_TRIALS];
     int n = 0;
-    for (int i = 0; i < trial_log_len && n < 2 * MAX_TRIALS; i++)
-        if (trial_log[i].test == test && trial_log[i].variant == variant)
-            t[n++] = trial_log[i].r;
+    for (int i = 0; i < trial_log_len; i++) {
+        if (trial_log[i].test != test || trial_log[i].variant != variant) continue;
+        if (n == 2 * MAX_TRIALS) log_full("representative buffer");
+        t[n++] = trial_log[i].r;
+    }
     if (!n) {
         const Result none = {0};
         return none;
@@ -668,7 +674,8 @@ static int pair_a_first(int k)
     } while (0)
 
 /* Measures two variants `trials` times each in AB/BA order as one pair,
- * reports each one's median trial and stores the pair id in pair_out. */
+ * reports each one's median trial (over every pair the variant is in) and
+ * stores the pair id in pair_out. */
 #define MEASURE_PAIR(ra, va, call_a, rb, vb, call_b, pair_out)  \
     do {                                                        \
         const int n_trials_ = trial_count();                    \
@@ -687,13 +694,15 @@ static int pair_a_first(int k)
         (pair_out) = p_;                                        \
     } while (0)
 
-/* Sums over one pair's trials.  Times cover every pair; counter deltas
- * (b − a, signed) cover only valid pairs, where both trials read their
- * counters, and only counters open on both. */
+/* Sums over one variant pair's trials, matched by trial index k.  Times
+ * cover every trial pair; counter deltas (b − a, signed) cover only valid
+ * trial pairs, where both trials read their counters, and only counters
+ * open on both. */
 typedef struct {
     int      pairs;
     int      valid;
-    double   ms_a, ms_b;
+    double   ms_a;
+    double   ms_b;
     double   delta[CTR_COUNT];
     unsigned open_mask;
 } PairStats;
@@ -732,7 +741,8 @@ static PairStats pair_stats(int pair)
 
 /* Effective extra cycles per additional miss over a pair's valid trials:
  * Σ Δcycles ÷ Σ Δmisses, signed.  Returns 1 with *cost set, 0 when the miss
- * difference is too small to resolve, -1 when cycles or misses are missing. */
+ * difference is too small to resolve, -1 when there is no valid trial pair
+ * or cycles or misses were not open on both trials. */
 static int pair_cost(const PairStats *s, double *cost)
 {
     const unsigned need = (1u << CTR_CYCLES) | (1u << CTR_MISSES);
@@ -1045,8 +1055,8 @@ static void print_pair_cost(FILE *report, int pair)
         int n = snprintf(text, sizeof text, "%.1f cycles", cost);
         if (s.valid < s.pairs && n > 0)
             snprintf(text + n, sizeof text - (size_t)n, " (%d of %d pairs)", s.valid, s.pairs);
-        pair_info[pair].cost_shown = 1;
     }
+    pair_info[pair].cost_shown = 1;
     printf("  → Effective extra cycles per additional miss: %s\n", text);
     if (report)
         fprintf(report, "**Effective extra cycles per additional miss:** %s\n\n", text);
@@ -1103,7 +1113,7 @@ static void list_append(char *buf, size_t bufsz, size_t *len, const char *item)
 }
 
 /* Standard 2-row emission (predictable vs unpredictable): console rows,
- * Markdown table, slowdown ratio, and cost per miss. */
+ * Markdown table, slowdown ratio, and effective cost per additional miss. */
 static void emit_pair_summary(FILE *report, const char *title, const char *desc,
                               const ReportRow rows[2], const Work *w, int pair)
 {
@@ -1447,7 +1457,8 @@ static void run_test4(FILE *report)
     Result r_sl = {0};
     Result r_rb = {0};
     Result r_rl = {0};
-    int pair_branch, pair_branchless;
+    int pair_branch;
+    int pair_branchless;
     MEASURE_PAIR(r_sb, 0, sum_branch(sorted, len, reps),
                  r_rb, 2, sum_branch(random_d, len, reps), pair_branch);
     MEASURE_PAIR(r_sl, 1, sum_branchless(sorted, len, reps),
@@ -1807,11 +1818,16 @@ static void print_correlation_used(FILE *report, const D6Point *pts)
     size_t used = 0;
     unsigned best = 0;
     int evaluated = 0;
+    int counted = 0;   /* distances whose pair has valid miss counts */
+    int short_na = 0;  /* distances n/a because their sample is too short */
     for (int i = 0; i < D6_DISTS; i++) {
         const unsigned d = (unsigned)D6_MIN_DIST << i;
         char entry[32];
         const PairStats s = pair_stats(pts[i].pair);
-        if (pts[i].blocks < D6_MIN_SAMPLE || !s.valid || !((s.open_mask >> CTR_MISSES) & 1u)) {
+        const int has_misses = s.valid && ((s.open_mask >> CTR_MISSES) & 1u);
+        counted += has_misses;
+        if (!has_misses || pts[i].blocks < D6_MIN_SAMPLE) {
+            short_na += has_misses;
             snprintf(entry, sizeof entry, "d=%u n/a", d);
         } else {
             const double pct = correlation_used_pct(&s, pts[i].work.count);
@@ -1821,6 +1837,7 @@ static void print_correlation_used(FILE *report, const D6Point *pts)
         }
         list_append(list, sizeof list, &used, entry);
     }
+    if (!counted) return;   /* no miss counts at all: no summary */
     char best_d[16];
     snprintf(best_d, sizeof best_d, "%u", best);
     const char *shown = "n/a";
@@ -1829,7 +1846,7 @@ static void print_correlation_used(FILE *report, const D6Point *pts)
     if (report)
         fprintf(report, "**Correlation used:** %s\n\n**Largest d with ≥ 90%%:** %s\n\n",
                 list, shown);
-    if (evaluated < D6_DISTS) {
+    if (short_na) {
         printf("  → n/a: fewer than %d blocks per pass, so a predictor may learn the sequences\n",
                D6_MIN_SAMPLE);
         if (report)
@@ -1838,13 +1855,13 @@ static void print_correlation_used(FILE *report, const D6Point *pts)
     }
 }
 
-/* Test 6's summary lines: cost per miss from the d = 4 pair (same work,
- * only B's predictability differs) when its sample is long enough, and the
- * correlation used per distance; both need the miss counter on every row. */
-static void print_test6_summary(FILE *report, const ReportRow *rows, const D6Point *pts)
+/* Test 6's summary lines: the effective cost per additional miss from the
+ * d = 4 pair (same work, only B's predictability differs) when its sample
+ * is long enough, and the correlation used per distance.  Each pair decides
+ * from its own trials whether it has usable counts, so one failed median
+ * row cannot hide the other distances. */
+static void print_test6_summary(FILE *report, const D6Point *pts)
 {
-    for (int i = 0; i < 2 * D6_DISTS; i++)
-        if (!result_has(&rows[i].r, CTR_MISSES)) return;
     if (pts[0].blocks >= D6_MIN_SAMPLE)
         print_pair_cost(report, pts[0].pair);
     print_correlation_used(report, pts);
@@ -1889,7 +1906,7 @@ static void run_test6(FILE *report)
     anti_dce_sink(sink);
 
     emit_rows(report, D6_TITLE, D6_DESC, rows, 2 * D6_DISTS, &pts[0].work);
-    print_test6_summary(report, rows, pts);
+    print_test6_summary(report, pts);
     printf("\n");
 }
 
@@ -1934,7 +1951,7 @@ static const KernelDesc kernel_descs[] = {
     { KERNEL(count_decisions),     "elem",  1, 0,  2, "2,5" },
     { KERNEL(dispatch_sequential), "call",  0, 1,  2, "3"   },
     { KERNEL(dispatch_random),     "call",  0, 1,  2, "3"   },
-    { KERNEL(correlate_distance),  "block", 3, 0, -1, "6"   },
+    { KERNEL(correlate_distance),  "block", 3, 0,  2, "6"   },
 };
 #undef KERNEL
 
@@ -1962,7 +1979,7 @@ static void json_string_or_null(FILE *f, const char *s)
 /* A double, or null where JSON has no number (inf, nan) or none applies. */
 static void json_double(FILE *f, int has, double v)
 {
-    if (has && v == v && v - v == 0) fprintf(f, "%.17g", v);
+    if (has && isfinite(v)) fprintf(f, "%.17g", v);
     else fputs("null", f);
 }
 
@@ -1972,33 +1989,28 @@ static void json_int(FILE *f, int has, long long v)
     else fputs("null", f);
 }
 
-/* Same file: equal paths, or both exist and share device and inode (e.g.
- * hard links or "a" vs "./a"). */
-static int same_file(const char *a, const char *b)
-{
-    struct stat sa, sb;
-    if (strcmp(a, b) == 0) return 1;
-    return stat(a, &sa) == 0 && stat(b, &sb) == 0 &&
-           sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
-}
-
+/* 1 if two open files are the same file (equal paths, hard links, "a" vs
+ * "./a"), 0 if not, -1 if either cannot be examined. */
 static int same_open_file(FILE *a, FILE *b)
 {
-    struct stat sa, sb;
-    return fstat(fileno(a), &sa) == 0 && fstat(fileno(b), &sb) == 0 &&
-           sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+    struct stat sa;
+    struct stat sb;
+    if (fstat(fileno(a), &sa) != 0 || fstat(fileno(b), &sb) != 0) return -1;
+    return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
 }
 
-/* First line of a text file, without its newline; 0 if unreadable. */
+/* First line of a text file, without its newline; 0 if unreadable or empty. */
 static int sysfs_line(const char *path, char *buf, size_t n)
 {
+    char line[256];
     FILE *f = fopen(path, "r");
     if (!f) return 0;
-    const int ok = fgets(buf, (int)n, f) != NULL;
+    const int ok = fgets(line, sizeof line, f) != NULL;
     fclose(f);
     if (!ok) return 0;
-    buf[strcspn(buf, "\r\n")] = '\0';
-    return buf[0] != '\0';
+    const int len = (int)strcspn(line, "\r\n");
+    snprintf(buf, n, "%.*s", len, line);
+    return len > 0;
 }
 
 /* Value of the first /proc/cpuinfo line whose key is exactly `key`. */
@@ -2008,17 +2020,20 @@ static int cpuinfo_value(const char *key, char *buf, size_t n)
 #ifdef __linux__
     FILE *f = fopen("/proc/cpuinfo", "r");
     if (!f) return 0;
-    char line[1024];
+    char line[4096];   /* x86 flags lines pass 1 KB on recent CPUs */
     const size_t klen = strlen(key);
-    while (!found && fgets(line, sizeof line, f)) {
+    while (fgets(line, sizeof line, f)) {
         const char *colon = strchr(line, ':');
         if (!colon || strncmp(line, key, klen) != 0 ||
             strspn(line + klen, " \t") != (size_t)(colon - line) - klen)
             continue;
         const char *v = colon + 1 + strspn(colon + 1, " \t");
-        snprintf(buf, n, "%s", v);
-        buf[strcspn(buf, "\r\n")] = '\0';
-        found = buf[0] != '\0';
+        const int len = (int)strcspn(v, "\r\n");
+        if (len > 0) {
+            snprintf(buf, n, "%.*s", len, v);
+            found = 1;
+            break;
+        }
     }
     fclose(f);
 #else
@@ -2030,12 +2045,16 @@ static int cpuinfo_value(const char *key, char *buf, size_t n)
 /* 1 or 0 if /proc/cpuinfo's flags list has `flag`, -1 without a flags line. */
 static int cpuinfo_has_flag(const char *flag)
 {
-    char flags[1024];
+    char flags[4096];
     if (!cpuinfo_value("flags", flags, sizeof flags)) return -1;
     const size_t len = strlen(flag);
-    for (const char *p = flags; (p = strstr(p, flag)) != NULL; p += len)
-        if ((p == flags || p[-1] == ' ') && (p[len] == ' ' || p[len] == '\0'))
-            return 1;
+    const char *p = flags + strspn(flags, " ");
+    while (*p) {
+        const size_t word = strcspn(p, " ");
+        if (word == len && strncmp(p, flag, len) == 0) return 1;
+        p += word;
+        p += strspn(p, " ");
+    }
     return 0;
 }
 
@@ -2048,8 +2067,9 @@ static void write_counters_meta(FILE *f)
         const CounterDesc *d = &counter_descs[c];
         fprintf(f, "%s{\"name\":", c ? "," : "");
         json_string(f, d->console_label);
+        const char *type = raw ? "raw" : "hardware";
         fprintf(f, ",\"open\":%s,\"type\":", open ? "true" : "false");
-        json_string_or_null(f, open ? (raw ? "raw" : "hardware") : NULL);
+        json_string_or_null(f, open ? type : NULL);
         fputs(",\"config\":", f);
         json_int(f, open, (long long)(raw ? d->arm_raw : d->generic));
         fputs(",\"semantics\":", f);
@@ -2088,21 +2108,30 @@ static void write_affinity_meta(FILE *f)
     fputs("}", f);
 }
 
-/* Governor, SMT siblings and hypervisor flag, for the pinned CPU (else 0). */
+/* ,"key":"<first line of /sys/devices/system/cpu/cpu<cpu>/<leaf>>" or null. */
+static void json_cpu_sysfs(FILE *f, const char *key, int cpu, const char *leaf)
+{
+    char path[128];
+    char buf[256];
+    snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/%s", cpu, leaf);
+    fprintf(f, ",\"%s\":", key);
+    json_string_or_null(f, sysfs_line(path, buf, sizeof buf) ? buf : NULL);
+}
+
+/* SMT siblings and governor of metadata_cpu (the pinned CPU, else CPU 0);
+ * the hypervisor flag from /proc/cpuinfo's first flags line; max_ghz and
+ * the effective rate are machine- and run-wide. */
 static void write_system_meta(FILE *f)
 {
     const int cpu = affinity_status == AFF_PINNED ? cpu_requested : 0;
-    char path[96], buf[256];
     fprintf(f, ",\"metadata_cpu\":%d,\"hypervisor\":", cpu);
     const int hv = cpuinfo_has_flag("hypervisor");
-    fputs(hv < 0 ? "null" : hv ? "true" : "false", f);
-    snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu);
-    fputs(",\"smt_siblings\":", f);
-    json_string_or_null(f, sysfs_line(path, buf, sizeof buf) ? buf : NULL);
-    snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_governor", cpu);
-    fputs(",\"governor\":", f);
-    json_string_or_null(f, sysfs_line(path, buf, sizeof buf) ? buf : NULL);
-    const double max_ghz = cpu_max_ghz(), eff_ghz = measured_ghz();
+    if (hv < 0) fputs("null", f);
+    else fputs(hv ? "true" : "false", f);
+    json_cpu_sysfs(f, "smt_siblings", cpu, "topology/thread_siblings_list");
+    json_cpu_sysfs(f, "governor", cpu, "cpufreq/scaling_governor");
+    const double max_ghz = cpu_max_ghz();
+    const double eff_ghz = measured_ghz();
     fputs(",\"max_ghz\":", f);
     json_double(f, max_ghz > 0, max_ghz);
     fputs(",\"effective_user_cycle_ghz\":", f);
@@ -2111,7 +2140,9 @@ static void write_system_meta(FILE *f)
 
 static void write_meta(FILE *f)
 {
-    char cpu[192], microcode[64], kernel[160];
+    char cpu[192];
+    char microcode[64];
+    char kernel[160];
     struct utsname u;
     const int have_uname = uname(&u) == 0;
     get_cpu_model(cpu, sizeof cpu);
@@ -2175,15 +2206,26 @@ static void variant_kernel(int test, int variant, char *buf, size_t n)
     }
 }
 
+/* Copies s into out (at most cap - 1 bytes) with runs of spaces collapsed,
+ * as fputs_collapsed() writes labels to the Markdown report. */
+static void collapse_spaces(const char *s, char *out, size_t cap)
+{
+    size_t n = 0;
+    const char *p = s;
+    while (*p && n + 1 < cap) {
+        if (!(p[0] == ' ' && p[1] == ' ')) out[n++] = *p;
+        p++;
+    }
+    out[n] = '\0';
+}
+
 static void write_variants(FILE *f)
 {
     for (int i = 0; i < variant_count; i++) {
         const VariantInfo *v = &variant_info[i];
-        char label[128], kernel[64];
-        size_t n = 0;
-        for (const char *p = v->label; *p && n + 1 < sizeof label; p++)
-            if (!(p[0] == ' ' && p[1] == ' ')) label[n++] = *p;
-        label[n] = '\0';
+        char label[128];
+        char kernel[64];
+        collapse_spaces(v->label, label, sizeof label);
         variant_kernel(v->test, v->variant, kernel, sizeof kernel);
         fprintf(f, "{\"type\":\"variant\",\"test\":%d,\"variant\":%d,\"label\":", v->test, v->variant);
         json_string(f, label);
@@ -2308,16 +2350,19 @@ static int parse_count(const char *s, const char *what,
     return 1;
 }
 
-/* Parses a 64-bit seed, decimal or 0x hex.  Prints an error and returns 0
- * if invalid. */
+/* Parses a 64-bit seed: decimal, or hex after "0x".  A leading zero is
+ * still decimal (strtoull's base 0 would read "010" as octal 8).  Prints an
+ * error and returns 0 if invalid. */
 static int parse_seed(const char *s, u64 *out)
 {
-    char *end;
+    const int hex = s[0] == '0' && (s[1] == 'x' || s[1] == 'X');
+    const char *digits = hex ? s + 2 : s;
+    const char *allowed = hex ? "0123456789abcdefABCDEF" : "0123456789";
+    const size_t len = strlen(digits);
     errno = 0;
-    const int has_digits = (*s >= '0' && *s <= '9');  /* strtoull would accept "-1" */
-    unsigned long long v = has_digits ? strtoull(s, &end, 0) : 0;
-    if (!has_digits || *end != '\0' || errno == ERANGE) {
-        fprintf(stderr, "Invalid seed: %s (must be 0–18446744073709551615)\n", s);
+    const unsigned long long v = strtoull(digits, NULL, hex ? 16 : 10);
+    if (!len || strspn(digits, allowed) != len || errno == ERANGE) {
+        fprintf(stderr, "Invalid seed: %s (must be 0–18446744073709551615, decimal or 0x hex)\n", s);
         return 0;
     }
     *out = (u64)v;
@@ -2329,9 +2374,9 @@ static void print_usage(const char *prog)
     printf("Usage: %s [options]\n"
            "  -o, --output <file>  write a formatted Markdown report there\n"
            "                       (in addition to the normal console output)\n"
-           "  -n, --trials <N>     measure each variant N times (1–%d) after one\n"
-           "                       warm-up run and report the median trial\n"
-           "                       (default: 1, a single measurement, no warm-up)\n"
+           "  -n, --trials <N>     measure each variant N times (1–%d), each trial\n"
+           "                       after one untimed training run, and report the\n"
+           "                       median trial (default: 1)\n"
            "  -t, --test <N>       run only test N (1–%d); repeat to run several\n"
            "                       (default: tests 1–4; tests 5–6 run only when selected)\n"
            "      --hard           run all tests, including the hard tests 5 and 6\n"
@@ -2570,15 +2615,58 @@ static void print_clock_summary(FILE *report)
         fprintf(report, "**Effective user-cycle rate during measurements:** %.2f GHz\n\n", avg_ghz);
 }
 
-/* Creates or truncates an output file, owner-only when new: open() rather
- * than fopen() (0666).  NULL after printing why. */
+/* Opens (creating, owner-only when new) an output file without truncating
+ * it: open() rather than fopen() (0666).  open_outputs() truncates once
+ * both files are known to be usable and distinct.  NULL after printing why. */
 static FILE *open_output(const char *path)
 {
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    int fd = open(path, O_WRONLY | O_CREAT, 0600);
     if (fd < 0) { perror(path); return NULL; }
     FILE *f = fdopen(fd, "w");
     if (!f) { perror("fdopen"); close(fd); }
     return f;
+}
+
+/* Empties a regular file (a device such as /dev/full is left as is, as
+ * O_TRUNC would); 0 on success. */
+static int truncate_output(FILE *f, const char *path)
+{
+    struct stat st;
+    if (fstat(fileno(f), &st) == 0 && !S_ISREG(st.st_mode)) return 0;
+    if (ftruncate(fileno(f), 0) == 0) return 0;
+    perror(path);
+    return 1;
+}
+
+/* Opens the -o report and the --json export (NULL where not requested).
+ * Neither is truncated until both are open and known to be different
+ * files, so a bad --json path or an alias never empties an existing
+ * report.  0 on success; 1 with both closed after printing why. */
+static int open_outputs(const char *out_path, FILE **report, FILE **json)
+{
+    *report = NULL;
+    *json = NULL;
+    if (out_path) {
+        *report = open_output(out_path);
+        if (!*report) return 1;
+    }
+    int failed = 0;
+    if (json_path) {
+        *json = open_output(json_path);
+        failed = *json == NULL;
+    }
+    if (!failed && *report && *json && same_open_file(*report, *json) != 0) {
+        fprintf(stderr, "Report and JSON export must be different files\n");
+        failed = 1;
+    }
+    if (!failed && *report) failed = truncate_output(*report, out_path);
+    if (!failed && *json) failed = truncate_output(*json, json_path);
+    if (!failed) return 0;
+    if (*report) fclose(*report);
+    if (*json) fclose(*json);
+    *report = NULL;
+    *json = NULL;
+    return 1;
 }
 
 /* Closes an output file; nonzero if any write failed.  A previous buffered
@@ -2590,31 +2678,50 @@ static int close_output(FILE *f)
     return failed;
 }
 
+static void run_selected_tests(FILE *report)
+{
+    if (test_selected(1)) { begin_test(1); run_test1(report); }
+    if (test_selected(2)) { begin_test(2); run_test2(report); }
+    if (test_selected(3)) { begin_test(3); run_test3(report); }
+    if (test_selected(4)) { begin_test(4); run_test4(report); }
+    if (test_selected(5)) { begin_test(5); run_test5(report); }
+    if (test_selected(6)) { begin_test(6); run_test6(report); }
+}
+
+/* Closes the report, then writes and closes the export.  Nonzero if either
+ * failed. */
+static int finish_outputs(FILE *report, const char *out_path, FILE *json)
+{
+    int failed = 0;
+    if (report) {
+        if (close_output(report)) {
+            fprintf(stderr, "Error writing report to %s\n", out_path);
+            failed = 1;
+        } else {
+            printf("\nFormatted report written to %s\n", out_path);
+        }
+    }
+    if (json) {
+        write_export(json);
+        if (close_output(json)) {
+            fprintf(stderr, "Error writing JSON export to %s\n", json_path);
+            failed = 1;
+        } else {
+            printf("JSON export written to %s\n", json_path);
+        }
+    }
+    return failed;
+}
+
 int main(int argc, char **argv)
 {
     const char *out_path = NULL;
     int rc = parse_args(argc, argv, &out_path);
     if (rc >= 0) return rc;
 
-    if (out_path && json_path && same_file(out_path, json_path)) {
-        fprintf(stderr, "Report and JSON export must be different files\n");
-        return 1;
-    }
-    FILE *report = NULL;
-    FILE *json = NULL;
-    if (out_path && !(report = open_output(out_path))) return 1;
-    if (json_path && !(json = open_output(json_path))) {
-        if (report) fclose(report);
-        return 1;
-    }
-    /* Paths that only alias once created (e.g. "a" and "./a") pass the
-     * check above; the open files themselves cannot be mistaken. */
-    if (report && json && same_open_file(report, json)) {
-        fprintf(stderr, "Report and JSON export must be different files\n");
-        fclose(report);
-        fclose(json);
-        return 1;
-    }
+    FILE *report;
+    FILE *json;
+    if (open_outputs(out_path, &report, &json)) return 1;
 
     apply_affinity();
     perf_init();
@@ -2625,36 +2732,15 @@ int main(int argc, char **argv)
     if (report)
         write_report_header(report, tests_list);
 
-    if (test_selected(1)) { begin_test(1); run_test1(report); }
-    if (test_selected(2)) { begin_test(2); run_test2(report); }
-    if (test_selected(3)) { begin_test(3); run_test3(report); }
-    if (test_selected(4)) { begin_test(4); run_test4(report); }
-    if (test_selected(5)) { begin_test(5); run_test5(report); }
-    if (test_selected(6)) { begin_test(6); run_test6(report); }
+    run_selected_tests(report);
 
     print_clock_summary(report);
 
     printf("See README.md for how to interpret these results.\n");
 
-    int report_failed = 0;
-    if (report) {
-        report_failed = close_output(report);
-        if (report_failed)
-            fprintf(stderr, "Error writing report to %s\n", out_path);
-        else
-            printf("\nFormatted report written to %s\n", out_path);
-    }
-    if (json) {
-        write_export(json);
-        if (close_output(json)) {
-            fprintf(stderr, "Error writing JSON export to %s\n", json_path);
-            report_failed = 1;
-        } else {
-            printf("JSON export written to %s\n", json_path);
-        }
-    }
+    const int output_failed = finish_outputs(report, out_path, json);
 
     perf_close();
 
-    return sanity_failed || report_failed ? 1 : 0;
+    return sanity_failed || output_failed ? 1 : 0;
 }
