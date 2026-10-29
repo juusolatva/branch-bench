@@ -849,7 +849,7 @@ static int exit_status(void (*fn)(void))
     const pid_t pid = fork();
     assert(pid >= 0);
     if (pid == 0) {
-        freopen("/dev/null", "w", stderr);
+        if (!freopen("/dev/null", "w", stderr)) _exit(2);
         fn();
         _exit(0);
     }
