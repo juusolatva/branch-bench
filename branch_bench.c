@@ -1,13 +1,16 @@
 /*
  * branch_bench.c — CPU Branch Prediction Efficiency Benchmark
  *
- * Four tests that contrast highly predictable vs unpredictable branching
- * to measure the real CPU cost of branch misprediction:
+ * Tests that contrast predictable vs unpredictable branching to measure the
+ * real CPU cost of branch misprediction.  Tests 1-4 run by default; tests
+ * 5-6 probe longer-range behaviour and run only with -t or --hard:
  *
  *  Test 1 — Threshold Sum       sorted vs shuffled array              (classic direct-branch demo)
  *  Test 2 — Stride Conditional  periodic 25% vs random 25% take-rate  (repeating pattern stress)
  *  Test 3 — Indirect Dispatch   sequential vs random function pointer  (indirect branch predictor)
  *  Test 4 — Branch vs Branchless sorted/random × branch/arithmetic    (misprediction cost isolation)
+ *  Test 5 — Pattern Learnability de Bruijn periods 32..2048 vs random (pattern length, opt-in)
+ *  Test 6 — Correlation Distance B copies A after d fillers vs random (correlation reach, opt-in)
  *
  * On Linux, hardware counters are read via perf_event_open(2) when the kernel
  * allows it (in a VM only if the hypervisor exposes a virtual PMU, which
@@ -21,13 +24,13 @@
  *
  * Note: -fno-tree-vectorize prevents SIMD rewriting that would bypass branches.
  *       -fno-if-conversion keeps if-else as actual branch instructions (not CMOV),
- *       which is required for tests 1-3 and Test 4's branch variant to show
- *       misprediction cost.
+ *       which is required for tests 1-3, 5, 6 and Test 4's branch variant to
+ *       show misprediction cost.
  *       Test 4's branchless variant uses arithmetic masks — unaffected by these flags.
  *       clang rejects -fno-if-conversion and has no equivalent; it builds with
  *       -fno-vectorize -fno-slp-vectorize instead, but (as of clang 18-21)
- *       makes Tests 1, 2 and 4's branch variant branchless (CMOV, SBB), so
- *       clang timings don't show the misprediction cost.
+ *       makes Tests 1, 2, 5, 6 and 4's branch variant branchless (CMOV, SBB),
+ *       so clang timings don't show the misprediction cost.
  *
  * Run:
  *   ./branch_bench
@@ -56,14 +59,33 @@
 #endif
 
 /* ── Tuneable parameters ─────────────────────────────────────────────────── */
-#define DEFAULT_SIZE  (1u << 22)   /* 4 194 304 elements (tests 1/2/4) or calls (test 3) */
-#define DEFAULT_REPS  64           /* outer repetitions (tests 1/2/4)        */
+#define DEFAULT_SIZE  (1u << 22)   /* 4 194 304 elements (tests 1/2/4/5/6) or calls (test 3) */
+#define DEFAULT_REPS  64           /* passes (tests 1/2/4/5); test 6 budget  */
 #define THRESHOLD     128          /* byte comparison threshold               */
 #define NUM_FUNCS     32           /* distinct indirect call targets (test 3) */
-#define NUM_TESTS     4
+#define NUM_TESTS     6
+#define DEFAULT_TESTS 0xFu         /* tests run without -t: 1–4 (5 and 6 are opt-in) */
+#define HARD_TESTS    0x3Fu        /* tests run with --hard: all six              */
 #define MAX_TRIALS    99           /* upper limit for -n/--trials             */
 #define MAX_SIZE      (1UL << 30)  /* upper limit for --size                  */
 #define MAX_REPS      100000UL     /* upper limit for --reps                  */
+
+/* Test 5: de Bruijn pattern orders k (periods 2^k) and the random reference */
+#define DB_MIN_ORDER   5
+#define DB_MAX_ORDER   11
+#define DB_MAX_PERIOD  (1u << DB_MAX_ORDER)
+#define DB_ORDERS      (DB_MAX_ORDER - DB_MIN_ORDER + 1)
+#define DB_RANDOM_SEED 0x2545f4914f6cdd1dULL  /* nonzero: xorshift64 sticks at 0 */
+#define DB_MIN_SAMPLE  65536  /* elements for test 5's summary lines */
+
+/* Test 6: distances d (filler branches between A and B), powers of two */
+#define D6_MIN_DIST    4
+#define D6_MAX_DIST    1024
+#define D6_DISTS       9
+#define D6_MIN_BLOCKS  64     /* blocks per pass at d = D6_MAX_DIST */
+#define D6_MIN_SAMPLE  65536  /* blocks per pass for a "Correlation used" figure */
+#define D6_SEED_A      0x6a09e667f3bcc908ULL  /* nonzero, distinct seeds */
+#define D6_SEED_B      0xbb67ae8584caa73bULL
 
 /* ── Build provenance (printed in the banner and report) ────────────────── */
 /* Clang's __VERSION__ already names the compiler; GCC's is only the number. */
@@ -83,11 +105,14 @@
 #endif
 
 /* Run-time settings, changed only by command-line options. */
-static size_t   size  = DEFAULT_SIZE;  /* --size: elements per array (tests 1/2/4),
+static size_t   size  = DEFAULT_SIZE;  /* --size: elements per array (tests 1/2/4/5/6),
                                           calls per trial (test 3) */
-static unsigned reps  = DEFAULT_REPS;  /* --reps: passes over the array per trial */
+static unsigned reps  = DEFAULT_REPS;  /* --reps: passes over the array per trial;
+                                          test 6: scales its branch budget */
 static int      trials = 1;            /* -n/--trials: 1 = single measurement, no warm-up */
-static unsigned tests_selected = 0;    /* -t/--test bitmask (bit n-1 = test n); 0 = all */
+static unsigned tests_selected = 0;    /* -t/--test bitmask (bit n-1 = test n);
+                                          0 = DEFAULT_TESTS (1–4) */
+static int      hard_selected = 0;     /* --hard: all tests, including 5 and 6 */
 
 /* ── Types ───────────────────────────────────────────────────────────────── */
 typedef uint64_t        u64;
@@ -503,17 +528,25 @@ static void cpu_heading(char *buf, size_t bufsz)
     snprintf(buf + len, bufsz - len, " @ %.2f GHz", ghz);
 }
 
+/* Work done per trial, for the misses-per-item column: elements processed
+ * (tests 1/2/4/5, all passes), indirect calls made (test 3) or blocks run
+ * (test 6, all passes). */
+typedef struct {
+    u64         count;
+    const char *unit;      /* "elem", "call" or "block" */
+} Work;
+
 typedef struct {
     const char *label;
     Result      r;
+    const Work *work;      /* this row's work, or NULL for the test's Work */
 } ReportRow;
 
-/* Work done per trial, for the misses-per-item column: elements processed
- * (tests 1/2/4, all passes) or indirect calls made (test 3). */
-typedef struct {
-    u64         count;
-    const char *unit;      /* "elem" or "call" */
-} Work;
+/* The Work that applies to one row: its own, else the test's. */
+static const Work *row_work(const ReportRow *row, const Work *w)
+{
+    return row->work ? row->work : w;
+}
 
 static double misses_per_item(const Result *r, const Work *w)
 {
@@ -569,7 +602,7 @@ static void report_table(FILE *f, const char *title, const char *desc,
         else
             fprintf(f, " – |");
         if (result_has(r, CTR_MISSES))
-            fprintf(f, " %.3f |\n", misses_per_item(r, w));
+            fprintf(f, " %.3f |\n", misses_per_item(r, row_work(&rows[i], w)));
         else
             fprintf(f, " – |\n");
     }
@@ -628,7 +661,7 @@ static void emit_rows(FILE *report, const char *title, const char *desc,
                       const ReportRow *rows, int n, const Work *w)
 {
     for (int i = 0; i < n; i++)
-        print_row(rows[i].label, &rows[i].r, w);
+        print_row(rows[i].label, &rows[i].r, row_work(&rows[i], w));
     report_table(report, title, desc, rows, n, w);
 }
 
@@ -641,6 +674,25 @@ static void emit_ratio(FILE *report, const char *console_prefix,
     printf("%s%.2f×%s\n", console_prefix, ratio, suffix);
     if (report)
         fprintf(report, "**%s:** %.2f×%s\n\n", md_label, ratio, suffix);
+}
+
+/* For a test that cannot run at this --size/--reps: says why, on the
+ * console and in the report, in place of its results. */
+static void emit_skip(FILE *report, const char *title, const char *reason)
+{
+    printf("  Skipped: %s\n\n", reason);
+    if (report) fprintf(report, "### %s\n\n_Skipped: %s_\n\n", title, reason);
+}
+
+/* Appends ", item" (or the first item) to the list in buf.  Once an item is
+ * truncated, *len reaches bufsz and later items are dropped, so the size
+ * passed to snprintf never wraps around. */
+static void list_append(char *buf, size_t bufsz, size_t *len, const char *item)
+{
+    if (*len >= bufsz) return;
+    int written = snprintf(buf + *len, bufsz - *len, "%s%s", *len ? ", " : "", item);
+    if (written < 0) return;
+    *len += (size_t)written;
 }
 
 /* Standard 2-row emission (predictable vs unpredictable): console rows,
@@ -734,8 +786,8 @@ static void run_test1(FILE *report)
 
     const Work work = { (u64)len * reps, "elem" };
     const ReportRow rows[] = {
-        { "Sorted   (predictable, ~0% misses)",    rs },
-        { "Shuffled (unpredictable, ~50% misses)", rr },
+        { "Sorted   (predictable, ~0% misses)",    rs, NULL },
+        { "Shuffled (unpredictable, ~50% misses)", rr, NULL },
     };
     emit_pair_summary(report, "Test 1 — Threshold Sum",
                       "Sorted vs shuffled array, same direct branch. Identical data, different order.",
@@ -799,8 +851,8 @@ static void run_test2(FILE *report)
 
     const Work work = { (u64)len * reps, "elem" };
     const ReportRow rows[] = {
-        { "Periodic (every 4th — learnable)",   rp },
-        { "Random   (same rate — unlearnable)", rr },
+        { "Periodic (every 4th — learnable)",   rp, NULL },
+        { "Random   (same rate — unlearnable)", rr, NULL },
     };
     emit_pair_summary(report, "Test 2 — Stride Conditional",
                       "Both arrays have ~25% ones; only the pattern differs.",
@@ -899,8 +951,8 @@ static void run_test3(FILE *report)
 
     const Work work = { len, "call" };
     const ReportRow rows[] = {
-        { "Sequential i%32 (learnable cycle)", rs },
-        { "Random index (unlearnable)",        rr },
+        { "Sequential i%32 (learnable cycle)", rs, NULL },
+        { "Random index (unlearnable)",        rr, NULL },
     };
     emit_pair_summary(report, "Test 3 — Indirect Dispatch",
                       "32 targets, function-pointer call. The indirect predictor must guess the target address.",
@@ -999,10 +1051,10 @@ static void run_test4(FILE *report)
 
     const Work work = { (u64)len * reps, "elem" };
     const ReportRow rows[] = {
-        { "Sorted  + branch",     r_sb },
-        { "Sorted  + branchless", r_sl },
-        { "Random  + branch",     r_rb },
-        { "Random  + branchless", r_rl },
+        { "Sorted  + branch",     r_sb, NULL },
+        { "Sorted  + branchless", r_sl, NULL },
+        { "Random  + branch",     r_rb, NULL },
+        { "Random  + branchless", r_rl, NULL },
     };
     emit_rows(report, "Test 4 — Branch vs Branchless",
               "Same sum, computed via conditional jump vs. arithmetic mask, on sorted and random data.",
@@ -1014,6 +1066,404 @@ static void run_test4(FILE *report)
                "Branchless is consistent", r_rl.time_ms, r_sl.time_ms,
                " random vs sorted");
     print_miss_cost(report, &r_sb, &r_rb);
+    printf("\n");
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *
+ *  TEST 5 — Pattern Learnability: de Bruijn patterns vs random  (opt-in)
+ *
+ *  Runs Test 2's count_decisions() kernel on repeating binary de Bruijn
+ *  sequences of orders k = 5..11 (periods 32..2048, half ones), tiled over
+ *  the array, and on random 50% ones.  Every k-bit window of a period is
+ *  distinct, so k previous outcomes identify the position.  The results show
+ *  how well this kernel's data branch learns each period; they do not
+ *  measure a predictor's capacity or history length.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+#define DB_TITLE "Test 5 — Pattern Learnability"
+#define DB_DESC  "Repeating de Bruijn patterns (orders 5–11, 50% ones) vs. random 50% ones; same kernel as Test 2."
+
+static const char *const db_labels[] = {
+    "Period   32 (k=5)",  "Period   64 (k=6)",  "Period  128 (k=7)",
+    "Period  256 (k=8)",  "Period  512 (k=9)",  "Period 1024 (k=10)",
+    "Period 2048 (k=11)", "Random 50%",
+};
+CHECK_LEN(db_labels_len_check, db_labels, DB_ORDERS + 1);
+
+/* Fills buf with random 0/1 bytes from a fixed seed, leaving the shared RNG
+ * stream as it was, so other tests see the same numbers either way. */
+static void fill_random_bits(u8 *buf, size_t n, u64 seed)
+{
+    const u64 saved = rng_state;
+    rng_state = seed;
+    for (size_t i = 0; i < n; i++)
+        buf[i] = (u8)(rng64() >> 63);   /* top bit: xorshift64's low bit is weakest */
+    rng_state = saved;
+}
+
+/* Marks word w in a bitset; returns 1 if it was not marked before. */
+static int mark_new(u8 *set, unsigned w)
+{
+    const u8 bit = (u8)(1u << (w & 7));
+    if (set[w >> 3] & bit) return 0;
+    set[w >> 3] |= bit;
+    return 1;
+}
+
+/* Writes the first 2^k bits of the prefer-one de Bruijn sequence of order k
+ * (Martin, 1934): k zeros, then each next bit 1 if that makes a k-bit word
+ * not seen yet, else 0.  Run on, it would emit k - 1 more (wrap-around)
+ * bits; the first 2^k are a cyclic de Bruijn sequence.  Returns 0 for an
+ * unsupported k, or if neither bit gives a new word. */
+static int debruijn_prefer_one(unsigned k, u8 out[DB_MAX_PERIOD])
+{
+    if (k < DB_MIN_ORDER || k > DB_MAX_ORDER) return 0;
+    const unsigned period = 1u << k;
+    const unsigned mask = period - 1;
+    u8 seen[DB_MAX_PERIOD / 8] = {0};
+    unsigned state = 0;
+    for (unsigned i = 0; i < k; i++) out[i] = 0;
+    mark_new(seen, 0);
+    for (unsigned i = k; i < period; i++) {
+        const unsigned one = ((state << 1) | 1u) & mask;
+        if (mark_new(seen, one))            state = one;
+        else if (mark_new(seen, one & ~1u)) state = one & ~1u;
+        else return 0;
+        out[i] = (u8)(state & 1u);
+    }
+    return 1;
+}
+
+/* 1 if p[0..2^k-1] (bytes 0/1) is a cyclic de Bruijn sequence of order k:
+ * every k-bit word appears exactly once as a cyclic window, and half the
+ * bits are ones.  k must be in DB_MIN_ORDER..DB_MAX_ORDER. */
+static int debruijn_valid(const u8 *p, unsigned k)
+{
+    const unsigned period = 1u << k;
+    const unsigned mask = period - 1;
+    u8 seen[DB_MAX_PERIOD / 8] = {0};
+    unsigned state = 0;
+    unsigned ones = 0;
+    for (unsigned i = 0; i + 1 < k; i++) state = (state << 1) | p[i];
+    for (unsigned i = 0; i < period; i++) {
+        state = ((state << 1) | p[(i + k - 1) & mask]) & mask;
+        ones += p[i];
+        if (!mark_new(seen, state)) return 0;
+    }
+    return ones == period / 2;
+}
+
+/* Whole periods of the longest pattern; with --size >= 1 this also means
+ * at least one period. */
+static int test5_size_ok(size_t len)
+{
+    return len % DB_MAX_PERIOD == 0;
+}
+
+/* Measures count_decisions() on each de Bruijn pattern tiled over buf, then
+ * on random bits.  Returns 0, measuring nothing more, if a pattern fails its
+ * check. */
+static int measure_patterns(u8 *buf, size_t len, ReportRow rows[DB_ORDERS + 1])
+{
+    u8 pattern[DB_MAX_PERIOD];
+    for (unsigned k = DB_MIN_ORDER; k <= DB_MAX_ORDER; k++) {
+        const size_t mask = ((size_t)1 << k) - 1;
+        if (!debruijn_prefer_one(k, pattern) || !debruijn_valid(pattern, k)) {
+            fprintf(stderr, "  ERROR: de Bruijn sequence of order %u is invalid!\n", k);
+            return 0;
+        }
+        for (size_t i = 0; i < len; i++) buf[i] = pattern[i & mask];
+        MEASURE(rows[k - DB_MIN_ORDER].r, count_decisions(buf, len, reps));
+    }
+    fill_random_bits(buf, len, DB_RANDOM_SEED);
+    MEASURE(rows[DB_ORDERS].r, count_decisions(buf, len, reps));
+    return 1;
+}
+
+/* Lists the periods at or under 0.05 misses per element; needs the miss
+ * counter on every row.  A description of these results, not a capacity. */
+static void print_low_miss_periods(FILE *report, const ReportRow *rows, const Work *w)
+{
+    char list[64] = "";
+    size_t used = 0;
+    for (int i = 0; i <= DB_ORDERS; i++)
+        if (!result_has(&rows[i].r, CTR_MISSES)) return;
+    for (int i = 0; i < DB_ORDERS; i++) {
+        if (misses_per_item(&rows[i].r, w) > 0.05) continue;
+        char period[16];
+        snprintf(period, sizeof period, "%u", 1u << (i + DB_MIN_ORDER));
+        list_append(list, sizeof list, &used, period);
+    }
+    const char *shown = used ? list : "none";
+    printf("  → Periods at ≤ 0.05 misses/elem: %s\n", shown);
+    if (report) fprintf(report, "**Periods at ≤ 0.05 misses/elem:** %s\n\n", shown);
+}
+
+/* Test 5's summary lines: random vs the shortest and longest period, cost
+ * per miss, and the low-miss periods.  Below DB_MIN_SAMPLE elements the
+ * random row repeats so often that a predictor may learn it, so a note
+ * replaces them. */
+static void print_test5_summary(FILE *report, const ReportRow *rows,
+                                const Work *w, size_t len)
+{
+    if (len < DB_MIN_SAMPLE) {
+        printf("\n  → n/a: --size below %d, so a predictor may learn the random row\n",
+               DB_MIN_SAMPLE);
+        if (report)
+            fprintf(report, "_n/a: --size below %d, so a predictor may learn the "
+                            "random row; summary omitted._\n\n", DB_MIN_SAMPLE);
+        return;
+    }
+    const Result *shortest = &rows[0].r;
+    const Result *longest  = &rows[DB_ORDERS - 1].r;
+    const Result *random_row = &rows[DB_ORDERS].r;
+    emit_ratio(report, "\n  Random vs period 32:    ", "Random vs period 32",
+               random_row->time_ms, shortest->time_ms, "");
+    emit_ratio(report, "  Random vs period 2048:  ", "Random vs period 2048",
+               random_row->time_ms, longest->time_ms, "");
+    print_miss_cost(report, shortest, random_row);
+    print_low_miss_periods(report, rows, w);
+}
+
+static void run_test5(FILE *report)
+{
+    const size_t len = size;
+    printf("TEST 5 — Pattern Learnability  (de Bruijn k=%d..%d vs random 50%%, %zu×%u reps)\n",
+           DB_MIN_ORDER, DB_MAX_ORDER, len, reps);
+    printf("  %s\n\n", DB_DESC);
+    if (!test5_size_ok(len)) {
+        char reason[96];
+        snprintf(reason, sizeof reason,
+                 "--size %zu is not a multiple of %u (whole de Bruijn periods are required).",
+                 len, DB_MAX_PERIOD);
+        emit_skip(report, DB_TITLE, reason);
+        return;
+    }
+
+    u8 *buf = malloc(len);
+    if (!buf) { perror("malloc"); exit(1); }
+    const Result none = {0};
+    ReportRow rows[DB_ORDERS + 1];
+    for (int i = 0; i <= DB_ORDERS; i++) {
+        rows[i].label = db_labels[i];
+        rows[i].r     = none;
+        rows[i].work  = NULL;
+    }
+    const int ok = measure_patterns(buf, len, rows);
+    free(buf);
+    if (!ok) {
+        sanity_failed = 1;
+        return;
+    }
+    u64 sink = 0;
+    for (int i = 0; i <= DB_ORDERS; i++) sink += rows[i].r.result;
+    anti_dce_sink(sink);
+
+    const Work work = { (u64)len * reps, "elem" };
+    emit_rows(report, DB_TITLE, DB_DESC, rows, DB_ORDERS + 1, &work);
+    print_test5_summary(report, rows, &work, len);
+    printf("\n");
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *
+ *  TEST 6 — Correlation Distance: correlated vs independent branch  (opt-in)
+ *
+ *  Each block runs branch A on a random outcome, then d filler branches with
+ *  a constant outcome, then branch B.  In the correlated row B's outcome equals
+ *  A's, so a predictor whose history still reaches A can learn B; in the
+ *  reference row B is independently random.  The pair's miss difference
+ *  isolates B.  d counts filler iterations, not history bits (each adds a
+ *  filler branch and the inner back-edge), so these are results for this
+ *  kernel, not a history length.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+#define D6_TITLE "Test 6 — Correlation Distance"
+#define D6_DESC  "Branch B repeats branch A's random outcome after d constant filler branches; reference rows make B independently random."
+
+static const char *const d6_labels[] = {
+    "d=   4 correlated", "d=   4 random B", "d=   8 correlated", "d=   8 random B",
+    "d=  16 correlated", "d=  16 random B", "d=  32 correlated", "d=  32 random B",
+    "d=  64 correlated", "d=  64 random B", "d= 128 correlated", "d= 128 random B",
+    "d= 256 correlated", "d= 256 random B", "d= 512 correlated", "d= 512 random B",
+    "d=1024 correlated", "d=1024 random B",
+};
+CHECK_LEN(d6_labels_len_check, d6_labels, 2 * D6_DISTS);
+
+__attribute__((noinline))
+static u64 correlate_distance(const u8 *a, const u8 *b, const u8 *fill,
+                              size_t n_blocks, unsigned d, unsigned n_passes)
+{
+    u64 acc = 0;
+    for (unsigned p = 0; p < n_passes; p++)
+        for (size_t i = 0; i < n_blocks; i++) {
+            if (a[i]) acc += 1;              /* branch A */
+            for (unsigned j = 0; j < d; j++)
+                if (fill[j]) acc += 2;       /* filler branches */
+            if (b[i]) acc += 3;              /* branch B: a copy of A, or random */
+        }
+    return acc;
+}
+
+/* Even the longest distance gets D6_MIN_BLOCKS blocks per pass.  Which
+ * distances are long enough for a "Correlation used" figure is decided
+ * separately, by D6_MIN_SAMPLE. */
+static int test6_size_ok(size_t len, unsigned r)
+{
+    return len >= D6_MIN_BLOCKS &&
+           (u64)len * r / (D6_MAX_DIST + 2) >= D6_MIN_BLOCKS;
+}
+
+/* Splits a budget of `total` branches over blocks of d + 2: as many blocks
+ * as fit (at most len), then whole passes over them.  The rest of the
+ * budget is left unused. */
+static void d6_layout(u64 total, size_t len, unsigned d, size_t *blocks, unsigned *passes)
+{
+    const u64 per_block = (u64)d + 2;
+    const u64 fit = total / per_block;
+    *blocks = fit < len ? (size_t)fit : len;
+    *passes = (unsigned)(total / (per_block * *blocks));
+}
+
+/* One distance's layout, and the work each of its two rows does. */
+typedef struct {
+    size_t   blocks;     /* per pass */
+    unsigned passes;
+    Work     work;       /* blocks × passes, unit "block" */
+} D6Point;
+
+/* Misses the correlated row avoided, as a percentage of the 0.5 misses per
+ * block that a random B costs; clamped to 0–100%.  Needs both miss counts. */
+static double correlation_used_pct(const Result *corr, const Result *ref, u64 blocks_run)
+{
+    const double avoided = (double)ref->counts[CTR_MISSES] - (double)corr->counts[CTR_MISSES];
+    const double pct = 100.0 * avoided / (0.5 * (double)blocks_run);
+    if (pct < 0) return 0;
+    if (pct > 100) return 100;
+    return pct;
+}
+
+/* Measures each distance's correlated row (B a copy of A) and reference row
+ * (B random), recording each distance's layout in pts[] and pointing both
+ * of its rows at that work. */
+static void measure_distances(const u8 *a, u8 *b, size_t len, u64 total,
+                              ReportRow rows[2 * D6_DISTS], D6Point pts[D6_DISTS])
+{
+    u8 fill[D6_MAX_DIST];
+    memset(fill, 1, sizeof fill);
+    for (int i = 0; i < D6_DISTS; i++) {
+        const unsigned d = (unsigned)D6_MIN_DIST << i;
+        D6Point *pt = &pts[i];
+        d6_layout(total, len, d, &pt->blocks, &pt->passes);
+        pt->work.count = (u64)pt->blocks * pt->passes;
+        pt->work.unit  = "block";
+        rows[2 * i].work = &pt->work;
+        rows[2 * i + 1].work = &pt->work;
+        const size_t blocks = pt->blocks;
+        const unsigned passes = pt->passes;
+        memcpy(b, a, blocks);
+        MEASURE(rows[2 * i].r, correlate_distance(a, b, fill, blocks, d, passes));
+        fill_random_bits(b, blocks, D6_SEED_B);
+        MEASURE(rows[2 * i + 1].r, correlate_distance(a, b, fill, blocks, d, passes));
+    }
+}
+
+/* Per distance, how much of B's randomness the correlation removed, and the
+ * largest d at 90% or more; needs the miss counter on every row.  These are
+ * descriptive thresholds, not a measured history length.  A distance with
+ * fewer than D6_MIN_SAMPLE blocks per pass shows n/a: its random sequences
+ * repeat so often that a predictor may learn them, which would make B
+ * predictable without A. */
+static void print_correlation_used(FILE *report, const ReportRow *rows,
+                                   const D6Point *pts)
+{
+    char list[256] = "";
+    size_t used = 0;
+    unsigned best = 0;
+    int evaluated = 0;
+    for (int i = 0; i < D6_DISTS; i++) {
+        const unsigned d = (unsigned)D6_MIN_DIST << i;
+        char entry[32];
+        if (pts[i].blocks < D6_MIN_SAMPLE) {
+            snprintf(entry, sizeof entry, "d=%u n/a", d);
+        } else {
+            const double pct = correlation_used_pct(&rows[2 * i].r, &rows[2 * i + 1].r,
+                                                    pts[i].work.count);
+            snprintf(entry, sizeof entry, "d=%u %.0f%%", d, pct);
+            evaluated++;
+            if (pct >= 90.0) best = d;
+        }
+        list_append(list, sizeof list, &used, entry);
+    }
+    char best_d[16];
+    snprintf(best_d, sizeof best_d, "%u", best);
+    const char *shown = "n/a";
+    if (evaluated) shown = best ? best_d : "none";
+    printf("  → Correlation used: %s\n  → Largest d with ≥ 90%%: %s\n", list, shown);
+    if (report)
+        fprintf(report, "**Correlation used:** %s\n\n**Largest d with ≥ 90%%:** %s\n\n",
+                list, shown);
+    if (evaluated < D6_DISTS) {
+        printf("  → n/a: fewer than %d blocks per pass, so a predictor may learn the sequences\n",
+               D6_MIN_SAMPLE);
+        if (report)
+            fprintf(report, "_n/a: fewer than %d blocks per pass, so a predictor may "
+                            "learn the sequences._\n\n", D6_MIN_SAMPLE);
+    }
+}
+
+/* Test 6's summary lines: cost per miss from the d = 4 pair (same work,
+ * only B's predictability differs) when its sample is long enough, and the
+ * correlation used per distance; both need the miss counter on every row. */
+static void print_test6_summary(FILE *report, const ReportRow *rows, const D6Point *pts)
+{
+    for (int i = 0; i < 2 * D6_DISTS; i++)
+        if (!result_has(&rows[i].r, CTR_MISSES)) return;
+    if (pts[0].blocks >= D6_MIN_SAMPLE)
+        print_miss_cost(report, &rows[0].r, &rows[1].r);
+    print_correlation_used(report, rows, pts);
+}
+
+static void run_test6(FILE *report)
+{
+    const size_t len = size;
+    const unsigned r = reps;
+    printf("TEST 6 — Correlation Distance  (d=%d..%d, budget %zu×%u branches per row)\n",
+           D6_MIN_DIST, D6_MAX_DIST, len, r);
+    printf("  %s\n\n", D6_DESC);
+    if (!test6_size_ok(len, r)) {
+        char reason[96];
+        snprintf(reason, sizeof reason,
+                 "Test 6 needs --size ≥ %d and --size × --reps ≥ %d.",
+                 D6_MIN_BLOCKS, D6_MIN_BLOCKS * (D6_MAX_DIST + 2));
+        emit_skip(report, D6_TITLE, reason);
+        return;
+    }
+
+    u8 *a = malloc(len);
+    u8 *b = malloc(len);
+    if (!a || !b) { perror("malloc"); exit(1); }
+    fill_random_bits(a, len, D6_SEED_A);
+    const Result none = {0};
+    ReportRow rows[2 * D6_DISTS];
+    D6Point pts[D6_DISTS];
+    for (int i = 0; i < 2 * D6_DISTS; i++) {
+        rows[i].label = d6_labels[i];
+        rows[i].r     = none;
+        rows[i].work  = NULL;   /* set by measure_distances() */
+    }
+    measure_distances(a, b, len, (u64)len * r, rows, pts);
+    free(a);
+    free(b);
+    u64 sink = 0;
+    for (int i = 0; i < 2 * D6_DISTS; i++) sink += rows[i].r.result;
+    anti_dce_sink(sink);
+
+    emit_rows(report, D6_TITLE, D6_DESC, rows, 2 * D6_DISTS, &pts[0].work);
+    print_test6_summary(report, rows, pts);
     printf("\n");
 }
 
@@ -1075,11 +1525,15 @@ static void print_usage(const char *prog)
            "                       warm-up run and report the median trial\n"
            "                       (default: 1, a single measurement, no warm-up)\n"
            "  -t, --test <N>       run only test N (1–%d); repeat to run several\n"
-           "                       (default: all tests)\n"
-           "      --size <N>       elements per array (tests 1/2/4) and calls\n"
+           "                       (default: tests 1–4; tests 5–6 run only when selected)\n"
+           "      --hard           run all tests, including the hard tests 5 and 6\n"
+           "      --size <N>       elements per array (tests 1/2/4/5/6) and calls\n"
            "                       per trial (test 3); K/M suffixes allowed\n"
-           "                       (default: %u = 4M, max: %lu = 1024M)\n"
-           "      --reps <N>       passes over the array per trial, tests 1/2/4\n"
+           "                       (default: %u = 4M, max: %lu = 1024M;\n"
+           "                       test 5 needs a multiple of 2048; test 6 needs\n"
+           "                       size ≥ 64 and size × reps ≥ 65664)\n"
+           "      --reps <N>       passes over the array per trial, tests 1/2/4/5;\n"
+           "                       scales test 6's branch budget with --size\n"
            "                       (default: %u, max: %lu)\n"
            "  -h, --help           show this help\n",
            prog, MAX_TRIALS, NUM_TESTS, DEFAULT_SIZE, MAX_SIZE, DEFAULT_REPS, MAX_REPS);
@@ -1118,6 +1572,11 @@ static int apply_option(int argc, char **argv, int *i, const char **out_path)
         tests_selected |= 1u << (v - 1);
         return -1;
     }
+    if (is_opt(arg, NULL, "--hard")) {
+        tests_selected |= HARD_TESTS;
+        hard_selected = 1;
+        return -1;
+    }
     if (is_opt(arg, NULL, "--size")) {
         if (!option_number(argc, argv, i, "size", 1, MAX_SIZE, &v)) return 1;
         size = (size_t)v;
@@ -1146,7 +1605,7 @@ static int parse_args(int argc, char **argv, const char **out_path)
 
 static int test_selected(int n)
 {
-    return tests_selected == 0 || ((tests_selected >> (n - 1)) & 1u);
+    return ((tests_selected ? tests_selected : DEFAULT_TESTS) >> (n - 1)) & 1u;
 }
 
 /* Comma-separated list of the selected tests, e.g. "1, 3". */
@@ -1186,7 +1645,9 @@ static void print_banner(const char *tests_list)
     if (trials > 1)
         printf("  Trials:          %10d per variant (median shown, after 1 warm-up run)\n",
                trials);
-    if (tests_selected)
+    if (hard_selected)
+        printf("  Tests:           %10s (all, with --hard)\n", tests_list);
+    else if (tests_selected)
         printf("  Tests:           %10s (selected with -t)\n", tests_list);
     printf("  Perf counters:   %s\n",
            perf_available() ? "AVAILABLE (hardware branch-miss counts shown)"
@@ -1234,7 +1695,9 @@ static void write_report_header(FILE *report, const char *tests_list)
     if (trials > 1)
         fprintf(report, "_Median of %d trials per variant, after one warm-up run. "
                         "Range is the fastest–slowest trial._\n\n", trials);
-    if (tests_selected)
+    if (hard_selected)
+        fprintf(report, "_All tests were run (--hard), including the hard tests 5 and 6._\n\n");
+    else if (tests_selected)
         fprintf(report, "_Only test(s) %s were run._\n\n", tests_list);
 }
 
@@ -1278,6 +1741,8 @@ int main(int argc, char **argv)
     if (test_selected(2)) run_test2(report);
     if (test_selected(3)) run_test3(report);
     if (test_selected(4)) run_test4(report);
+    if (test_selected(5)) run_test5(report);
+    if (test_selected(6)) run_test6(report);
 
     print_clock_summary(report);
 

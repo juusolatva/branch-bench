@@ -13,10 +13,14 @@ A simple benchmark for testing out gains from branch prediction or conversely lo
 2. **Stride Conditional** counts the ones in a 0/1 array that has them at every 4th position, or at random with the same 25% rate.
 3. **Indirect Dispatch** calls 32 functions through a pointer table, in sequential `i % 32` order or at random.
 4. **Branch vs Branchless** computes Test 1's sum with a conditional jump and with an arithmetic mask, on sorted and random data, and checks that both give the same result.
+5. **Pattern Learnability** (opt-in) runs Test 2's kernel on repeating de Bruijn patterns with periods 32 to 2048, and on random 50% ones.
+6. **Correlation Distance** (opt-in) makes a branch repeat the random outcome of a branch d = 4 to 1024 constant-outcome branches earlier, against a reference where it is random.
+
+A run without `-t` runs Tests 1–4. Tests 5 and 6 run only when selected with `-t` or `--hard` (all six tests), so default runs stay comparable with [RESULTS.md](RESULTS.md).
 
 ## Notes
 
-You **MUST** run this with ./run.sh, use a [prebuilt binary](#prebuilt-binaries), or build it with exactly `gcc -std=c99 -O2 -fno-tree-vectorize -fno-if-conversion -o branch_bench branch_bench.c`, adding `-Wa,-mbranches-within-32B-boundaries,-malign-branch=jcc+fused+jmp+call+ret+indirect` on x86-64 as `./run.sh` does. Without *-fno-tree-vectorize* and *-fno-if-conversion* the compiler optimizes the mispredictions away, and other optimization levels give results that cannot be compared with [RESULTS.md](RESULTS.md). The x86-64 assembler flags keep every jump in the kernels off 32-byte boundaries, which Intel's JCC-erratum fix slows on Skylake-derived CPUs. `./run.sh` builds and then runs the benchmark with any options you give it (e.g. `./run.sh -n 5 -o report.md`); after that, `./branch_bench` runs it directly. Build with GCC: Clang has no equivalent of *-fno-if-conversion* and makes Tests 1, 2 and Test 4's branch variant branchless, so its timings show no misprediction cost (see [AGENTS.md](AGENTS.md)).
+You **MUST** run this with ./run.sh, use a [prebuilt binary](#prebuilt-binaries), or build it with exactly `gcc -std=c99 -O2 -fno-tree-vectorize -fno-if-conversion -o branch_bench branch_bench.c`, adding `-Wa,-mbranches-within-32B-boundaries,-malign-branch=jcc+fused+jmp+call+ret+indirect` on x86-64 as `./run.sh` does. Without *-fno-tree-vectorize* and *-fno-if-conversion* the compiler optimizes the mispredictions away, and other optimization levels give results that cannot be compared with [RESULTS.md](RESULTS.md). The x86-64 assembler flags keep every jump in the kernels off 32-byte boundaries, which Intel's JCC-erratum fix slows on Skylake-derived CPUs. `./run.sh` builds and then runs the benchmark with any options you give it (e.g. `./run.sh -n 5 -o report.md`); after that, `./branch_bench` runs it directly. Build with GCC: Clang has no equivalent of *-fno-if-conversion* and makes Tests 1, 2, 5, 6 and Test 4's branch variant branchless, so its timings show no misprediction cost (see [AGENTS.md](AGENTS.md)).
 
 The benchmark builds on Linux with GCC; on Windows, use WSL2. Other POSIX systems build with GCC too but show times only. On macOS `gcc` is Clang, so install GCC (e.g. from Homebrew) and build with the command above using its versioned `gcc-<N>` (`./run.sh` calls plain `gcc`), without the `-Wa,...` flags: they need the GNU assembler (binutils 2.34 or later), which macOS does not use.
 
@@ -82,11 +86,19 @@ run to take about N+1 times as long.
 ```sh
 ./branch_bench -t 3                 # run only Test 3 (repeat -t for more)
 ./branch_bench --size 1M --reps 8   # smaller, quicker run (e.g. small boards)
+./branch_bench -t 5                 # opt-in Test 5 (pattern learnability)
+./branch_bench -t 6                 # opt-in Test 6 (correlation distance)
+./branch_bench --hard               # all six tests
 ```
+
+Test 5 tiles whole periods of its longest pattern, so it needs a
+`--size` that is a multiple of 2048; at any other size it prints a skip
+note and the other selected tests still run. Test 6 needs `--size` ≥ 64
+and `--size` × `--reps` ≥ 65664.
 
 `--size` sets the elements per array (and the calls per trial for
 Test 3); `K`/`M` suffixes are allowed. `--reps` sets how many passes each
-trial makes over the array. Results are only comparable with
+trial makes over the array (for Test 6, it scales the branch budget). Results are only comparable with
 [RESULTS.md](RESULTS.md) at the defaults (`--size 4M --reps 64`).
 Run `./branch_bench --help` for all options.
 
@@ -181,3 +193,31 @@ Ryzen 5 9600X under WSL2).
   on sorted data (319 ms vs 390 ms), but its QEMU model name hides the
   host's real core, so it neither confirms nor refutes this. The
   Raspberry Pi 4's reason has not been investigated.
+- **Test 5** feeds Test 2's branch binary de Bruijn sequences of order
+  k = 5 to 11. Each period of 2^k outcomes contains every k-bit word
+  exactly once, so the last k outcomes always identify the position, and
+  a long period does not need an equally long history. Read the misses
+  per element against the period: they show how well this kernel's branch
+  learns each pattern, compared with the random row's ~0.5. They do not
+  measure a predictor's capacity, history length or table structure. In
+  the GCC x86-64 build the loop has two conditional branches per element
+  (the data branch and the back-edge), so a global-history predictor would
+  see about 2k outcomes per k-bit context, and results also depend on
+  table sizes, hashing and training. Below `--size 64K` the summary lines
+  show n/a: the random row repeats so often that a predictor may learn it.
+- **Test 6** asks how far back a correlated outcome can be and still be
+  used. Each block runs branch A on a random outcome, d filler branches
+  with a constant outcome, then branch B. In the correlated row B equals A,
+  so B is predictable only if the predictor's history still reaches A; in
+  the reference row B is random. "Correlation used" is the share of the
+  0.5 misses per block that a random B costs which the correlated row
+  avoids. The filler
+  loop's exit can also mispredict, but equally in both rows, so it cancels.
+  d counts filler iterations, not history bits: each adds two conditional
+  branches in the GCC build (the filler and the loop back-edge). The
+  percentage need not fall steadily with d, and "Largest d with ≥ 90%" is
+  a description of this run, not a measured history length. A distance
+  with fewer than 65536 blocks per pass shows n/a: its random sequences
+  repeat so often that a predictor may learn them, which could make B
+  predictable without A. At the defaults every distance has enough. Rows do
+  different amounts of work, so compare times only within a pair.

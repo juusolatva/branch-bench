@@ -55,12 +55,15 @@ jobs:
       - name: Run (small size)
         run: ./branch_bench $SMALL_RUN
 
+      - name: Run all tests (small size, --hard)
+        run: ./branch_bench --hard $SMALL_RUN
+
       - name: Perf regression tests (no PMU required)
         run: |
           gcc $BENCH_FLAGS $WARN_FLAGS -o "$RUNNER_TEMP/perf_test" .github/scripts/perf_test.c
           "$RUNNER_TEMP/perf_test"
 
-      - name: Check Test 1-3 kernels keep real branches
+      - name: Check Test 1-3 and 6 kernels keep real branches
         run: .github/scripts/check_kernels.sh ./branch_bench
 
       # The fixture's kernel is branchless without any blacklisted
@@ -102,6 +105,7 @@ jobs:
               gcc --version
               gcc $BENCH_FLAGS $JCC_FLAGS $WARN_FLAGS -o /tmp/branch_bench branch_bench.c
               /tmp/branch_bench $SMALL_RUN > /dev/null
+              /tmp/branch_bench --hard $SMALL_RUN > /dev/null
               .github/scripts/check_kernels.sh /tmp/branch_bench
               hits=$(.github/scripts/check_jcc.sh /tmp/branch_bench)
               if [ -n "$hits" ]; then
@@ -128,10 +132,14 @@ jobs:
       - name: Run (small size)
         run: ./branch_bench $SMALL_RUN
 
-      # Clang makes Tests 1-2 branchless (cmov in sum_threshold, sbb in
-      # count_decisions), so check_kernels.sh must reject both. This proves
-      # the checker still detects lost branches.
-      - name: Kernel check rejects Clang's branchless Tests 1-2
+      - name: Run all tests (small size, --hard)
+        run: ./branch_bench --hard $SMALL_RUN
+
+      # Clang makes Tests 1-2 and 6 branchless (cmov in sum_threshold, sbb in
+      # count_decisions, sbb/cmov in correlate_distance), so check_kernels.sh
+      # must reject all three. This proves the checker still detects lost
+      # branches.
+      - name: Kernel check rejects Clang's branchless Tests 1-2 and 6
         run: |
           out="$RUNNER_TEMP/check_kernels.txt"
           if .github/scripts/check_kernels.sh ./branch_bench > "$out"; then
@@ -142,6 +150,7 @@ jobs:
           cat "$out"
           grep -q '^FAIL Test 1/4' "$out"
           grep -q '^FAIL Test 2' "$out"
+          grep -q '^FAIL Test 6' "$out"
 
       - name: clang --analyze
         run: |
@@ -251,10 +260,19 @@ jobs:
           # Fails if the shim was not used: these lines need the counters.
           grep -q '^\*\*Cost per miss:\*\*' "$dir/report.md"
           grep -q '^\*\*Average clock during measurements:\*\*' "$dir/report.md"
-          # Only some counters open.
-          for ev in misses branches,cycles; do
-            FAKE_PERF_EVENTS=$ev ./branch_bench_cov -t 1 $SMALL_RUN -o "$dir/part.md"
-          done
+          grep -q '^\*\*Periods at' "$dir/t5.md"
+          grep -q '^\*\*Correlation used:\*\* d=4 [0-9][0-9]*%, d=8 n/a' "$dir/t6.md"
+          grep -q '^_n/a: ' "$dir/t6.md"
+          # Only some counters open.  Tests 1-2 come first: the shim fails the
+          # first and third counter reads, and their four measurements absorb
+          # them.  The Test 5-6 summaries need misses, and only misses.
+          FAKE_PERF_EVENTS=misses ./branch_bench_cov -t 1 -t 2 -t 5 -t 6 $SMALL_RUN -o "$dir/part.md"
+          grep -q '^\*\*Periods at' "$dir/part.md"
+          grep -q '^\*\*Correlation used' "$dir/part.md"
+          FAKE_PERF_EVENTS=branches,cycles ./branch_bench_cov -t 1 -t 2 -t 5 -t 6 $SMALL_RUN -o "$dir/part.md"
+          if grep -q 'Periods at\|Correlation used' "$dir/part.md"; then
+            echo "Test 5-6 summaries printed without the miss counter"; exit 1
+          fi
 
       # Covers perf_stop()'s error paths, which need failing counter reads.
       - name: Perf regression tests with coverage

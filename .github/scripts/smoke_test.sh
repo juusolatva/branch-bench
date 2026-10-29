@@ -1,7 +1,8 @@
 #!/bin/sh
 # Runs a branch_bench binary through every command-line path with small
-# sizes: all tests, each option in short and long form, the report file and
-# invalid input.  Checks exit codes only, never timings.  Used for the
+# sizes: the default tests, the opt-in tests 5 and 6 and their size rules,
+# --hard, each option in short and long form, the report file and invalid
+# input.  Checks exit codes only, never timings.  Used for the
 # sanitizer and coverage builds.
 #
 # Usage: smoke_test.sh <binary> [work dir]
@@ -37,11 +38,52 @@ expect 0 $small -n 3 -o "$dir/report.md"
 expect 0 --trials 2 --test 2 --test 4 --output "$dir/report2.md" --size 4k --reps 1
 expect 0 -t 1 -t 3 --size 1m --reps 1
 expect 0 -t 3 --size 1000 --reps 1
+# Test 5 is opt-in; it skips (exit 0) when --size is not a multiple of 2048,
+# while other selected tests still run.
+# Test 4 first: fake_perf.so fails the first and third counter reads, and its
+# four measurements absorb them, so every Test 5 row gets counts.
+# shellcheck disable=SC2086
+expect 0 -t 4 -t 5 $small -o "$dir/t5.md"
+grep -q '^| Period 2048 (k=11) |' "$dir/t5.md" || { echo "FAIL t5.md lacks Test 5's table"; fail=1; }
+expect 0 -t 5 --size 1000 --reps 1 -o "$dir/skip5.md"
+grep -q 'Skipped:' "$dir/skip5.md" || { echo "FAIL skip5.md lacks the skip reason"; fail=1; }
+# Below 64K elements Test 5 measures, but replaces its summary with a note.
+expect 0 -t 5 --size 2048 --reps 1 -o "$dir/short5.md"
+grep -q '^_n/a: --size below' "$dir/short5.md" || { echo "FAIL short5.md lacks the n/a note"; fail=1; }
+expect 0 -t 2 -t 5 --size 1000 --reps 1 -o "$dir/mixed.md"
+grep -q '^### Test 2 ' "$dir/mixed.md" || { echo "FAIL mixed.md lacks Test 2"; fail=1; }
+grep -q 'Skipped:' "$dir/mixed.md" || { echo "FAIL mixed.md lacks Test 5's skip reason"; fail=1; }
+# Test 6 is opt-in; it skips when --size < 64 or --size × --reps < 65664.
+# At 64K × 6 only d = 4 gets the 65536 blocks per pass that a "Correlation
+# used" figure needs, so with the miss counter (CI's fake_perf.so step
+# checks this) the report has both a figure and n/a entries.
+expect 0 -t 4 -t 6 --size 64K --reps 6 -o "$dir/t6.md"
+grep -q '^| d= 4 correlated |' "$dir/t6.md" || { echo "FAIL t6.md lacks Test 6's table"; fail=1; }
+expect 0 -t 6 --size 1000 --reps 1 -o "$dir/skip6.md"
+grep -q 'Skipped:' "$dir/skip6.md" || { echo "FAIL skip6.md lacks the skip reason"; fail=1; }
+expect 0 -t 6 --size 32 --reps 100000 -o "$dir/skip6b.md"
+grep -q 'Skipped:' "$dir/skip6b.md" || { echo "FAIL skip6b.md lacks the skip reason"; fail=1; }
+# --hard runs all six tests, also next to -t, and says so.
+# shellcheck disable=SC2086
+expect 0 --hard $small -o "$dir/hard.md"
+grep -q '(all, with --hard)' "$dir/stdout" || { echo "FAIL --hard banner lacks its tests line"; fail=1; }
+expect 0 --hard -t 2 --size 4K --reps 1 -o "$dir/hard2.md"
+for f in hard.md hard2.md; do
+    for t in 1 2 3 4 5 6; do
+        grep -q "^### Test $t " "$dir/$f" || { echo "FAIL $f lacks Test $t"; fail=1; }
+    done
+    grep -q 'All tests were run (--hard)' "$dir/$f" || { echo "FAIL $f lacks the --hard note"; fail=1; }
+    if grep -q 'Only test(s)' "$dir/$f"; then echo "FAIL $f says only some tests ran"; fail=1; fi
+done
 
 # The report must contain every test that ran.
 for t in 1 2 3 4; do
     grep -q "^### Test $t " "$dir/report.md" || { echo "FAIL report.md lacks Test $t"; fail=1; }
 done
+# ... and only those: the default run leaves out the opt-in tests.
+if grep -q '^### Test [56] ' "$dir/report.md"; then
+    echo "FAIL default report.md contains an opt-in test"; fail=1
+fi
 # ... and record the compiler that built it.
 grep -q '^| Array size | Repetitions | Perf counters | Compiler |$' "$dir/report.md" ||
     { echo "FAIL report.md lacks a Compiler column"; fail=1; }
@@ -54,7 +96,7 @@ expect 1 --size 2048M
 expect 1 --reps 0
 expect 1 --reps
 expect 1 -n 100
-expect 1 -t 5
+expect 1 -t 7
 expect 1 -o
 expect 1 -o "$dir/no/such/dir/report.md"
 expect 1 --bogus
