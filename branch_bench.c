@@ -677,6 +677,17 @@ static void emit_skip(FILE *report, const char *title, const char *reason)
     if (report) fprintf(report, "### %s\n\n_Skipped: %s_\n\n", title, reason);
 }
 
+/* Appends ", item" (or the first item) to the list in buf.  Once an item is
+ * truncated, *len reaches bufsz and later items are dropped, so the size
+ * passed to snprintf never wraps around. */
+static void list_append(char *buf, size_t bufsz, size_t *len, const char *item)
+{
+    if (*len >= bufsz) return;
+    int written = snprintf(buf + *len, bufsz - *len, "%s%s", *len ? ", " : "", item);
+    if (written < 0) return;
+    *len += (size_t)written;
+}
+
 /* Standard 2-row emission (predictable vs unpredictable): console rows,
  * Markdown table, slowdown ratio, and cost per miss. */
 static void emit_pair_summary(FILE *report, const char *title, const char *desc,
@@ -1172,10 +1183,12 @@ static void print_low_miss_periods(FILE *report, const ReportRow *rows, const Wo
     size_t used = 0;
     for (int i = 0; i <= DB_ORDERS; i++)
         if (!result_has(&rows[i].r, CTR_MISSES)) return;
-    for (int i = 0; i < DB_ORDERS; i++)
-        if (misses_per_item(&rows[i].r, w) <= 0.05)
-            used += (size_t)snprintf(list + used, sizeof list - used, "%s%u",
-                                     used ? ", " : "", 1u << (i + DB_MIN_ORDER));
+    for (int i = 0; i < DB_ORDERS; i++) {
+        if (misses_per_item(&rows[i].r, w) > 0.05) continue;
+        char period[16];
+        snprintf(period, sizeof period, "%u", 1u << (i + DB_MIN_ORDER));
+        list_append(list, sizeof list, &used, period);
+    }
     const char *shown = used ? list : "none";
     printf("  → Periods at ≤ 0.05 misses/elem: %s\n", shown);
     if (report) fprintf(report, "**Periods at ≤ 0.05 misses/elem:** %s\n\n", shown);
@@ -1335,8 +1348,9 @@ static void print_correlation_used(FILE *report, const ReportRow *rows)
         const unsigned d = (unsigned)D6_MIN_DIST << i;
         const double pct = correlation_used_pct(&rows[2 * i].r, &rows[2 * i + 1].r,
                                                 rows[2 * i].work->count);
-        used += (size_t)snprintf(list + used, sizeof list - used, "%sd=%u %.0f%%",
-                                 used ? ", " : "", d, pct);
+        char entry[32];
+        snprintf(entry, sizeof entry, "d=%u %.0f%%", d, pct);
+        list_append(list, sizeof list, &used, entry);
         if (pct >= 90.0) best = d;
     }
     char best_d[16];

@@ -253,6 +253,23 @@ static void correlation_distance(void)
     puts("ok   Test 6 kernel, layout and correlation");
 }
 
+/* Summary lists stay inside their buffer when an item does not fit. */
+static void bounded_list(void)
+{
+    char buf[16 + 4];
+    memset(buf, 'X', sizeof buf);
+    /* volatile: GCC would see the deliberate truncation and warn. */
+    volatile size_t cap = 16;
+    size_t len = 0;
+    buf[0] = '\0';
+    list_append(buf, cap, &len, "1234567");
+    list_append(buf, cap, &len, "abcdefgh");   /* truncated */
+    list_append(buf, cap, &len, "more");       /* no room left */
+    assert(strcmp(buf, "1234567, abcdef") == 0);
+    for (size_t i = 16; i < sizeof buf; i++) assert(buf[i] == 'X');
+    puts("ok   bounded summary lists");
+}
+
 int main(void)
 {
     perf_leader = 42;
@@ -282,5 +299,6 @@ int main(void)
     per_row_work();
     pattern_learnability();
     correlation_distance();
+    bounded_list();
     return 0;
 }
