@@ -1,13 +1,16 @@
 /*
  * branch_bench.c — CPU Branch Prediction Efficiency Benchmark
  *
- * Four tests that contrast highly predictable vs unpredictable branching
- * to measure the real CPU cost of branch misprediction:
+ * Tests that contrast predictable vs unpredictable branching to measure the
+ * real CPU cost of branch misprediction.  Tests 1-4 run by default; tests
+ * 5-6 probe longer-range behaviour and run only with -t or --hard:
  *
  *  Test 1 — Threshold Sum       sorted vs shuffled array              (classic direct-branch demo)
  *  Test 2 — Stride Conditional  periodic 25% vs random 25% take-rate  (repeating pattern stress)
  *  Test 3 — Indirect Dispatch   sequential vs random function pointer  (indirect branch predictor)
  *  Test 4 — Branch vs Branchless sorted/random × branch/arithmetic    (misprediction cost isolation)
+ *  Test 5 — Pattern Learnability de Bruijn periods 32..2048 vs random (pattern length, opt-in)
+ *  Test 6 — Correlation Distance B copies A after d fillers vs random (correlation reach, opt-in)
  *
  * On Linux, hardware counters are read via perf_event_open(2) when the kernel
  * allows it (in a VM only if the hypervisor exposes a virtual PMU, which
@@ -21,13 +24,13 @@
  *
  * Note: -fno-tree-vectorize prevents SIMD rewriting that would bypass branches.
  *       -fno-if-conversion keeps if-else as actual branch instructions (not CMOV),
- *       which is required for tests 1-3 and Test 4's branch variant to show
- *       misprediction cost.
+ *       which is required for tests 1-3, 5, 6 and Test 4's branch variant to
+ *       show misprediction cost.
  *       Test 4's branchless variant uses arithmetic masks — unaffected by these flags.
  *       clang rejects -fno-if-conversion and has no equivalent; it builds with
  *       -fno-vectorize -fno-slp-vectorize instead, but (as of clang 18-21)
- *       makes Tests 1, 2 and 4's branch variant branchless (CMOV, SBB), so
- *       clang timings don't show the misprediction cost.
+ *       makes Tests 1, 2, 5, 6 and 4's branch variant branchless (CMOV, SBB),
+ *       so clang timings don't show the misprediction cost.
  *
  * Run:
  *   ./branch_bench
@@ -57,7 +60,7 @@
 
 /* ── Tuneable parameters ─────────────────────────────────────────────────── */
 #define DEFAULT_SIZE  (1u << 22)   /* 4 194 304 elements (tests 1/2/4/5/6) or calls (test 3) */
-#define DEFAULT_REPS  64           /* outer repetitions (tests 1/2/4/5/6)    */
+#define DEFAULT_REPS  64           /* passes (tests 1/2/4/5); test 6 budget  */
 #define THRESHOLD     128          /* byte comparison threshold               */
 #define NUM_FUNCS     32           /* distinct indirect call targets (test 3) */
 #define NUM_TESTS     6
@@ -79,7 +82,7 @@
 #define D6_MIN_DIST    4
 #define D6_MAX_DIST    1024
 #define D6_DISTS       9
-#define D6_MIN_BLOCKS  64
+#define D6_MIN_BLOCKS  64     /* blocks per pass at d = D6_MAX_DIST */
 #define D6_MIN_SAMPLE  65536  /* blocks per pass for a "Correlation used" figure */
 #define D6_SEED_A      0x6a09e667f3bcc908ULL  /* nonzero, distinct seeds */
 #define D6_SEED_B      0xbb67ae8584caa73bULL
@@ -104,7 +107,8 @@
 /* Run-time settings, changed only by command-line options. */
 static size_t   size  = DEFAULT_SIZE;  /* --size: elements per array (tests 1/2/4/5/6),
                                           calls per trial (test 3) */
-static unsigned reps  = DEFAULT_REPS;  /* --reps: passes over the array per trial */
+static unsigned reps  = DEFAULT_REPS;  /* --reps: passes over the array per trial;
+                                          test 6: scales its branch budget */
 static int      trials = 1;            /* -n/--trials: 1 = single measurement, no warm-up */
 static unsigned tests_selected = 0;    /* -t/--test bitmask (bit n-1 = test n);
                                           0 = DEFAULT_TESTS (1–4) */
@@ -525,10 +529,11 @@ static void cpu_heading(char *buf, size_t bufsz)
 }
 
 /* Work done per trial, for the misses-per-item column: elements processed
- * (tests 1/2/4, all passes) or indirect calls made (test 3). */
+ * (tests 1/2/4/5, all passes), indirect calls made (test 3) or blocks run
+ * (test 6, all passes). */
 typedef struct {
     u64         count;
-    const char *unit;      /* "elem" or "call" */
+    const char *unit;      /* "elem", "call" or "block" */
 } Work;
 
 typedef struct {
@@ -1266,8 +1271,8 @@ static void run_test5(FILE *report)
  *
  *  TEST 6 — Correlation Distance: correlated vs independent branch  (opt-in)
  *
- *  Each block runs branch A on a random outcome, then d filler branches that
- *  are always taken, then branch B.  In the correlated row B's outcome equals
+ *  Each block runs branch A on a random outcome, then d filler branches with
+ *  a constant outcome, then branch B.  In the correlated row B's outcome equals
  *  A's, so a predictor whose history still reaches A can learn B; in the
  *  reference row B is independently random.  The pair's miss difference
  *  isolates B.  d counts filler iterations, not history bits (each adds a
@@ -1303,7 +1308,9 @@ static u64 correlate_distance(const u8 *a, const u8 *b, const u8 *fill,
     return acc;
 }
 
-/* Enough blocks that a pass of A's random outcomes cannot be memorized. */
+/* Even the longest distance gets D6_MIN_BLOCKS blocks per pass.  Which
+ * distances are long enough for a "Correlation used" figure is decided
+ * separately, by D6_MIN_SAMPLE. */
 static int test6_size_ok(size_t len, unsigned r)
 {
     return len >= D6_MIN_BLOCKS &&
@@ -1328,8 +1335,8 @@ typedef struct {
     Work     work;       /* blocks × passes, unit "block" */
 } D6Point;
 
-/* Share of the reference row's B misses (0.5 per block) that the
- * correlated row avoided, clamped to 0–100%.  Needs both miss counts. */
+/* Misses the correlated row avoided, as a percentage of the 0.5 misses per
+ * block that a random B costs; clamped to 0–100%.  Needs both miss counts. */
 static double correlation_used_pct(const Result *corr, const Result *ref, u64 blocks_run)
 {
     const double avoided = (double)ref->counts[CTR_MISSES] - (double)corr->counts[CTR_MISSES];
@@ -1525,7 +1532,8 @@ static void print_usage(const char *prog)
            "                       (default: %u = 4M, max: %lu = 1024M;\n"
            "                       test 5 needs a multiple of 2048; test 6 needs\n"
            "                       size ≥ 64 and size × reps ≥ 65664)\n"
-           "      --reps <N>       passes over the array per trial, tests 1/2/4/5/6\n"
+           "      --reps <N>       passes over the array per trial, tests 1/2/4/5;\n"
+           "                       scales test 6's branch budget with --size\n"
            "                       (default: %u, max: %lu)\n"
            "  -h, --help           show this help\n",
            prog, MAX_TRIALS, NUM_TESTS, DEFAULT_SIZE, MAX_SIZE, DEFAULT_REPS, MAX_REPS);

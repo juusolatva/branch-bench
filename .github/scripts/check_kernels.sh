@@ -1,14 +1,16 @@
 #!/bin/sh
-# Checks that the Test 1-3 kernels in a GCC build still contain the code the
-# benchmark measures: a real conditional branch in Tests 1-2 (no conditional
-# move/select, no flag arithmetic such as setcc/sbb/adc, no SIMD), an
-# indirect call in Test 3.  Whether these survive depends on the compiler
+# Checks that the Test 1-3 and 6 kernels in a GCC build still contain the
+# code the benchmark measures: a real conditional branch in Tests 1-2 (Test 5
+# shares Test 2's kernel) and three in Test 6's (no conditional move/select,
+# no flag arithmetic such as setcc/sbb/adc, no SIMD), an indirect call in
+# Test 3.  Whether these survive depends on the compiler
 # version, and losing them silently invalidates results.  x86-64 and aarch64
 # only.
 #
 # Tests 1-2 need a data branch: a forward conditional branch that starts and
 # lands inside a loop (between a backward branch and its target), so neither
-# the loop back-edge nor an early exit to the return path counts.  Known
+# the loop back-edge nor an early exit to the return path counts.  Test 6
+# needs three (A, filler and B; mode loop-branch3).  Known
 # branchless forms are rejected too.  A pass is necessary, not sufficient:
 # a branch inside the loop need not be the one on the data.
 #
