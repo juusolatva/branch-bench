@@ -5,12 +5,24 @@ Rebuilds every pair summary from the trial records, independently of the
 C code, and compares it with the pair records, and checks each trial's
 scaled counts against its raw counts and scheduling times.  With --report,
 also checks that the Markdown report shows the same medians, ranges,
-counter columns, Miss %, misses per item, ratios and effective-cost lines
-(resolved and inconclusive).  Test 6's "Correlation used" values are not
-checked.  Every check must have something to compare: an empty export or
-report fails.  Standard library only.  The schema, revision and the
-1000-miss gate below must change together with branch_bench.c
-(JSON_SCHEMA, BENCH_REVISION, COST_MIN_MISSES_PER_PAIR).
+counter columns, Miss %, misses per item, ratios, effective-cost lines
+(resolved and inconclusive), Tests 1 and 4's condition-count line and
+Test 6's "Correlation used" lines.
+
+Input records: every row of Tests 1-4 and 6 must have one.  Both rows of
+a pair must have equal work and, where recorded, equal item and
+condition-true counts; a pair that compares two kernels must see the same
+input hash, and a pair that compares two orders of one kernel different
+ones (except Test 3's single-target pair and inputs below 1024 items).  Test 2 must have all 17 rows
+with their exact bias.  These counts are what the C code recorded, so they
+catch a broken export or wiring, not a wrong buffer; the C code checks the
+buffers themselves.  The run must not have flagged a result mismatch
+(meta results_ok).
+
+Every check must have something to compare: an empty export or report
+fails.  Standard library only.  The schema, revision and the constants
+below must change together with branch_bench.c (JSON_SCHEMA,
+BENCH_REVISION, COST_MIN_MISSES_PER_PAIR, D6_MIN_SAMPLE, T2_ROWS).
 
 Usage: check_export.py EXPORT [--report REPORT.md] [--kernel-counts FILE]
                        [--same-results OTHER --test N]
@@ -24,6 +36,12 @@ import math
 import sys
 
 COST_MIN_MISSES_PER_PAIR = 1000.0
+D6_MIN_SAMPLE = 65536
+T2_ROWS = 17
+INPUT_TESTS = (1, 2, 3, 4, 6)   # tests whose rows record their input
+# Below this many items per pass, two orders of one multiset can coincide
+# (one element; a 1/16 bias over 16 elements), so they may hash alike.
+ORDER_MIN_ITEMS = 1024
 COST_LABEL = "**Effective extra cycles per additional miss:**"
 
 
@@ -66,7 +84,9 @@ def check_structure(records):
     meta = records[0]
     check(meta.get("type") == "meta", "first record is not meta")
     check(meta.get("schema") == 1, f"schema {meta.get('schema')}, want 1")
-    check(meta.get("revision") == 2, f"revision {meta.get('revision')}, want 2")
+    check(meta.get("revision") == 3, f"revision {meta.get('revision')}, want 3")
+    check(meta.get("results_ok") is True,
+          "meta results_ok is not true: a kernel result differed from its reference")
     kernels = {k["id"] for k in by_type(records, "kernel")}
     variants = {(v["test"], v["variant"]): v for v in by_type(records, "variant")}
     for v in variants.values():
@@ -79,7 +99,7 @@ def check_structure(records):
     used = {t["pair"] for t in trials if t["pair"] is not None}
     recorded = {p["pair"] for p in by_type(records, "pair")}
     check(used == recorded, f"trial pairs {sorted(used)} differ from pair records {sorted(recorded)}")
-    ok("structure: meta first, schema 1, revision 2, every trial has a variant and kernel, "
+    ok("structure: meta first, schema 1, revision 3, every trial has a variant and kernel, "
        "every pair has a record")
     return variants
 
@@ -168,6 +188,71 @@ def check_pairs(records):
     ok(f"{len(pairs)} pair records rebuilt from {len(trials)} trials")
 
 
+def same_input_allowed(test, label, items):
+    """Test 3's single-target sequence is all zeros, so shuffling it cannot
+    change it; short inputs can be reordered into themselves."""
+    return (test == 3 and label.startswith("T= 1 ")) or items < ORDER_MIN_ITEMS
+
+
+def check_pair_inputs(records, variants):
+    """Rows of the tests that record inputs have one; both sides of a pair
+    do the same work on inputs of the same size and condition count; a
+    kernel comparison sees one input, an order comparison two."""
+    for (test, _), v in variants.items():
+        if test in INPUT_TESTS:
+            check(v["pass_items"] is not None and v["input_hash"] is not None,
+                  f"Test {test} {v['label']!r}: no input record")
+    pairs = by_type(records, "pair")
+    for p in pairs:
+        a, b = variants[(p["test"], p["a"])], variants[(p["test"], p["b"])]
+        where = f"pair {p['pair']} (test {p['test']})"
+        check(a["work"] == b["work"], f"{where}: work {a['work']} vs {b['work']}")
+        for field in ("pass_items", "cond_true"):
+            if a[field] is not None and b[field] is not None:
+                check(a[field] == b[field], f"{where}: {field} {a[field]} vs {b[field]}")
+        if a["input_hash"] is None or b["input_hash"] is None:
+            continue
+        if a["kernel"] != b["kernel"]:
+            check(a["input_hash"] == b["input_hash"],
+                  f"{where}: {a['kernel']} and {b['kernel']} see different inputs")
+        elif not same_input_allowed(p["test"], a["label"], a["pass_items"]):
+            check(a["input_hash"] != b["input_hash"],
+                  f"{where}: {a['label']!r} and {b['label']!r} have the same input")
+    ok(f"{len(pairs)} pairs compare equal work and matching inputs")
+
+
+def check_bias(variants):
+    """Test 2: each row has exactly its bias's ones per pass, a periodic
+    row's word has that bias, and one bias's three orders share one count."""
+    rows = {k: v for k, v in variants.items() if k[0] == 2}
+    if not rows:
+        return
+    check(len(rows) == T2_ROWS, f"Test 2: {len(rows)} rows, want {T2_ROWS}")
+    per_bias = {}
+    for v in rows.values():
+        where = f"Test 2 {v['label']!r}"
+        check(v["cond_true"] is not None and v["pass_items"] is not None, f"{where}: no input record")
+        words = v["label"].split()
+        check(len(words) >= 2, f"{where}: unexpected label")
+        if words[0] == "Constant":
+            want = 0 if words[1] == "0" else v["pass_items"]
+            check(v["cond_true"] == want, f"{where}: cond_true {v['cond_true']}, want {want}")
+            continue
+        try:
+            num, den = (int(x) for x in words[0].split("/"))
+        except ValueError:
+            raise Failure(f"{where}: label does not start with a bias")
+        check(v["cond_true"] * den == v["pass_items"] * num,
+              f"{where}: {v['cond_true']} of {v['pass_items']} is not {num}/{den}")
+        if words[1] == "periodic":
+            word = words[2]
+            check(word.count("1") * den == len(word) * num, f"{where}: word {word} is not {num}/{den}")
+        per_bias.setdefault(words[0], set()).add(v["cond_true"])
+    for bias, counts in per_bias.items():
+        check(len(counts) == 1, f"Test 2 bias {bias}: orders differ in ones per pass {sorted(counts)}")
+    ok(f"Test 2: {len(rows)} rows have their exact bias")
+
+
 def report_sections(path):
     """Report text per test number, from each "### Test N " heading on."""
     sections = {}
@@ -245,6 +330,68 @@ def cost_line(p):
     return text
 
 
+def correlation_lines(records, variants):
+    """The lines print_correlation_used() writes for Test 6, or None when no
+    pair has miss counts."""
+    entries = []
+    counted = short_na = evaluated = 0
+    best = 0
+    for p in sorted((p for p in by_type(records, "pair") if p["test"] == 6),
+                    key=lambda p: p["pair"]):
+        a = variants[(6, p["a"])]
+        d = int(a["label"].split("=")[1].split()[0])
+        has_misses = p["valid"] > 0 and p["delta"]["misses"] is not None
+        counted += has_misses
+        if not has_misses or a["pass_items"] < D6_MIN_SAMPLE:
+            short_na += has_misses
+            entries.append(f"d={d} n/a")
+            continue
+        avoided = p["delta"]["misses"] / p["valid"]
+        pct = min(100.0, max(0.0, 100.0 * avoided / (0.5 * a["work"])))
+        entries.append(f"d={d} {pct:.0f}%")
+        evaluated += 1
+        if pct >= 90.0:
+            best = d
+    if not counted:
+        return None
+    shown = (str(best) if best else "none") if evaluated else "n/a"
+    lines = [f"**Correlation used:** {', '.join(entries)}\n\n"
+             f"**Largest d with ≥ 90%:** {shown}\n\n"]
+    if short_na:
+        lines.append(f"_n/a: fewer than {D6_MIN_SAMPLE} blocks per pass, so a predictor "
+                     f"may learn the sequences._\n")
+    return lines
+
+
+def check_correlation(records, variants, sections):
+    """Test 6's correlation lines, rebuilt from its pairs; returns how many
+    lines were compared."""
+    section = sections.get(6, "")
+    want = correlation_lines(records, variants)
+    if want is None:
+        check("**Correlation used:**" not in section,
+              "Test 6: report has a Correlation used line without miss counts")
+        return 0
+    for line in want:
+        check(line in section, f"Test 6: report lacks {line.strip()!r}")
+    if len(want) == 1:
+        check("_n/a: fewer than" not in section, "Test 6: report has an n/a note no pair needs")
+    return len(want)
+
+
+def check_threshold_note(variants, sections, test):
+    """Tests 1 and 4: every row has the same multiset, and the report states
+    its condition-true count; returns how many lines were compared."""
+    rows = [v for (t, _), v in variants.items() if t == test]
+    check(all(v["cond_true"] is not None for v in rows), f"Test {test}: a row has no cond_true")
+    check(len({(v["cond_true"], v["pass_items"]) for v in rows}) == 1,
+          f"Test {test}: rows differ in cond_true or pass_items")
+    c, n = rows[0]["cond_true"], rows[0]["pass_items"]
+    want = f"_Elements > 128: {c} of {n} per pass ({100.0 * c / n:.1f}%)._"
+    check(want in sections.get(test, ""), f"Test {test}: report lacks {want!r}")
+    return 1
+
+
 def check_report(records, variants, path):
     sections = report_sections(path)
     trials = by_type(records, "trial")
@@ -284,6 +431,11 @@ def check_report(records, variants, path):
             want = cost_line(p)
             check(want + "\n" in section, f"Test {p['test']}: report lacks {want!r}")
             lines += 1
+    for test in (1, 4):
+        if any(t["test"] == test for t in trials):
+            lines += check_threshold_note(variants, sections, test)
+    if any(t["test"] == 6 for t in trials):
+        lines += check_correlation(records, variants, sections)
     check(rows, "report check compared no table rows")
     ok(f"report matches the export: {rows} table rows, {lines} summary lines")
 
@@ -318,8 +470,12 @@ def check_kernel_counts(records, path):
 
 
 def results(records, test):
+    """A test's trial results and its variants' input hashes."""
     trials = [t for t in by_type(records, "trial") if t["test"] == test]
-    return [(t["variant"], t["result"]) for t in sorted(trials, key=lambda t: (t["variant"], t["seq"]))]
+    hashes = {v["variant"]: v.get("input_hash") for v in by_type(records, "variant")
+              if v["test"] == test}
+    return ([(t["variant"], t["result"]) for t in sorted(trials, key=lambda t: (t["variant"], t["seq"]))],
+            hashes)
 
 
 def main():
@@ -336,6 +492,8 @@ def main():
         variants = check_structure(records)
         check_trials(records)
         check_pairs(records)
+        check_pair_inputs(records, variants)
+        check_bias(variants)
         if args.report:
             check_report(records, variants, args.report)
         if args.kernel_counts:
@@ -345,8 +503,8 @@ def main():
                 continue
             check(args.test is not None, "--same-results/--different-results need --test")
             mine, theirs = results(records, args.test), results(load(other), args.test)
-            check(mine, f"no Test {args.test} trials in {args.export}")
-            check(theirs, f"no Test {args.test} trials in {other}")
+            check(mine[0], f"no Test {args.test} trials in {args.export}")
+            check(theirs[0], f"no Test {args.test} trials in {other}")
             check((mine == theirs) == same,
                   f"Test {args.test} results {'differ' if same else 'are equal'}: {mine} vs {theirs}")
             ok(f"Test {args.test} results {'equal' if same else 'differ'}")

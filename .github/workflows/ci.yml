@@ -52,6 +52,19 @@ jobs:
       - name: Build without perf support (non-Linux path)
         run: gcc $BENCH_FLAGS $WARN_FLAGS -U__linux__ -c -o /dev/null branch_bench.c
 
+      # The C kernels are the fallback on other architectures; GCC with the
+      # benchmark's flags must still keep their branches.
+      - name: Build with the C kernels
+        run: |
+          gcc $BENCH_FLAGS $WARN_FLAGS -DBRANCH_BENCH_C_KERNELS -o bb_c branch_bench.c
+          ./bb_c $SMALL_RUN -o bb_c.md --json bb_c.jsonl > bb_c.out
+          grep -q '^  Kernels: *C only' bb_c.out
+          grep -q '"kernel_backend":"c"' bb_c.jsonl
+          python3 .github/scripts/check_export.py bb_c.jsonl --report bb_c.md
+          .github/scripts/check_kernels.sh ./bb_c
+          gcc $BENCH_FLAGS $WARN_FLAGS -DBRANCH_BENCH_C_KERNELS -o "$RUNNER_TEMP/perf_test_c" .github/scripts/perf_test.c
+          "$RUNNER_TEMP/perf_test_c"
+
       - name: Run (small size)
         run: ./branch_bench $SMALL_RUN
 
@@ -86,17 +99,19 @@ jobs:
 
       # Each fixture breaks the kernels in a way an older check accepted or
       # never looked for; the check must reject each with its own message.
-      - name: Kernel check rejects a loop guard, an unrolled loop and merged leaves
+      - name: Kernel check rejects a loop guard, unrolled loops and merged or uneven leaves
         run: |
           out="$RUNNER_TEMP/check_fixture.txt"
-          for f in loop_guard unrolled merged_leaves; do
+          for f in loop_guard unrolled asm_unrolled merged_leaves uneven_leaves; do
             gcc $BENCH_FLAGS $WARN_FLAGS -o "$RUNNER_TEMP/$f" ".github/scripts/${f}_fixture.c"
             .github/scripts/check_kernels.sh "$RUNNER_TEMP/$f" > "$out" || true
             cat "$out"
             case $f in
               loop_guard)    grep -q '^FAIL Test 1/4 .*expected 1 data branch(es), found 0' "$out" ;;
-              unrolled)      grep -q '^FAIL Test 1/4 .*expected 1 data branch(es), found [2-9]' "$out" ;;
-              merged_leaves) grep -q '^FAIL Test 3 leaves: 31 distinct addresses for 32 leaves' "$out" ;;
+              unrolled|asm_unrolled)
+                             grep -q '^FAIL Test 1/4 .*expected 1 data branch(es), found [2-9]' "$out" ;;
+              merged_leaves) grep -q '^FAIL Test 3 leaves: 63 distinct addresses for 64 leaves' "$out" ;;
+              uneven_leaves) grep -q '^FAIL Test 3 leaves: 2 instruction shapes for 64 leaves' "$out" ;;
             esac
           done
 
@@ -152,8 +167,12 @@ jobs:
               fi'
 
   clang:
-    name: Clang build and static analysis
-    runs-on: ubuntu-24.04
+    name: Clang build and static analysis (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -172,22 +191,27 @@ jobs:
       - name: Run all tests (small size, --hard)
         run: ./branch_bench --hard $SMALL_RUN
 
-      # Clang makes Tests 1-2 and 6 branchless (cmov in sum_threshold, sbb in
-      # count_decisions, sbb/cmov in correlate_distance), so check_kernels.sh
-      # must reject all three. This proves the checker still detects lost
-      # branches.
-      - name: Kernel check rejects Clang's branchless Tests 1-2 and 6
+      # The asm kernels keep their branches under Clang too; only Test 6's C
+      # kernel is still branchless (sbb/cmov, csel/cset on arm64) until
+      # Stage 3 replaces it.  Its failure also proves the checker still
+      # detects lost branches.
+      - name: Clang keeps the controlled kernels' branches
         run: |
           out="$RUNNER_TEMP/check_kernels.txt"
-          if .github/scripts/check_kernels.sh ./branch_bench > "$out"; then
-            cat "$out"
-            echo "check_kernels.sh accepted a Clang build"
+          status=0
+          .github/scripts/check_kernels.sh ./branch_bench > "$out" 2>&1 || status=$?
+          cat "$out"
+          # 1 = some check failed; anything else means the script broke.
+          [ "$status" -eq 1 ]
+          for label in 'Test 1/4 sum_threshold' 'Test 2/5 count_decisions' \
+                       'Test 4 sum_branchless' 'Test 3 dispatch_indexed' 'Test 3 leaves'; do
+            grep -qx "ok   $label" "$out" || { echo "missing: ok   $label"; exit 1; }
+          done
+          grep -Eq '^FAIL Test 6 correlate_distance: (branchless instruction|fewer than three)' "$out"
+          if grep '^FAIL' "$out" | grep -qv '^FAIL Test 6 '; then
+            echo "check_kernels.sh rejected a controlled kernel in the Clang build"
             exit 1
           fi
-          cat "$out"
-          grep -q '^FAIL Test 1/4 .*data branch' "$out"
-          grep -q '^FAIL Test 2/5 .*data branch' "$out"
-          grep -q '^FAIL Test 6' "$out"
 
       - name: clang --analyze
         run: |
@@ -305,10 +329,14 @@ jobs:
           # Only some counters open.  Tests 1-2 come first: the shim fails the
           # first and third counter reads, and their four measurements absorb
           # them.  The Test 5-6 summaries need misses, and only misses.
-          FAKE_PERF_EVENTS=misses ./branch_bench_cov -t 1 -t 2 -t 5 -t 6 $SMALL_RUN -o "$dir/part.md"
+          # check_export.py must accept both: the Test 6 line with misses,
+          # its absence without.
+          FAKE_PERF_EVENTS=misses ./branch_bench_cov -t 1 -t 2 -t 5 -t 6 $SMALL_RUN -o "$dir/part.md" --json "$dir/part.jsonl"
           grep -q '^\*\*Periods at' "$dir/part.md"
           grep -q '^\*\*Correlation used' "$dir/part.md"
-          FAKE_PERF_EVENTS=branches,cycles ./branch_bench_cov -t 1 -t 2 -t 5 -t 6 $SMALL_RUN -o "$dir/part.md"
+          python3 .github/scripts/check_export.py "$dir/part.jsonl" --report "$dir/part.md"
+          FAKE_PERF_EVENTS=branches,cycles ./branch_bench_cov -t 1 -t 2 -t 5 -t 6 $SMALL_RUN -o "$dir/part.md" --json "$dir/part.jsonl"
+          python3 .github/scripts/check_export.py "$dir/part.jsonl" --report "$dir/part.md"
           if grep -q 'Periods at\|Correlation used' "$dir/part.md"; then
             echo "Test 5-6 summaries printed without the miss counter"; exit 1
           fi

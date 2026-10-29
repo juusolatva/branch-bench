@@ -11,8 +11,7 @@
 # Prints one line per hit (function, address, instruction) and exits 0 with or
 # without hits; exits non-zero if objdump fails or a kernel is missing, so an
 # empty listing always means the kernels were checked.  GCC clone suffixes
-# such as .constprop.0 are accepted; GCC folds sum_branch and sum_threshold
-# into one body under either name, so one of the two suffices.
+# such as .constprop.0 are accepted.
 # OBJDUMP overrides the objdump binary.
 set -eu
 
@@ -29,8 +28,8 @@ printf '%s\n' "$disassembly" | awk -F'\t' '
     /^[0-9a-f]+ </ {
         fn = $0; sub(/^[0-9a-f]+ /, "", fn); sub(/:$/, "", fn)
         base = fn; sub(/^</, "", base); sub(/[.>].*$/, "", base)
-        kernel = fn ~ /^<(sum_threshold|sum_branch|sum_branchless|count_decisions|dispatch_sequential|dispatch_random|correlate_distance)(\.[^>]*)?>$/
-        if (kernel) seen[base == "sum_branch" ? "sum_threshold" : base] = 1
+        kernel = fn ~ /^<(sum_threshold|sum_branchless|count_decisions|dispatch_indexed|correlate_distance)(\.[^>]*)?>$/
+        if (kernel) seen[base] = 1
         pop = ""; next
     }
     kernel && NF >= 3 {
@@ -47,7 +46,7 @@ printf '%s\n' "$disassembly" | awk -F'\t' '
         ps = s; pe = e; pop = op
     }
     END {
-        n = split("sum_threshold sum_branchless count_decisions dispatch_sequential dispatch_random correlate_distance", want, " ")
+        n = split("sum_threshold sum_branchless count_decisions dispatch_indexed correlate_distance", want, " ")
         for (i = 1; i <= n; i++)
             if (!(want[i] in seen)) {
                 printf "check_jcc.sh: kernel %s not found\n", want[i] > "/dev/stderr"

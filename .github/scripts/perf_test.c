@@ -14,6 +14,7 @@
 #undef read
 #undef ioctl
 #include <assert.h>
+#include <sys/wait.h>
 
 static u64 samples[8][3 + CTR_COUNT];
 static unsigned sample_count;
@@ -447,13 +448,6 @@ static void test5_summary(void)
     puts("ok   Test 5 summary: list, none, missing counts, n/a");
 }
 
-static u64 count_ones(const u8 *p, size_t n)
-{
-    u64 ones = 0;
-    for (size_t i = 0; i < n; i++) ones += p[i];
-    return ones;
-}
-
 /* Tests 5 and 6 feed their kernels the data their labels describe:
  * whole de Bruijn periods and the seeded random row; B a copy of A in each
  * correlated row and independently seeded in each reference row. */
@@ -750,6 +744,174 @@ static void seeds(void)
     puts("ok   per-test seeds, unbiased draws, seed parsing");
 }
 
+/* The data-branch kernels (assembly where available) on edge cases: the
+ * threshold boundary, one element, no elements and no passes. */
+static void kernels(void)
+{
+    static const u8 edge[] = { 0, 128, 129, 255, 1, 127 };
+    assert(sum_threshold(edge, sizeof edge, 1) == 129 + 255);
+    assert(sum_threshold(edge, sizeof edge, 3) == 3 * (129 + 255));
+    assert(sum_threshold(edge + 3, 1, 2) == 2 * 255);
+    assert(sum_threshold(edge + 1, 1, 5) == 0);    /* 128 is not > 128 */
+    assert(sum_threshold(edge, 0, 4) == 0);
+    assert(sum_threshold(edge, sizeof edge, 0) == 0);
+    static const u8 dec[] = { 0, 1, 1, 0, 1 };
+    assert(count_decisions(dec, sizeof dec, 1) == 3);
+    assert(count_decisions(dec, sizeof dec, 4) == 12);
+    assert(count_decisions(dec + 1, 1, 7) == 7);
+    assert(count_decisions(dec, 0, 7) == 0);
+    assert(count_decisions(dec, sizeof dec, 0) == 0);
+    assert(KERNEL_ASM == (strcmp(KERNEL_BACKEND, "c") != 0));
+}
+
+/* Tests 1 and 4: one multiset in two orders, and a reference sum that does
+ * not use the kernel's comparison loop. */
+static void threshold_inputs(void)
+{
+    static const u8 edge[] = { 0, 128, 129, 255, 255 };
+    u64 above = 0;
+    assert(threshold_reference(edge, sizeof edge, 2, &above) == 2 * (129 + 255 + 255));
+    assert(above == 3);
+    static u8 s[4096];
+    static u8 h[4096];
+    rng_state = test_seed(1, 0, 0);
+    prepare_threshold(s, h, sizeof s);
+    for (size_t i = 1; i < sizeof s; i++) assert(s[i - 1] <= s[i]);
+    u64 as = 0;
+    u64 ah = 0;
+    assert(threshold_reference(s, sizeof s, 1, &as) == threshold_reference(h, sizeof h, 1, &ah));
+    assert(as == ah);
+    assert(fnv1a64(s, sizeof s) != fnv1a64(h, sizeof h));
+    assert(sum_threshold(h, sizeof h, 3) == threshold_reference(h, sizeof h, 3, &ah));
+    sanity_failed = 0;
+    check_result("match", 5, 5);
+    assert(!sanity_failed);
+    check_result("mismatch", 5, 6);
+    assert(sanity_failed);
+    sanity_failed = 0;
+}
+
+/* Test 2: every bias pattern has exactly its word's ones and period, and
+ * the size rule accepts only whole construction periods. */
+static void bias_inputs(void)
+{
+    u8 buf[64];
+    for (int b = 0; b < T2_BIASES; b++) {
+        const size_t wl = strlen(t2_words[b]);
+        assert(T2_PERIOD % wl == 0);
+        fill_periodic(buf, sizeof buf, t2_words[b]);
+        assert(fundamental_period(buf, sizeof buf) == wl);
+        size_t ones = 0;
+        for (size_t i = 0; i < wl; i++) ones += t2_words[b][i] == '1';
+        assert(count_ones(buf, sizeof buf) == sizeof buf / wl * ones);
+    }
+    fill_clustered(buf, sizeof buf, 12);
+    assert(count_ones(buf, sizeof buf) == 12 && buf[11] == 1 && buf[12] == 0);
+    assert(fundamental_period(buf, sizeof buf) == sizeof buf);
+    assert(test2_size_ok(16) && test2_size_ok(4096));
+    assert(!test2_size_ok(8) && !test2_size_ok(1000));
+}
+
+/* Test 3: distinct nonzero leaf constants, equal target counts in every
+ * sequence, and a call-free reference that depends on the call order. */
+static void dispatch_inputs(void)
+{
+    for (unsigned a = 0; a < NUM_FUNCS; a++) {
+        assert(LEAF_CONST(a) != 0);
+        for (unsigned b = a + 1; b < NUM_FUNCS; b++) assert(LEAF_CONST(a) != LEAF_CONST(b));
+    }
+    u8 idx[256];
+    for (unsigned t = 1; t <= NUM_FUNCS; t <<= 1) {
+        fill_cyclic(idx, sizeof idx, t);
+        assert(equal_target_counts(idx, sizeof idx, t));
+        assert(dispatch_indexed(idx, sizeof idx) == dispatch_reference(idx, sizeof idx));
+    }
+    idx[0] = 1;                                   /* one call moved to another target */
+    assert(!equal_target_counts(idx, sizeof idx, NUM_FUNCS));
+    fill_cyclic(idx, sizeof idx, 4);
+    idx[0] = 4;                                   /* a target outside the count */
+    assert(!equal_target_counts(idx, sizeof idx, 4));
+    fill_cyclic(idx, sizeof idx, 4);
+    const u64 cyc = dispatch_reference(idx, sizeof idx);
+    const u8 tmp = idx[0];
+    idx[0] = idx[1];
+    idx[1] = tmp;
+    assert(dispatch_reference(idx, sizeof idx) != cyc);   /* order matters */
+    assert(test3_size_ok(64) && test3_size_ok(4096));
+    assert(!test3_size_ok(32) && !test3_size_ok(1000));
+}
+
+/* Runs fn in a child process and returns its exit status (-1 if it did not
+ * exit normally), for the internal-error paths that call exit(1). */
+static int exit_status(void (*fn)(void))
+{
+    fflush(NULL);
+    const pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        if (!freopen("/dev/null", "w", stderr)) _exit(2);
+        fn();
+        _exit(0);
+    }
+    int st = 0;
+    assert(waitpid(pid, &st, 0) == pid);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+static const u8 input_a[4] = { 1, 0, 1, 1 };
+static const u8 input_b[4] = { 1, 1, 0, 1 };
+
+static void log_input_twice_same(void)
+{
+    log_input(0, input_a, 4, 1, 3);
+    log_input(0, input_a, 4, 1, 3);
+}
+static void log_input_twice_other_buffer(void)
+{
+    log_input(0, input_a, 4, 1, 3);
+    log_input(0, input_b, 4, 1, 3);
+}
+static void log_input_no_cond_twice(void)
+{
+    log_input(0, input_a, 4, 0, 0);
+    log_input(0, input_a, 4, 0, 7);   /* cond_true is ignored without has_cond */
+}
+static void log_input_too_many_true(void)
+{
+    log_input(0, input_a, 4, 1, 5);
+}
+static void log_variant_two_labels(void)
+{
+    const Work w = { 4, "elem" };
+    log_variant(0, "first", &w);
+    log_variant(0, "second", &w);
+}
+
+/* A variant's input and row can be registered again only unchanged; a row
+ * whose result differs from its reference is marked in the report. */
+static void variant_guards(void)
+{
+    reset_log(2);
+    assert(exit_status(log_input_twice_same) == 0);
+    assert(exit_status(log_input_twice_other_buffer) == 1);
+    assert(exit_status(log_input_too_many_true) == 1);
+    assert(exit_status(log_input_no_cond_twice) == 0);
+    assert(exit_status(log_variant_two_labels) == 1);
+
+    char buf[256] = "";
+    FILE *f = tmpfile();
+    assert(f);
+    sanity_failed = 0;
+    emit_sanity_note(f);
+    assert(ftell(f) == 0);
+    sanity_failed = 1;
+    emit_sanity_note(f);
+    rewind(f);
+    assert(fgets(buf, sizeof buf, f) && strstr(buf, "**ERROR:"));
+    fclose(f);
+    sanity_failed = 0;
+}
+
 int main(void)
 {
     perf_leader = 42;
@@ -788,5 +950,10 @@ int main(void)
     pair_schedule();
     paired_cost();
     json_escaping();
+    kernels();
+    threshold_inputs();
+    bias_inputs();
+    dispatch_inputs();
+    variant_guards();
     return 0;
 }

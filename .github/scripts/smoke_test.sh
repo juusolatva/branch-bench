@@ -37,7 +37,11 @@ expect 0 $small
 expect 0 $small -n 3 -o "$dir/report.md"
 expect 0 --trials 2 --test 2 --test 4 --output "$dir/report2.md" --size 4k --reps 1
 expect 0 -t 1 -t 3 --size 1m --reps 1
-expect 0 -t 3 --size 1000 --reps 1
+# Test 3 skips when --size is not a multiple of 64 (equal calls to every
+# target).
+expect 0 -t 3 --size 1000 --reps 1 -o "$dir/skip3.md"
+grep -q 'Skipped:' "$dir/skip3.md" || { echo "FAIL skip3.md lacks the skip reason"; fail=1; }
+expect 0 -t 3 --size 64 --reps 1
 # --cpu pins the run; a CPU that cannot be used is reported, not fatal.
 # The CPUs come from this process's own affinity mask, so the cases hold in
 # a cpuset-limited container and on hosts with up to 1024 CPUs.
@@ -58,7 +62,7 @@ expect 0 -t 3 --seed 7 --size 4K --reps 1
 expect 0 -t 3 --seed 0x1f --size 4K --reps 1
 expect 0 -t 3 --seed 010 --size 4K --reps 1
 expect 0 -t 1 --size 4K --reps 1 -o "$dir/rev.md"
-grep -q '^_Benchmark revision 2._$' "$dir/rev.md" || { echo "FAIL rev.md lacks the revision line"; fail=1; }
+grep -q '^_Benchmark revision 3._$' "$dir/rev.md" || { echo "FAIL rev.md lacks the revision line"; fail=1; }
 # Test 5 is opt-in; it skips (exit 0) when --size is not a multiple of 2048,
 # while other selected tests still run.
 # Test 4 first: fake_perf.so fails the first and third counter reads, and its
@@ -71,9 +75,14 @@ grep -q 'Skipped:' "$dir/skip5.md" || { echo "FAIL skip5.md lacks the skip reaso
 # Below 64K elements Test 5 measures, but replaces its summary with a note.
 expect 0 -t 5 --size 2048 --reps 1 -o "$dir/short5.md"
 grep -q '^_n/a: --size below' "$dir/short5.md" || { echo "FAIL short5.md lacks the n/a note"; fail=1; }
-expect 0 -t 2 -t 5 --size 1000 --reps 1 -o "$dir/mixed.md"
-grep -q '^### Test 2 ' "$dir/mixed.md" || { echo "FAIL mixed.md lacks Test 2"; fail=1; }
+expect 0 -t 1 -t 5 --size 1000 --reps 1 -o "$dir/mixed.md"
+grep -q '^| Sorted |' "$dir/mixed.md" || { echo "FAIL mixed.md lacks Test 1's table"; fail=1; }
 grep -q 'Skipped:' "$dir/mixed.md" || { echo "FAIL mixed.md lacks Test 5's skip reason"; fail=1; }
+# Test 2 skips when --size is not a multiple of 16 (whole periods of every
+# bias pattern); other selected tests still run.
+expect 0 -t 2 --size 1000 --reps 1 -o "$dir/skip2.md"
+grep -q 'Skipped:' "$dir/skip2.md" || { echo "FAIL skip2.md lacks the skip reason"; fail=1; }
+expect 0 -t 2 --size 16 --reps 1
 # Test 6 is opt-in; it skips when --size < 64 or --size × --reps < 65664.
 # At 64K × 6 only d = 4 gets the 65536 blocks per pass that a "Correlation
 # used" figure needs, so with the miss counter (CI's fake_perf.so step
@@ -89,8 +98,9 @@ grep -q 'Skipped:' "$dir/skip6b.md" || { echo "FAIL skip6b.md lacks the skip rea
 expect 0 --hard $small -o "$dir/hard.md"
 grep -q '(all, with --hard)' "$dir/stdout" || { echo "FAIL --hard banner lacks its tests line"; fail=1; }
 expect 0 --hard -t 2 --size 4K --reps 1 -o "$dir/hard2.md"
-# The largest legal run fits the trial log: 37 (variant, pair) streams
-# (Test 5's random row is in two pairs) × 99 trials = 3663 records.  Large
+# The largest legal run fits the trial log: 71 (variant, pair) streams
+# (Test 2's shuffled rows and Test 5's random row are in two pairs) × 99
+# trials = 7029 records.  Large
 # enough that Test 6, the biggest user, runs.
 expect 0 --hard -n 99 --size 64K --reps 2 --json "$dir/max.jsonl"
 for f in hard.md hard2.md; do
@@ -134,6 +144,27 @@ export_ok "$dir/run.jsonl" --report "$dir/report3.md"
 # shellcheck disable=SC2086
 expect 0 --hard $small -o "$dir/hard3.md" --json "$dir/hard.jsonl"
 export_ok "$dir/hard.jsonl" --report "$dir/hard3.md"
+# A skipped Test 2 leaves a valid export of the tests that ran.
+expect 0 -t 1 -t 2 --size 1000 --reps 1 -o "$dir/skip2b.md" --json "$dir/skip2b.jsonl"
+export_ok "$dir/skip2b.jsonl" --report "$dir/skip2b.md"
+# One element per array: the kernels' smallest input, against the reference.
+expect 0 -t 1 -t 4 --size 1 --reps 1 -o "$dir/one.md" --json "$dir/one.jsonl"
+export_ok "$dir/one.jsonl" --report "$dir/one.md"
+# Test 6's "Correlation used" line is rebuilt from the export too.  At
+# 64K × 6, d = 4 has a figure and the other distances n/a (with counters).
+expect 0 -t 4 -t 6 --size 64K --reps 6 -o "$dir/t6j.md" --json "$dir/t6.jsonl"
+export_ok "$dir/t6.jsonl" --report "$dir/t6j.md"
+# The checker must notice a changed figure (none without the miss counter).
+sed 's/^\(\*\*Correlation used:\*\* d=4 \)[0-9]*%/\1101%/' "$dir/t6j.md" > "$dir/t6bad.md"
+if cmp -s "$dir/t6j.md" "$dir/t6bad.md"; then
+    echo "skip corrupted-correlation case: no miss counter"
+elif python3 "$check_export" "$dir/t6.jsonl" --report "$dir/t6bad.md" > "$dir/check.out" 2>&1; then
+    echo "FAIL check_export.py accepted a corrupted Correlation used line"; fail=1
+elif grep -q '^FAIL Test 6: report lacks' "$dir/check.out"; then
+    echo "ok   check_export.py rejects a corrupted Correlation used line"
+else
+    echo "FAIL check_export.py failed for another reason:"; cat "$dir/check.out"; fail=1
+fi
 # Selecting more tests does not change Test 3's input; --seed does.
 expect 0 -t 3 --size 4K --reps 1 --json "$dir/a.jsonl"
 expect 0 -t 1 -t 3 --size 4K --reps 1 --json "$dir/b.jsonl"
@@ -175,8 +206,10 @@ if cmp -s "$dir/report3.md" "$dir/bad.md"; then
     echo "skip corrupted-report case: no counter columns without perf counters"
 elif python3 "$check_export" "$dir/run.jsonl" --report "$dir/bad.md" > "$dir/check.out" 2>&1; then
     echo "FAIL check_export.py accepted a corrupted counter column"; fail=1
-else
+elif grep -q '^FAIL Test [0-9] .*: Cycles ' "$dir/check.out"; then
     echo "ok   check_export.py rejects a corrupted counter column"
+else
+    echo "FAIL check_export.py failed for another reason:"; cat "$dir/check.out"; fail=1
 fi
 # -o and --json must be different files, also through a hard link.
 expect 1 -t 3 --size 1K --reps 1 -o "$dir/same.out" --json "$dir/same.out"

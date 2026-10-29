@@ -6,9 +6,9 @@
  * 5-6 probe longer-range behaviour and run only with -t or --hard:
  *
  *  Test 1 — Threshold Sum       sorted vs shuffled array              (classic direct-branch demo)
- *  Test 2 — Stride Conditional  periodic 25% vs random 25% take-rate  (repeating pattern stress)
- *  Test 3 — Indirect Dispatch   sequential vs random function pointer  (indirect branch predictor)
- *  Test 4 — Branch vs Branchless sorted/random × branch/arithmetic    (misprediction cost isolation)
+ *  Test 2 — Bias and Ordering  5 biases × periodic/clustered/shuffled (bias vs sequence structure)
+ *  Test 3 — Indirect Dispatch   cyclic vs shuffled, 1–64 targets       (indirect branch predictor)
+ *  Test 4 — Branch vs Branchless sorted/shuffled × branch/arithmetic (branchless per order)
  *  Test 5 — Pattern Learnability de Bruijn periods 32..2048 vs random (pattern length, opt-in)
  *  Test 6 — Correlation Distance B copies A after d fillers vs random (correlation reach, opt-in)
  *
@@ -23,14 +23,14 @@
  *   -Wa,-mbranches-within-32B-boundaries,-malign-branch=jcc+fused+jmp+call+ret+indirect
  *
  * Note: -fno-tree-vectorize prevents SIMD rewriting that would bypass branches.
- *       -fno-if-conversion keeps if-else as actual branch instructions (not CMOV),
- *       which is required for tests 1-3, 5, 6 and Test 4's branch variant to
- *       show misprediction cost.
+ *       -fno-if-conversion keeps if-else as actual branch instructions (not CMOV)
+ *       in the C kernels with a data branch (Test 6, and the C fallback of
+ *       Tests 1, 2, 4 and 5 on architectures without the asm kernels).
  *       Test 4's branchless variant uses arithmetic masks — unaffected by these flags.
  *       clang rejects -fno-if-conversion and has no equivalent; it builds with
- *       -fno-vectorize -fno-slp-vectorize instead, but (as of clang 18-21)
- *       makes Tests 1, 2, 5, 6 and 4's branch variant branchless (CMOV, SBB),
- *       so clang timings don't show the misprediction cost.
+ *       -fno-vectorize -fno-slp-vectorize instead.  The asm kernels keep their
+ *       branches, but clang (18-22) makes Test 6's C kernel branchless, so its
+ *       clang timings don't show the misprediction cost.
  *
  * Run:
  *   ./branch_bench
@@ -66,7 +66,8 @@
 #define DEFAULT_SIZE  (1u << 22)   /* 4 194 304 elements (tests 1/2/4/5/6) or calls (test 3) */
 #define DEFAULT_REPS  64           /* passes (tests 1/2/4/5); test 6 budget  */
 #define THRESHOLD     128          /* byte comparison threshold               */
-#define NUM_FUNCS     32           /* distinct indirect call targets (test 3) */
+#define NUM_FUNCS     64           /* leaf targets, largest count (test 3)    */
+#define T3_COUNTS     7            /* target counts 1, 2, 4, ... 64 (test 3)  */
 #define NUM_TESTS     6
 #define DEFAULT_TESTS 0xFu         /* tests run without -t: 1–4 (5 and 6 are opt-in) */
 #define HARD_TESTS    0x3Fu        /* tests run with --hard: all six              */
@@ -74,8 +75,12 @@
 #define MAX_SIZE      (1UL << 30)  /* upper limit for --size                  */
 #define MAX_REPS      100000UL     /* upper limit for --reps                  */
 #define MAX_CPU       1023         /* highest CPU number for --cpu            */
-#define BENCH_REVISION 2           /* bumped whenever measurements change     */
+#define BENCH_REVISION 3           /* bumped whenever measurements change     */
 #define DEFAULT_SEED  0xdeadbeefcafe1234ULL  /* --seed default */
+
+/* Test 2: biases (each with its periodic word) and their common period */
+#define T2_BIASES      5
+#define T2_PERIOD      16
 
 /* Test 5: de Bruijn pattern orders k (periods 2^k) and the random reference */
 #define DB_MIN_ORDER   5
@@ -90,6 +95,35 @@
 #define D6_DISTS       9
 #define D6_MIN_BLOCKS  64     /* blocks per pass at d = D6_MAX_DIST */
 #define D6_MIN_SAMPLE  65536  /* blocks per pass for a "Correlation used" figure */
+
+/* ── Kernel backend ───────────────────────────────────────────────────────
+ * The data-branch kernels (sum_threshold, count_decisions) are one asm
+ * block each on x86-64 and AArch64, so no compiler can turn their branch
+ * into a conditional move or duplicate it.  Elsewhere, or when built with
+ * -DBRANCH_BENCH_C_KERNELS, they are plain C, whose branches depend on the
+ * compiler (check them with .github/scripts/check_kernels.sh). */
+#if defined(BRANCH_BENCH_C_KERNELS)
+#  define KERNEL_ASM 0
+#  define KERNEL_BACKEND "c"
+#elif defined(__x86_64__)
+#  define KERNEL_ASM 1
+#  define KERNEL_BACKEND "asm-x86_64"
+#elif defined(__aarch64__)
+#  define KERNEL_ASM 1
+#  define KERNEL_BACKEND "asm-aarch64"
+#else
+#  define KERNEL_ASM 0
+#  define KERNEL_BACKEND "c"
+#endif
+/* How the asm data branches jump: they skip the update when the source
+ * condition is false.  Unknown for C kernels. */
+#if KERNEL_ASM
+#  define ASM_TAKEN_WHEN "false"
+#else
+#  define ASM_TAKEN_WHEN NULL
+#endif
+#define BB_STR_(x) #x
+#define BB_STR(x)  BB_STR_(x)
 
 /* ── Build provenance (printed in the banner and report) ────────────────── */
 /* Clang's __VERSION__ already names the compiler; GCC's is only the number. */
@@ -519,9 +553,9 @@ typedef struct {
  * Every measured trial is kept, with its test, variant (the row index in
  * that test's rows[]), pair and run-wide order, so every reported summary
  * can be rebuilt from the trials.  Static arrays: nothing is allocated
- * while measuring.  Up to 37 variant streams × 99 trials fit (--hard -n 99).
+ * while measuring.  Up to 71 variant streams × 99 trials fit (--hard -n 99).
  * ───────────────────────────────────────────────────────────────────────── */
-#define MAX_TRIAL_RECORDS 4096
+#define MAX_TRIAL_RECORDS 8192
 #define MAX_PAIRS         64
 #define TRAIN_RUNS        1         /* untimed runs before every measured trial */
 #define COST_MIN_MISSES_PER_PAIR 1000.0
@@ -589,31 +623,87 @@ static int new_pair(int a, int b)
     return pair_count++;
 }
 
-/* What each variant's rows describe, for the export: registered by
- * emit_rows(), once per (test, variant). */
-#define MAX_VARIANTS 64
+/* What each variant's rows describe, for the export: its label and work,
+ * registered by emit_rows(), and its input, registered by log_input() at
+ * setup.  One entry per (test, variant). */
+#define MAX_VARIANTS 128
 
 typedef struct {
     int         test;
     int         variant;
-    const char *label;
+    const char *label;       /* NULL until emit_rows() registers the row */
     Work        work;
+    int         has_input;
+    u64         pass_items;  /* items per pass (elements, blocks or calls) */
+    int         has_cond;
+    u64         cond_true;   /* items per pass whose source condition holds */
+    u64         input_hash;  /* fnv1a64() of the input buffer */
 } VariantInfo;
 
 static VariantInfo variant_info[MAX_VARIANTS];
 static int         variant_count = 0;
 
-static void log_variant(int variant, const char *label, const Work *w)
+/* FNV-1a, 64-bit: identifies an input buffer in the export. */
+static u64 fnv1a64(const u8 *p, size_t n)
+{
+    u64 h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < n; i++) {
+        h ^= p[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+/* The entry for (current_test, variant), created zeroed on first use. */
+static VariantInfo *variant_entry(int variant)
 {
     for (int i = 0; i < variant_count; i++)
         if (variant_info[i].test == current_test && variant_info[i].variant == variant)
-            return;
+            return &variant_info[i];
     if (variant_count >= MAX_VARIANTS) log_full("variant table");
     VariantInfo *v = &variant_info[variant_count++];
+    memset(v, 0, sizeof *v);
     v->test = current_test;
     v->variant = variant;
+    return v;
+}
+
+static void log_variant(int variant, const char *label, const Work *w)
+{
+    VariantInfo *v = variant_entry(variant);
+    if (v->label) {
+        if (strcmp(v->label, label) || v->work.count != w->count) {
+            fprintf(stderr, "Internal error: test %d variant %d registered as two rows\n",
+                    current_test, variant);
+            exit(1);
+        }
+        return;
+    }
     v->label = label;
     v->work = *w;
+}
+
+/* Records a variant's input before it is measured: pass_items items per
+ * pass from buf, of which cond_true (when has_cond) meet the kernel's
+ * source condition.  A variant measured in two pairs logs it once, or
+ * twice with the same values. */
+static void log_input(int variant, const u8 *buf, size_t pass_items, int has_cond, u64 cond_true)
+{
+    VariantInfo *v = variant_entry(variant);
+    const u64 hash = fnv1a64(buf, pass_items);
+    if (!has_cond) cond_true = 0;
+    if (cond_true > pass_items ||
+        (v->has_input && (v->pass_items != pass_items || v->has_cond != has_cond ||
+                          v->cond_true != cond_true || v->input_hash != hash))) {
+        fprintf(stderr, "Internal error: test %d variant %d input logged twice or inconsistent\n",
+                current_test, variant);
+        exit(1);
+    }
+    v->has_input  = 1;
+    v->pass_items = pass_items;
+    v->has_cond   = has_cond;
+    v->cond_true  = cond_true;
+    v->input_hash = hash;
 }
 
 /* The reported row for a variant: its median trial by time over all its
@@ -1145,30 +1235,139 @@ static void shuffle_u8(u8 *arr, size_t n)
     }
 }
 
+/* Set when a row's result differs from its reference, or Test 5's patterns
+ * fail their check; main() then exits 1. */
+static int sanity_failed = 0;
+
+/* Compares a measured kernel result with its independently computed
+ * reference. */
+static void check_result(const char *what, u64 got, u64 want)
+{
+    if (got == want) return;
+    fprintf(stderr, "  ERROR: %s result %" PRIu64 ", reference %" PRIu64 "\n", what, got, want);
+    sanity_failed = 1;
+}
+
+/* Tests 1 and 4: one random byte array, as a sorted and a shuffled copy, so
+ * both orders hold the same multiset.  Uses the current rng_state, so each
+ * test keeps its own seed. */
+static void prepare_threshold(u8 *sorted, u8 *shuffled, size_t n)
+{
+    fill_random_bytes(sorted, n);
+    memcpy(shuffled, sorted, n);
+    qsort(sorted, n, 1, cmp_u8_asc);
+    shuffle_u8(shuffled, n);
+}
+
+/* The threshold sum over n_reps passes, from a histogram rather than the
+ * kernel's compare-per-element loop; *above gets the elements > THRESHOLD
+ * per pass. */
+static u64 threshold_reference(const u8 *arr, size_t n, unsigned n_reps, u64 *above)
+{
+    u64 count[256] = {0};
+    for (size_t i = 0; i < n; i++) count[arr[i]]++;
+    u64 sum = 0;
+    *above = 0;
+    for (unsigned v = THRESHOLD + 1; v < 256; v++) {
+        sum += (u64)v * count[v];
+        *above += count[v];
+    }
+    return sum * n_reps;
+}
+
+/* "Elements > 128: <above> of <n> per pass (<pct>%)" */
+static void threshold_note(char *buf, size_t bufsz, u64 above, size_t n)
+{
+    snprintf(buf, bufsz, "Elements > %d: %" PRIu64 " of %zu per pass (%.1f%%)",
+             THRESHOLD, above, n, 100.0 * (double)above / (double)n);
+}
+
+/* The report's copy of the note the console prints in the test heading. */
+static void emit_threshold_note(FILE *report, const char *note)
+{
+    if (report) fprintf(report, "_%s._\n\n", note);
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  *
  *  TEST 1 — Threshold Sum: Sorted vs Shuffled Array
  *
- *  Accumulates all elements > THRESHOLD.  Both arrays contain identical data,
- *  just in different orders.
+ *  Accumulates all elements > THRESHOLD.  One random byte array is copied:
+ *  one copy is sorted, the other shuffled, so both hold the same multiset
+ *  (about 127/256 of the bytes are above the threshold; the run prints the
+ *  actual count).
  *
- *  Sorted:   the branch outcome is "not-taken" for the first ~50% of the
- *            array, then "always-taken" for the rest.  The predictor finds
- *            the crossover within a few iterations and then has near-zero
- *            mispredictions.
+ *  Sorted:   the condition (arr[i] > THRESHOLD) is false up to the
+ *            crossover and true after it (the asm jump, which skips the
+ *            add, is taken before it and not after), so the predictor is
+ *            wrong only around the crossover.
  *
- *  Shuffled: each element's outcome is independent and ~50/50.  The predictor
- *            can do no better than chance, yielding ~50% misprediction rate.
+ *  Shuffled: each element's outcome is effectively random, so a predictor
+ *            cannot learn it.
  *
  * ═══════════════════════════════════════════════════════════════════════════ */
+/* Where KERNEL_ASM is set, the whole function body is one asm block: the
+ * n == 0 / n_reps == 0 exits, the pass loop at 1: and the element loop at
+ * 2: (a C guard would let Clang add setcc code around it).  The data
+ * branch (jbe / b.ls) skips the add unless arr[i] > THRESHOLD. */
 __attribute__((noinline))
 static u64 sum_threshold(const u8 *arr, size_t n, unsigned n_reps)
 {
     u64 acc = 0;
+#if KERNEL_ASM
+    const u8 *p;
+    u64 v;
+    unsigned r = n_reps;
+#  if defined(__x86_64__)
+    __asm__ __volatile__(
+        "test %[n], %[n]\n\t"
+        "jz 4f\n\t"
+        "test %k[r], %k[r]\n\t"
+        "jz 4f\n"
+        "1:\n\t"
+        "mov %[arr], %[p]\n"
+        "2:\n\t"
+        "movzbl (%[p]), %k[v]\n\t"
+        "cmp $" BB_STR(THRESHOLD) ", %k[v]\n\t"
+        "jbe 3f\n\t"                 /* <── THE branch; skips: ASM_TAKEN_WHEN */
+        "add %[v], %[acc]\n"
+        "3:\n\t"
+        "inc %[p]\n\t"
+        "cmp %[end], %[p]\n\t"
+        "jne 2b\n\t"
+        "dec %k[r]\n\t"
+        "jnz 1b\n"
+        "4:"
+        : [acc] "+r"(acc), [p] "=&r"(p), [v] "=&r"(v), [r] "+r"(r)
+        : [arr] "r"(arr), [end] "r"(arr + n), [n] "r"(n)
+        : "cc", "memory");
+#  else
+    __asm__ __volatile__(
+        "cbz %[n], 4f\n\t"
+        "cbz %w[r], 4f\n"
+        "1:\n\t"
+        "mov %[p], %[arr]\n"
+        "2:\n\t"
+        "ldrb %w[v], [%[p]], #1\n\t"
+        "cmp %w[v], #" BB_STR(THRESHOLD) "\n\t"
+        "b.ls 3f\n\t"                /* <── THE branch being predicted */
+        "add %[acc], %[acc], %[v]\n"
+        "3:\n\t"
+        "cmp %[p], %[end]\n\t"
+        "b.ne 2b\n\t"
+        "subs %w[r], %w[r], #1\n\t"
+        "b.ne 1b\n"
+        "4:"
+        : [acc] "+r"(acc), [p] "=&r"(p), [v] "=&r"(v), [r] "+r"(r)
+        : [arr] "r"(arr), [end] "r"(arr + n), [n] "r"(n)
+        : "cc", "memory");
+#  endif
+#else
     for (unsigned rep = 0; rep < n_reps; rep++)
         for (size_t i = 0; i < n; i++)
             if (arr[i] > THRESHOLD)   /* <── THE branch being predicted */
                 acc += arr[i];
+#endif
     return acc;
 }
 
@@ -1180,127 +1379,326 @@ static void run_test1(FILE *report)
     u8 *sorted   = malloc(len);
     u8 *shuffled = malloc(len);
     if (!sorted || !shuffled) { perror("malloc"); exit(1); }
-
-    /* Fill with uniform random bytes, then sort one copy */
-    fill_random_bytes(sorted, len);
-    memcpy(shuffled, sorted, len);
-    qsort(sorted, len, 1, cmp_u8_asc);
-    shuffle_u8(shuffled, len);
+    prepare_threshold(sorted, shuffled, len);
+    u64 above = 0;
+    const u64 want = threshold_reference(sorted, len, reps, &above);
+    char note[96];
+    threshold_note(note, sizeof note, above, len);
 
     printf("TEST 1 — Threshold Sum  (sorted vs shuffled array, %zu×%u reps)\n",
            len, reps);
-    printf("  Counts/sums elements > %d.  Identical data, different order.\n\n",
-           THRESHOLD);
+    printf("  Counts/sums elements > %d.  Identical data, different order.\n", THRESHOLD);
+    printf("  %s\n\n", note);
 
+    log_input(0, sorted, len, 1, above);
+    log_input(1, shuffled, len, 1, above);
     Result rs = {0};
     Result rr = {0};
     int pair;
     MEASURE_PAIR(rs, 0, sum_threshold(sorted, len, reps),
                  rr, 1, sum_threshold(shuffled, len, reps), pair);
 
-    anti_dce_sink(rs.result + rr.result);
-
     free(sorted); free(shuffled);
+    check_result("Test 1 sorted", rs.result, want);
+    check_result("Test 1 shuffled", rr.result, want);
 
     const Work work = { (u64)len * reps, "elem" };
     const ReportRow rows[] = {
-        { "Sorted   (predictable, ~0% misses)",    rs, NULL },
-        { "Shuffled (unpredictable, ~50% misses)", rr, NULL },
+        { "Sorted",   rs, NULL },
+        { "Shuffled", rr, NULL },
     };
     emit_pair_summary(report, "Test 1 — Threshold Sum",
-                      "Sorted vs shuffled array, same direct branch. Identical data, different order.",
+                      "Sorted vs shuffled copies of one random byte array, same branch kernel.",
                       rows, &work, pair);
+    emit_threshold_note(report, note);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *
- *  TEST 2 — Stride Conditional: Periodic vs Random Same-Rate Pattern
+ *  TEST 2 — Bias and Ordering: periodic vs clustered vs shuffled
  *
- *  Counts how many array elements pass a condition.  Both variants have the
- *  same ~25% branch-taken rate, but one is perfectly periodic and the other
- *  is random.
+ *  Counts the ones in a 0/1 array.  For each bias (1/16, 1/4, 1/2, 3/4,
+ *  15/16 ones) the three arrays hold exactly the same number of ones, in
+ *  three orders:
  *
- *  Periodic ("every 4th"):  the predictor learns the T-N-N-N-T-N-N-N cycle
- *                           within the first few passes → nearly zero misses.
+ *  Periodic:   a short word repeated (e.g. 1000 for 1/4).
+ *  Clustered:  all the ones first, then all the zeros.
+ *  Shuffled:   the periodic array, randomly permuted.
  *
- *  Random 25%:              a lookup table of pre-randomised decisions
- *                           (generated offline so RNG overhead is excluded).
- *                           Same take-rate but no exploitable pattern.
+ *  Constant-0 and constant-1 arrays are controls.  Every row runs the same
+ *  branch site, so within a bias only the order differs.  The results show
+ *  how this kernel's branch responds to bias and order; they say nothing
+ *  general about a predictor's type.
  *
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+/* Same loop frame as sum_threshold; the data branch (je / cbz) skips the
+ * increment when decisions[i] is 0. */
 __attribute__((noinline))
 static u64 count_decisions(const u8 *decisions, size_t n, unsigned n_reps)
 {
     u64 acc = 0;
+#if KERNEL_ASM
+    const u8 *p;
+    unsigned r = n_reps;
+#  if defined(__x86_64__)
+    __asm__ __volatile__(
+        "test %[n], %[n]\n\t"
+        "jz 4f\n\t"
+        "test %k[r], %k[r]\n\t"
+        "jz 4f\n"
+        "1:\n\t"
+        "mov %[arr], %[p]\n"
+        "2:\n\t"
+        "cmpb $0, (%[p])\n\t"
+        "je 3f\n\t"                  /* branch outcome determined by table */
+        "inc %[acc]\n"
+        "3:\n\t"
+        "inc %[p]\n\t"
+        "cmp %[end], %[p]\n\t"
+        "jne 2b\n\t"
+        "dec %k[r]\n\t"
+        "jnz 1b\n"
+        "4:"
+        : [acc] "+r"(acc), [p] "=&r"(p), [r] "+r"(r)
+        : [arr] "r"(decisions), [end] "r"(decisions + n), [n] "r"(n)
+        : "cc", "memory");
+#  else
+    u64 v;
+    __asm__ __volatile__(
+        "cbz %[n], 4f\n\t"
+        "cbz %w[r], 4f\n"
+        "1:\n\t"
+        "mov %[p], %[arr]\n"
+        "2:\n\t"
+        "ldrb %w[v], [%[p]], #1\n\t"
+        "cbz %w[v], 3f\n\t"          /* branch outcome determined by table */
+        "add %[acc], %[acc], #1\n"
+        "3:\n\t"
+        "cmp %[p], %[end]\n\t"
+        "b.ne 2b\n\t"
+        "subs %w[r], %w[r], #1\n\t"
+        "b.ne 1b\n"
+        "4:"
+        : [acc] "+r"(acc), [p] "=&r"(p), [v] "=&r"(v), [r] "+r"(r)
+        : [arr] "r"(decisions), [end] "r"(decisions + n), [n] "r"(n)
+        : "cc", "memory");
+#  endif
+#else
     for (unsigned rep = 0; rep < n_reps; rep++)
         for (size_t i = 0; i < n; i++)
             if (decisions[i])   /* branch outcome determined by table */
                 acc++;
+#endif
     return acc;
+}
+
+#define T2_TITLE "Test 2 — Bias and Ordering"
+#define T2_DESC  "Same number of ones per bias in periodic, clustered and shuffled order, plus constant controls; one branch site."
+#define T2_ROWS  (3 * T2_BIASES + 2)
+
+/* Each bias's periodic word; every length divides T2_PERIOD. */
+static const char *const t2_words[] = {
+    "1000000000000000", "1000", "10", "1110", "1111111111111110",
+};
+CHECK_LEN(t2_words_len_check, t2_words, T2_BIASES);
+
+/* Row labels: bias b's periodic, clustered and shuffled rows are 3b, 3b+1
+ * and 3b+2, then the two controls.  A bias row's first word is its bias
+ * (check_export.py reads it). */
+static const char *const t2_labels[] = {
+    "1/16  periodic 1000000000000000", "1/16  clustered", "1/16  shuffled",
+    "1/4   periodic 1000",             "1/4   clustered", "1/4   shuffled",
+    "1/2   periodic 10",               "1/2   clustered", "1/2   shuffled",
+    "3/4   periodic 1110",             "3/4   clustered", "3/4   shuffled",
+    "15/16 periodic 1111111111111110", "15/16 clustered", "15/16 shuffled",
+    "Constant 0", "Constant 1",
+};
+CHECK_LEN(t2_labels_len_check, t2_labels, T2_ROWS);
+
+static const char *const t2_ratio_periodic[] = {
+    "1/16 shuffled vs periodic", "1/4 shuffled vs periodic", "1/2 shuffled vs periodic",
+    "3/4 shuffled vs periodic", "15/16 shuffled vs periodic",
+};
+static const char *const t2_ratio_clustered[] = {
+    "1/16 shuffled vs clustered", "1/4 shuffled vs clustered", "1/2 shuffled vs clustered",
+    "3/4 shuffled vs clustered", "15/16 shuffled vs clustered",
+};
+static const char *const t2_prefix_periodic[] = {
+    "  → 1/16  shuffled vs periodic:  ", "  → 1/4   shuffled vs periodic:  ",
+    "  → 1/2   shuffled vs periodic:  ", "  → 3/4   shuffled vs periodic:  ",
+    "  → 15/16 shuffled vs periodic:  ",
+};
+static const char *const t2_prefix_clustered[] = {
+    "  → 1/16  shuffled vs clustered: ", "  → 1/4   shuffled vs clustered: ",
+    "  → 1/2   shuffled vs clustered: ", "  → 3/4   shuffled vs clustered: ",
+    "  → 15/16 shuffled vs clustered: ",
+};
+CHECK_LEN(t2_ratio_periodic_len_check, t2_ratio_periodic, T2_BIASES);
+CHECK_LEN(t2_ratio_clustered_len_check, t2_ratio_clustered, T2_BIASES);
+CHECK_LEN(t2_prefix_periodic_len_check, t2_prefix_periodic, T2_BIASES);
+CHECK_LEN(t2_prefix_clustered_len_check, t2_prefix_clustered, T2_BIASES);
+
+/* Rows with their labels, no result yet and the test's Work. */
+static void init_rows(ReportRow *rows, const char *const *labels, int n)
+{
+    const Result none = {0};
+    for (int i = 0; i < n; i++) {
+        rows[i].label = labels[i];
+        rows[i].r     = none;
+        rows[i].work  = NULL;
+    }
+}
+
+static void fill_periodic(u8 *buf, size_t n, const char *word)
+{
+    const size_t wl = strlen(word);
+    for (size_t i = 0; i < n; i++)
+        buf[i] = word[i % wl] == '1';
+}
+
+/* `ones` ones, then zeros. */
+static void fill_clustered(u8 *buf, size_t n, size_t ones)
+{
+    memset(buf, 1, ones);
+    memset(buf + ones, 0, n - ones);
+}
+
+static size_t count_ones(const u8 *buf, size_t n)
+{
+    size_t ones = 0;
+    for (size_t i = 0; i < n; i++) ones += buf[i] != 0;
+    return ones;
+}
+
+/* The smallest p (≤ T2_PERIOD, dividing n) with buf[i] == buf[i % p]
+ * everywhere, else n. */
+static size_t fundamental_period(const u8 *buf, size_t n)
+{
+    for (size_t p = 1; p <= T2_PERIOD && p < n; p++) {
+        if (n % p) continue;
+        size_t i = p;
+        while (i < n && buf[i] == buf[i % p]) i++;
+        if (i == n) return p;
+    }
+    return n;
+}
+
+static int test2_size_ok(size_t len)
+{
+    return len >= T2_PERIOD && len % T2_PERIOD == 0;
+}
+
+/* Builds bias b's three orders in bufs[] (periodic, clustered, shuffled),
+ * checks that they hold its exact number of ones (and the periodic one its
+ * word's period), and measures periodic and clustered each paired with
+ * shuffled. */
+static void measure_bias(int b, u8 *const bufs[3], size_t len,
+                         ReportRow rows[T2_ROWS], int *pair_p, int *pair_c)
+{
+    u8 *periodic  = bufs[0];
+    u8 *clustered = bufs[1];
+    u8 *shuffled  = bufs[2];
+    const char *word = t2_words[b];
+    const size_t wl = strlen(word);
+    if (!wl || T2_PERIOD % wl) {
+        fprintf(stderr, "Internal error: Test 2 word %s does not divide %d\n", word, T2_PERIOD);
+        exit(1);
+    }
+    size_t word_ones = 0;
+    for (size_t i = 0; i < wl; i++) word_ones += word[i] == '1';
+    const size_t want_ones = len / wl * word_ones;
+    fill_periodic(periodic, len, word);
+    fill_clustered(clustered, len, want_ones);
+    memcpy(shuffled, periodic, len);
+    rng_state = test_seed(2, (unsigned)b + 1, 0);
+    shuffle_u8(shuffled, len);
+    if (fundamental_period(periodic, len) != wl || count_ones(periodic, len) != want_ones ||
+        count_ones(clustered, len) != want_ones || count_ones(shuffled, len) != want_ones) {
+        fprintf(stderr, "Internal error: Test 2 input check failed for word %s\n", word);
+        exit(1);
+    }
+    const int v = 3 * b;
+    log_input(v, periodic, len, 1, want_ones);
+    log_input(v + 1, clustered, len, 1, want_ones);
+    log_input(v + 2, shuffled, len, 1, want_ones);
+    MEASURE_PAIR(rows[v].r, v, count_decisions(periodic, len, reps),
+                 rows[v + 2].r, v + 2, count_decisions(shuffled, len, reps), *pair_p);
+    MEASURE_PAIR(rows[v + 1].r, v + 1, count_decisions(clustered, len, reps),
+                 rows[v + 2].r, v + 2, count_decisions(shuffled, len, reps), *pair_c);
+    const u64 want = (u64)want_ones * reps;
+    for (int k = 0; k < 3; k++)
+        check_result(rows[v + k].label, rows[v + k].r.result, want);
+}
+
+/* A constant-0 or constant-1 control row, measured alone. */
+static void measure_constant(u8 *buf, size_t len, int one, ReportRow rows[T2_ROWS])
+{
+    const int v = 3 * T2_BIASES + one;
+    const u64 ones = one ? (u64)len : 0;
+    memset(buf, one, len);
+    log_input(v, buf, len, 1, ones);
+    MEASURE(rows[v].r, v, count_decisions(buf, len, reps));
+    check_result(rows[v].label, rows[v].r.result, ones * reps);
 }
 
 static void run_test2(FILE *report)
 {
     seed_test(2);
     const size_t len = size;
-    /* Pre-generated branch decision arrays (avoids RNG in hot loop) */
-    u8 *decisions_periodic = malloc(len);  /* 1 at every 4th position        */
-    u8 *decisions_random   = malloc(len);  /* 1 with 25% probability, random */
-    if (!decisions_periodic || !decisions_random) { perror("malloc"); exit(1); }
-
-    for (size_t i = 0; i < len; i++) {
-        decisions_periodic[i] = ((i & 3) == 0) ? 1 : 0;
-        decisions_random[i] = rng_below(4) == 0 ? 1 : 0;
+    printf("TEST 2 — Bias and Ordering  (%d biases × periodic/clustered/shuffled, %zu×%u reps)\n",
+           T2_BIASES, len, reps);
+    printf("  %s\n\n", T2_DESC);
+    if (!test2_size_ok(len)) {
+        emit_skip(report, T2_TITLE,
+                  "Test 2 needs --size to be a multiple of 16 (whole periods of every bias pattern).");
+        return;
     }
+    u8 *bufs[3] = { malloc(len), malloc(len), malloc(len) };
+    if (!bufs[0] || !bufs[1] || !bufs[2]) { perror("malloc"); exit(1); }
 
-    printf("TEST 2 — Stride Conditional  (periodic vs random 25%%, %zu×%u reps)\n",
-           len, reps);
-    printf("  Both arrays have ~25%% ones; only the pattern differs.\n\n");
-
-    Result rp = {0};
-    Result rr = {0};
-    int pair;
-    MEASURE_PAIR(rp, 0, count_decisions(decisions_periodic, len, reps),
-                 rr, 1, count_decisions(decisions_random, len, reps), pair);
-
-    anti_dce_sink(rp.result + rr.result);
-
-    free(decisions_periodic);
-    free(decisions_random);
+    ReportRow rows[T2_ROWS];
+    init_rows(rows, t2_labels, T2_ROWS);
+    int pair_p[T2_BIASES];
+    int pair_c[T2_BIASES];
+    for (int b = 0; b < T2_BIASES; b++)
+        measure_bias(b, bufs, len, rows, &pair_p[b], &pair_c[b]);
+    measure_constant(bufs[0], len, 0, rows);
+    measure_constant(bufs[0], len, 1, rows);
+    for (int i = 0; i < 3; i++) free(bufs[i]);
 
     const Work work = { (u64)len * reps, "elem" };
-    const ReportRow rows[] = {
-        { "Periodic (every 4th — learnable)",   rp, NULL },
-        { "Random   (same rate — unlearnable)", rr, NULL },
-    };
-    emit_pair_summary(report, "Test 2 — Stride Conditional",
-                      "Both arrays have ~25% ones; only the pattern differs.",
-                      rows, &work, pair);
+    emit_rows(report, T2_TITLE, T2_DESC, rows, T2_ROWS, &work);
+    printf("\n");
+    for (int b = 0; b < T2_BIASES; b++) {
+        emit_pair_ratio(report, t2_prefix_periodic[b], t2_ratio_periodic[b], pair_p[b], "");
+        emit_pair_ratio(report, t2_prefix_clustered[b], t2_ratio_clustered[b], pair_c[b], "");
+    }
+    print_pair_cost(report, pair_p[2]);   /* 1/2: shuffled vs periodic */
+    printf("\n");
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *
- *  TEST 3 — Indirect Branch Dispatch: Sequential vs Random  (indirect predictor)
+ *  TEST 3 — Indirect Branch Dispatch: cyclic vs shuffled, 1–64 targets
  *
- *  Calls one of NUM_FUNCS trivial leaf functions via a function-pointer table.
- *  The CPU's indirect-branch predictor tries to guess the *target address* of
- *  each indirect call, not just taken/not-taken.  A plain Branch Target
- *  Buffer (BTB) only remembers the last target of each branch, which is
- *  wrong on every call here, so any learning comes from a predictor that
- *  also uses branch history.
+ *  dispatch_indexed() loads a precomputed target index per call and calls
+ *  that leaf function through one indirect call site.  The CPU's indirect
+ *  predictor must guess the target address.  For each target count T (1, 2,
+ *  4, ... 64) two index sequences with exactly the same number of calls to
+ *  every target are compared:
  *
- *  Sequential (i % NUM_FUNCS):  a repeating cycle of 32 targets.  History-
- *                                based indirect predictors (e.g. Haswell and
- *                                newer) learn it → almost no misses; older
- *                                cores (e.g. Ivy Bridge, Cortex-A72) miss
- *                                ~28 of every 32 calls.
+ *  Cyclic:    0, 1, ..., T-1, 0, 1, ...  For T >= 2 a plain Branch Target
+ *             Buffer only remembers the last target, so learning the cycle
+ *             takes a predictor that uses branch history.  T = 1 is the
+ *             single-target control.
  *
- *  Random:                      the next target is drawn from a pre-shuffled
- *                               array of random indices → nothing to learn
- *                               → right only by chance, ~1 call in 32.
+ *  Shuffled:  the cyclic sequence, randomly permuted: nothing to learn
+ *             beyond the target frequencies.
  *
- *  This mirrors stress-ng's --branch and --icache stressors.
+ *  Both rows of a pair run the same code on the same table; only the order
+ *  differs.  The leaves have identical instruction shapes (check_kernels.sh
+ *  checks this), so every call does the same work.
  *
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -1311,14 +1709,25 @@ typedef u64 (*leaf_fn_t)(u64);
     F( 0) F( 1) F( 2) F( 3) F( 4) F( 5) F( 6) F( 7) \
     F( 8) F( 9) F(10) F(11) F(12) F(13) F(14) F(15) \
     F(16) F(17) F(18) F(19) F(20) F(21) F(22) F(23) \
-    F(24) F(25) F(26) F(27) F(28) F(29) F(30) F(31)
+    F(24) F(25) F(26) F(27) F(28) F(29) F(30) F(31) \
+    F(32) F(33) F(34) F(35) F(36) F(37) F(38) F(39) \
+    F(40) F(41) F(42) F(43) F(44) F(45) F(46) F(47) \
+    F(48) F(49) F(50) F(51) F(52) F(53) F(54) F(55) \
+    F(56) F(57) F(58) F(59) F(60) F(61) F(62) F(63)
 
-/* Each function does one unique arithmetic op so it can't be merged by the
- * linker's identical-code folding (ICF). The constant is a unique Weyl-
- * sequence step derived from the golden ratio. */
+/* Leaf n's constant: a Weyl-sequence step, distinct and nonzero, with every
+ * 16-bit chunk in 1..0x7fff, so each constant needs the same instructions
+ * (x86-64 movabs; AArch64 mov + three movk) and every leaf has one shape.
+ * Distinct constants also keep identical code folding (ICF) from merging
+ * the leaves. */
+#define LEAF_CONST(n) \
+    ((((u64)(n) + 1) * 0x9e3779b97f4a7c15ULL & 0x7ffe7ffe7ffe7ffeULL) | 0x0001000100010001ULL)
+
+/* Rotate, then xor: order-dependent, so a call to the wrong target or in
+ * the wrong order changes the result. */
 #define DEF_LEAF(n) \
     __attribute__((noinline)) \
-    static u64 leaf_##n(u64 x) { return x ^ ((u64)(n) * 0x9e3779b97f4a7c15ULL); }
+    static u64 leaf_##n(u64 x) { return ((x << 1) | (x >> 63)) ^ LEAF_CONST(n); }
 
 FOR_EACH_LEAF(DEF_LEAF)
 
@@ -1326,16 +1735,7 @@ FOR_EACH_LEAF(DEF_LEAF)
 static leaf_fn_t leaf_table[NUM_FUNCS] = { FOR_EACH_LEAF(PTR_LEAF) };
 
 __attribute__((noinline))
-static u64 dispatch_sequential(size_t n)
-{
-    u64 acc = 0;
-    for (size_t i = 0; i < n; i++)
-        acc = leaf_table[i % NUM_FUNCS](acc);
-    return acc;
-}
-
-__attribute__((noinline))
-static u64 dispatch_random(const u8 *idx, size_t n)
+static u64 dispatch_indexed(const u8 *idx, size_t n)
 {
     u64 acc = 0;
     for (size_t i = 0; i < n; i++)
@@ -1343,86 +1743,150 @@ static u64 dispatch_random(const u8 *idx, size_t n)
     return acc;
 }
 
+/* dispatch_indexed()'s result without the calls. */
+static u64 dispatch_reference(const u8 *idx, size_t n)
+{
+    u64 acc = 0;
+    for (size_t i = 0; i < n; i++)
+        acc = ((acc << 1) | (acc >> 63)) ^ LEAF_CONST(idx[i]);
+    return acc;
+}
+
+static void fill_cyclic(u8 *idx, size_t n, unsigned targets)
+{
+    for (size_t i = 0; i < n; i++)
+        idx[i] = (u8)(i % targets);
+}
+
+/* 1 iff every index is below targets and each target gets n / targets
+ * calls. */
+static int equal_target_counts(const u8 *idx, size_t n, unsigned targets)
+{
+    size_t count[NUM_FUNCS] = {0};
+    for (size_t i = 0; i < n; i++) {
+        if (idx[i] >= targets) return 0;
+        count[idx[i]]++;
+    }
+    for (unsigned t = 0; t < targets; t++)
+        if (count[t] != n / targets) return 0;
+    return 1;
+}
+
+static int test3_size_ok(size_t len)
+{
+    return len >= NUM_FUNCS && len % NUM_FUNCS == 0;
+}
+
+#define T3_TITLE "Test 3 — Indirect Dispatch"
+#define T3_DESC  "One indirect call site over 1–64 leaf targets; cyclic vs shuffled index sequences with equal target counts."
+
+static const char *const t3_labels[] = {
+    "T= 1 cyclic", "T= 1 shuffled", "T= 2 cyclic", "T= 2 shuffled",
+    "T= 4 cyclic", "T= 4 shuffled", "T= 8 cyclic", "T= 8 shuffled",
+    "T=16 cyclic", "T=16 shuffled", "T=32 cyclic", "T=32 shuffled",
+    "T=64 cyclic", "T=64 shuffled",
+};
+CHECK_LEN(t3_labels_len_check, t3_labels, 2 * T3_COUNTS);
+static const char *const t3_ratio[] = {
+    "T=1 shuffled vs cyclic", "T=2 shuffled vs cyclic", "T=4 shuffled vs cyclic",
+    "T=8 shuffled vs cyclic", "T=16 shuffled vs cyclic", "T=32 shuffled vs cyclic",
+    "T=64 shuffled vs cyclic",
+};
+static const char *const t3_prefix[] = {
+    "  → T= 1 shuffled vs cyclic: ", "  → T= 2 shuffled vs cyclic: ",
+    "  → T= 4 shuffled vs cyclic: ", "  → T= 8 shuffled vs cyclic: ",
+    "  → T=16 shuffled vs cyclic: ", "  → T=32 shuffled vs cyclic: ",
+    "  → T=64 shuffled vs cyclic: ",
+};
+CHECK_LEN(t3_ratio_len_check, t3_ratio, T3_COUNTS);
+CHECK_LEN(t3_prefix_len_check, t3_prefix, T3_COUNTS);
+/* The largest target count is NUM_FUNCS: T = 1 << (T3_COUNTS - 1). */
+typedef char t3_counts_check[(1u << (T3_COUNTS - 1)) == NUM_FUNCS ? 1 : -1];
+
+/* Builds target count i's two sequences, checks their target counts and
+ * measures them as one pair. */
+static void measure_targets(int i, u8 *cyclic, u8 *shuffled, size_t len,
+                            ReportRow rows[2 * T3_COUNTS], int *pair)
+{
+    const unsigned targets = 1u << i;
+    fill_cyclic(cyclic, len, targets);
+    memcpy(shuffled, cyclic, len);
+    rng_state = test_seed(3, targets, 0);
+    shuffle_u8(shuffled, len);
+    if (!equal_target_counts(cyclic, len, targets) || !equal_target_counts(shuffled, len, targets)) {
+        fprintf(stderr, "Internal error: Test 3 input check failed for %u targets\n", targets);
+        exit(1);
+    }
+    log_input(2 * i, cyclic, len, 0, 0);
+    log_input(2 * i + 1, shuffled, len, 0, 0);
+    MEASURE_PAIR(rows[2 * i].r, 2 * i, dispatch_indexed(cyclic, len),
+                 rows[2 * i + 1].r, 2 * i + 1, dispatch_indexed(shuffled, len), *pair);
+    check_result(rows[2 * i].label, rows[2 * i].r.result, dispatch_reference(cyclic, len));
+    check_result(rows[2 * i + 1].label, rows[2 * i + 1].r.result,
+                 dispatch_reference(shuffled, len));
+}
+
 static void run_test3(FILE *report)
 {
     seed_test(3);
     const size_t len = size;
-    /* Pre-built random index sequence (uint8_t → 1 byte/call → cache-friendly) */
-    u8 *dispatch_indices = malloc(len);
-    if (!dispatch_indices) { perror("malloc"); exit(1); }
-    for (size_t i = 0; i < len; i++)
-        dispatch_indices[i] = (u8)rng_below(NUM_FUNCS);
-
     if (len % (1u << 20) == 0)
-        printf("TEST 3 — Indirect Dispatch  (%u targets, %zuM calls)\n",
+        printf("TEST 3 — Indirect Dispatch  (1–%u targets, cyclic vs shuffled, %zuM calls)\n",
                NUM_FUNCS, len >> 20);
     else
-        printf("TEST 3 — Indirect Dispatch  (%u targets, %zu calls)\n",
+        printf("TEST 3 — Indirect Dispatch  (1–%u targets, cyclic vs shuffled, %zu calls)\n",
                NUM_FUNCS, len);
     printf("  Calls leaf functions via pointer. The indirect predictor must guess the target address.\n\n");
+    if (!test3_size_ok(len)) {
+        emit_skip(report, T3_TITLE,
+                  "Test 3 needs --size to be a multiple of 64 (equal calls to every target).");
+        return;
+    }
+    u8 *cyclic   = malloc(len);
+    u8 *shuffled = malloc(len);
+    if (!cyclic || !shuffled) { perror("malloc"); exit(1); }
 
-    Result rs = {0};
-    Result rr = {0};
-    int pair;
-    MEASURE_PAIR(rs, 0, dispatch_sequential(len),
-                 rr, 1, dispatch_random(dispatch_indices, len), pair);
-
-    anti_dce_sink(rs.result + rr.result);
-
-    free(dispatch_indices);
+    ReportRow rows[2 * T3_COUNTS];
+    init_rows(rows, t3_labels, 2 * T3_COUNTS);
+    int pairs[T3_COUNTS];
+    for (int i = 0; i < T3_COUNTS; i++)
+        measure_targets(i, cyclic, shuffled, len, rows, &pairs[i]);
+    free(cyclic);
+    free(shuffled);
 
     const Work work = { len, "call" };
-    const ReportRow rows[] = {
-        { "Sequential i%32 (learnable cycle)", rs, NULL },
-        { "Random index (unlearnable)",        rr, NULL },
-    };
-    emit_pair_summary(report, "Test 3 — Indirect Dispatch",
-                      "32 targets, function-pointer call. The indirect predictor must guess the target address.",
-                      rows, &work, pair);
+    emit_rows(report, T3_TITLE, T3_DESC, rows, 2 * T3_COUNTS, &work);
+    printf("\n");
+    for (int i = 0; i < T3_COUNTS; i++)
+        emit_pair_ratio(report, t3_prefix[i], t3_ratio[i], pairs[i], "");
+    print_pair_cost(report, pairs[T3_COUNTS - 1]);   /* 64 targets */
+    printf("\n");
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *
- *  TEST 4 — Branch vs Branchless Computation  (misprediction cost isolation)
+ *  TEST 4 — Branch vs Branchless Computation
  *
- *  Both variants compute the same result: sum of elements > THRESHOLD.
- *  Tested on sorted data (predictable) and random data (unpredictable).
+ *  Both kernels compute the same result: the sum of elements > THRESHOLD,
+ *  on a sorted and a shuffled copy of one random byte array (as in Test 1,
+ *  with Test 4's own seed).
  *
- *  Branch version:
- *      if (arr[i] > T) acc += arr[i];
- *    The compiler emits a conditional jump.  On random data this mispredicts
- *    ~50% of the time.
+ *  Branch version:     sum_threshold(), Test 1's kernel: one conditional
+ *                      jump per element.
  *
  *  Branchless version (arithmetic mask):
  *      mask = 0 - (u64)(arr[i] > T);   → 0 or 0xFFFF...FFFF
  *      acc += arr[i] & mask;
- *    No conditional jump at all — the comparison result is a 0/1 integer
- *    that is sign-extended into a bitmask.  Performance is the same regardless
- *    of data distribution.
+ *    No data-dependent jump; the compiler may use setcc or a conditional
+ *    select for the comparison.
  *
- *  Expected pattern:
- *      Sorted   + branch    ≈ Sorted   + branchless  (few misses anyway)
- *      Random   + branch    >> Random  + branchless  (misprediction penalty)
- *
- *  This directly quantifies the penalty per misprediction and shows why
- *  modern compilers emit CMOV/branchless code for data-independent conditions.
+ *  Three paired comparisons: the branch kernel on shuffled vs sorted (its
+ *  effective cost per miss: same instructions, different predictability),
+ *  and branchless vs branch for each order.  Branch and branchless run
+ *  different instructions, so their time difference is not a pure
+ *  misprediction penalty.
  *
  * ═══════════════════════════════════════════════════════════════════════════ */
-
-/* Set when Test 4's branch and branchless sums differ; main() then exits 1. */
-static int sanity_failed = 0;
-
-/* Branch version — kept as a branch by -fno-if-conversion build flag */
-__attribute__((noinline))
-static u64 sum_branch(const u8 *arr, size_t n, unsigned n_reps)
-{
-    u64 acc = 0;
-    for (unsigned rep = 0; rep < n_reps; rep++)
-        for (size_t i = 0; i < n; i++)
-            if (arr[i] > THRESHOLD)
-                acc += arr[i];
-    return acc;
-}
 
 /* Branchless version — arithmetic mask, no conditional jump possible */
 __attribute__((noinline))
@@ -1442,53 +1906,58 @@ static void run_test4(FILE *report)
     seed_test(4);
     const size_t len = size;
     u8 *sorted   = malloc(len);
-    u8 *random_d = malloc(len);
-    if (!sorted || !random_d) { perror("malloc"); exit(1); }
+    u8 *shuffled = malloc(len);
+    if (!sorted || !shuffled) { perror("malloc"); exit(1); }
+    prepare_threshold(sorted, shuffled, len);
+    u64 above = 0;
+    const u64 want = threshold_reference(sorted, len, reps, &above);
+    char note[96];
+    threshold_note(note, sizeof note, above, len);
 
-    fill_random_bytes(sorted, len);
-    qsort(sorted, len, 1, cmp_u8_asc);
-    fill_random_bytes(random_d, len);
-
-    printf("TEST 4 — Branch vs Branchless  (sorted and random data, %zu×%u reps)\n",
+    printf("TEST 4 — Branch vs Branchless  (sorted and shuffled copies, %zu×%u reps)\n",
            len, reps);
-    printf("  Branchless uses arithmetic mask: 0 - (u64)(v > T) to avoid jumps.\n\n");
+    printf("  Branchless uses arithmetic mask: 0 - (u64)(v > T) to avoid jumps.\n");
+    printf("  %s\n\n", note);
 
-    Result r_sb = {0};
-    Result r_sl = {0};
-    Result r_rb = {0};
-    Result r_rl = {0};
-    int pair_branch;
-    int pair_branchless;
-    MEASURE_PAIR(r_sb, 0, sum_branch(sorted, len, reps),
-                 r_rb, 2, sum_branch(random_d, len, reps), pair_branch);
-    MEASURE_PAIR(r_sl, 1, sum_branchless(sorted, len, reps),
-                 r_rl, 3, sum_branchless(random_d, len, reps), pair_branchless);
+    const Result none = {0};
+    ReportRow rows[] = {
+        { "Sorted   + branch",     none, NULL },
+        { "Sorted   + branchless", none, NULL },
+        { "Shuffled + branch",     none, NULL },
+        { "Shuffled + branchless", none, NULL },
+    };
+    for (int v = 0; v < 4; v++)
+        log_input(v, v < 2 ? sorted : shuffled, len, 1, above);
+    int pb;
+    int ps;
+    int pr;
+    MEASURE_PAIR(rows[0].r, 0, sum_threshold(sorted, len, reps),
+                 rows[2].r, 2, sum_threshold(shuffled, len, reps), pb);
+    MEASURE_PAIR(rows[0].r, 0, sum_threshold(sorted, len, reps),
+                 rows[1].r, 1, sum_branchless(sorted, len, reps), ps);
+    MEASURE_PAIR(rows[2].r, 2, sum_threshold(shuffled, len, reps),
+                 rows[3].r, 3, sum_branchless(shuffled, len, reps), pr);
 
-    free(sorted); free(random_d);
-
-    /* verify both produce same result on the same data (sanity check) —
-     * this comparison already reads all four .result fields, so unlike
-     * tests 1-3 there's no separate anti-DCE sink needed here. */
-    if (r_sb.result != r_sl.result || r_rb.result != r_rl.result) {
-        fprintf(stderr, "  ERROR: branch/branchless results differ!\n");
-        sanity_failed = 1;
-    }
+    free(sorted); free(shuffled);
+    /* Every row is checked against the reference, so no anti-DCE sink is
+     * needed. */
+    for (int v = 0; v < 4; v++)
+        check_result(rows[v].label, rows[v].r.result, want);
 
     const Work work = { (u64)len * reps, "elem" };
-    const ReportRow rows[] = {
-        { "Sorted  + branch",     r_sb, NULL },
-        { "Sorted  + branchless", r_sl, NULL },
-        { "Random  + branch",     r_rb, NULL },
-        { "Random  + branchless", r_rl, NULL },
-    };
     emit_rows(report, "Test 4 — Branch vs Branchless",
-              "Same sum, computed via conditional jump vs. arithmetic mask, on sorted and random data.",
+              "Same sum via Test 1's branch kernel and an arithmetic mask, on sorted and "
+              "shuffled copies of one byte array. A branchless vs branch ratio below 1 "
+              "means branchless is faster.",
               rows, 4, &work);
-    emit_pair_ratio(report, "\n  Branch penalty on random data:  ",
-                    "Branch penalty on random data", pair_branch, " vs sorted-branch");
-    emit_pair_ratio(report, "  Branchless is consistent:       ",
-                    "Branchless is consistent", pair_branchless, " random vs sorted");
-    print_pair_cost(report, pair_branch);
+    emit_pair_ratio(report, "\n  Branch, shuffled vs sorted:     ",
+                    "Branch, shuffled vs sorted", pb, "");
+    emit_pair_ratio(report, "  Sorted, branchless vs branch:   ",
+                    "Sorted, branchless vs branch", ps, "");
+    emit_pair_ratio(report, "  Shuffled, branchless vs branch: ",
+                    "Shuffled, branchless vs branch", pr, "");
+    print_pair_cost(report, pb);
+    emit_threshold_note(report, note);
     printf("\n");
 }
 
@@ -1757,7 +2226,8 @@ static void d6_layout(u64 total, size_t len, unsigned d, size_t *blocks, unsigne
     const u64 per_block = (u64)d + 2;
     const u64 fit = total / per_block;
     *blocks = fit < len ? (size_t)fit : len;
-    *passes = (unsigned)(total / (per_block * *blocks));
+    /* test6_size_ok() guarantees blocks > 0; the guard is for the analyzer. */
+    *passes = *blocks ? (unsigned)(total / (per_block * *blocks)) : 0;
 }
 
 /* One distance's layout, and the work each of its two rows does. */
@@ -1800,6 +2270,8 @@ static void measure_distances(const u8 *a, u8 *b_corr, u8 *b_ref, size_t len, u6
         const unsigned passes = pt->passes;
         memcpy(b_corr, a, blocks);
         fill_random_bits(b_ref, blocks, test_seed(6, 0, 1));
+        log_input(2 * i, b_corr, blocks, 0, 0);
+        log_input(2 * i + 1, b_ref, blocks, 0, 0);
         MEASURE_PAIR(rows[2 * i].r, 2 * i, correlate_distance(a, b_corr, fill, blocks, d, passes),
                      rows[2 * i + 1].r, 2 * i + 1,
                      correlate_distance(a, b_ref, fill, blocks, d, passes), pt->pair);
@@ -1928,10 +2400,13 @@ static int test_selected(int n)
 
 /* What each kernel's code is declared to contain.  check_kernels.sh
  * --counts measures the same fields from the binary; -1 is "not declared".
- * No function pointers here: taking a kernel's address stops GCC folding
- * sum_branch into sum_threshold, which moves the kernels.  Entry
- * addresses therefore come from the binary (check_kernels.sh), and the
- * export's "entry" is null. */
+ * taken_when says when the data branch jumps relative to its source
+ * condition ("false": it skips the update), as written in the asm; NULL
+ * for C kernels (the compiler decides) and for kernels without a single
+ * data branch.  No function pointers here: taking a
+ * kernel's address can change how GCC compiles and places the kernels.
+ * Entry addresses therefore come from the binary (check_kernels.sh), and
+ * the export's "entry" is null. */
 typedef struct {
     const char *id;
     int         revision;
@@ -1940,18 +2415,17 @@ typedef struct {
     int         data_branches;
     int         indirect_calls;
     int         inner_loop_branches;
+    const char *taken_when;
     const char *tests;
 } KernelDesc;
 
-#define KERNEL(fn) #fn, 1, "c"
+#define KERNEL(fn, rev, backend) #fn, rev, backend
 static const KernelDesc kernel_descs[] = {
-    { KERNEL(sum_threshold),       "elem",  1, 0,  2, "1"   },
-    { KERNEL(sum_branch),          "elem",  1, 0,  2, "4"   },
-    { KERNEL(sum_branchless),      "elem",  0, 0,  1, "4"   },
-    { KERNEL(count_decisions),     "elem",  1, 0,  2, "2,5" },
-    { KERNEL(dispatch_sequential), "call",  0, 1,  2, "3"   },
-    { KERNEL(dispatch_random),     "call",  0, 1,  2, "3"   },
-    { KERNEL(correlate_distance),  "block", 3, 0,  2, "6"   },
+    { KERNEL(sum_threshold, 2, KERNEL_BACKEND),   "elem",  1, 0, 2, ASM_TAKEN_WHEN, "1,4" },
+    { KERNEL(sum_branchless, 1, "c"),             "elem",  0, 0, 1, NULL,           "4"   },
+    { KERNEL(count_decisions, 2, KERNEL_BACKEND), "elem",  1, 0, 2, ASM_TAKEN_WHEN, "2,5" },
+    { KERNEL(dispatch_indexed, 1, "c"),           "call",  0, 1, 2, NULL,           "3"   },
+    { KERNEL(correlate_distance, 1, "c"),         "block", 3, 0, 2, NULL,           "6"   },
 };
 #undef KERNEL
 
@@ -2157,6 +2631,9 @@ static void write_meta(FILE *f)
     json_string_or_null(f, have_uname ? kernel : NULL);
     fputs(",\"compiler\":", f);
     json_string(f, COMPILER_VERSION);
+    fputs(",\"kernel_backend\":", f);
+    json_string(f, KERNEL_BACKEND);
+    fprintf(f, ",\"results_ok\":%s", sanity_failed ? "false" : "true");
     fputs(",\"build_flags\":", f);
     json_string_or_null(f, BUILD_FLAGS);
     fputs(",\"commit\":", f);
@@ -2189,6 +2666,8 @@ static void write_kernels(FILE *f)
         json_int(f, k->indirect_calls >= 0, k->indirect_calls);
         fputs(",\"inner_loop_branches\":", f);
         json_int(f, k->inner_loop_branches >= 0, k->inner_loop_branches);
+        fputs(",\"taken_when\":", f);
+        json_string_or_null(f, k->taken_when);
         fputs(",\"tests\":", f);
         json_string(f, k->tests);
         fputs("}\n", f);
@@ -2223,6 +2702,11 @@ static void write_variants(FILE *f)
 {
     for (int i = 0; i < variant_count; i++) {
         const VariantInfo *v = &variant_info[i];
+        if (!v->label) {   /* input logged, but no row was emitted */
+            fprintf(stderr, "Internal error: test %d variant %d has an input but no row\n",
+                    v->test, v->variant);
+            exit(1);
+        }
         char label[128];
         char kernel[64];
         collapse_spaces(v->label, label, sizeof label);
@@ -2233,6 +2717,13 @@ static void write_variants(FILE *f)
         json_string_or_null(f, kernel);
         fprintf(f, ",\"work\":%" PRIu64 ",\"unit\":", v->work.count);
         json_string(f, v->work.unit);
+        fputs(",\"pass_items\":", f);
+        json_int(f, v->has_input, (long long)v->pass_items);
+        fputs(",\"cond_true\":", f);
+        json_int(f, v->has_cond, (long long)v->cond_true);
+        fputs(",\"input_hash\":", f);
+        if (v->has_input) fprintf(f, "%" PRIu64, v->input_hash);
+        else fputs("null", f);
         fputs("}\n", f);
     }
 }
@@ -2545,6 +3036,9 @@ static void print_banner(const char *tests_list)
         printf("  Raw PMU events:  %s (generic events failed)\n", raw);
     }
     printf("  Compiler:        %s\n", COMPILER_VERSION);
+    printf("  Kernels:         %s\n", KERNEL_ASM
+           ? KERNEL_BACKEND " (Tests 1, 2, 4 and 5 branch kernels)"
+           : "C only (branches depend on the compiler)");
     if (BUILD_FLAGS[0])
         printf("  Build flags:     %s\n", BUILD_FLAGS);
     if (BUILD_COMMIT[0])
@@ -2565,6 +3059,11 @@ static void write_report_header(FILE *report, const char *tests_list)
     fprintf(report, "## %s\n\n", cpu);
     fprintf(report, "_%s_\n\n", date);
     fprintf(report, "_Benchmark revision %d._\n\n", BENCH_REVISION);
+    fprintf(report, "%s\n\n", KERNEL_ASM
+            ? "_Kernels: " KERNEL_BACKEND " for the data-branch kernels of Tests 1, 2, 4 "
+              "and 5; the other kernels are C._"
+            : "_Kernels: C only; their branches depend on the compiler (check with "
+              "check_kernels.sh)._");
     if (seed_given)
         fprintf(report, "_Seed: %" PRIu64 "._\n\n", base_seed);
     fprintf(report, "| Array size | Repetitions | Perf counters | Compiler |\n");
@@ -2688,6 +3187,18 @@ static void run_selected_tests(FILE *report)
     if (test_selected(6)) { begin_test(6); run_test6(report); }
 }
 
+/* After a result mismatch (sanity_failed), says so where the numbers are
+ * read, not only on stderr, so the report is not mistaken for a valid one. */
+static void emit_sanity_note(FILE *report)
+{
+    if (!sanity_failed) return;
+    static const char msg[] =
+        "ERROR: a kernel result differed from its reference (see stderr); "
+        "do not use these results.";
+    printf("\n  %s\n\n", msg);
+    if (report) fprintf(report, "**%s**\n\n", msg);
+}
+
 /* Closes the report, then writes and closes the export.  Nonzero if either
  * failed. */
 static int finish_outputs(FILE *report, const char *out_path, FILE *json)
@@ -2735,6 +3246,7 @@ int main(int argc, char **argv)
     run_selected_tests(report);
 
     print_clock_summary(report);
+    emit_sanity_note(report);
 
     printf("See README.md for how to interpret these results.\n");
 

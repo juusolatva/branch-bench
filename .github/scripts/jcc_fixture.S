@@ -27,13 +27,8 @@ count_decisions:
     ret
 
     .p2align 4
-    .globl dispatch_sequential
-dispatch_sequential:
-    ret
-
-    .p2align 4
-    .globl dispatch_random
-dispatch_random:
+    .globl dispatch_indexed
+dispatch_indexed:
     ret
 
     .p2align 4

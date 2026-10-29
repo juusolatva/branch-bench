@@ -9,18 +9,18 @@ A simple benchmark for testing out gains from branch prediction or conversely lo
 
 ## The tests
 
-1. **Threshold Sum** sums the bytes above 128 in a sorted and a shuffled copy of the same random array.
-2. **Stride Conditional** counts the ones in a 0/1 array that has them at every 4th position, or at random with the same 25% rate.
-3. **Indirect Dispatch** calls 32 functions through a pointer table, in sequential `i % 32` order or at random.
-4. **Branch vs Branchless** computes Test 1's sum with a conditional jump and with an arithmetic mask, on sorted and random data, and checks that both give the same result.
+1. **Threshold Sum** sums the bytes above 128 in a sorted and a shuffled copy of the same random array, and prints how many bytes per pass are above 128 (about half).
+2. **Bias and Ordering** counts the ones in 0/1 arrays with 1/16, 1/4, 1/2, 3/4 or 15/16 ones. Each bias has exactly the same number of ones in three orders, a repeating word (e.g. `1000`), all ones first, and shuffled, plus all-0 and all-1 controls: 17 rows.
+3. **Indirect Dispatch** calls functions through a pointer table from one call site, for 1, 2, 4, … 64 targets, each in a repeating cycle (`i % T`) and in the same calls shuffled.
+4. **Branch vs Branchless** computes Test 1's sum with Test 1's conditional-jump kernel and with an arithmetic mask, on a sorted and a shuffled copy of one random array, and compares branchless with branch for each order directly.
 5. **Pattern Learnability** (opt-in) runs Test 2's kernel on repeating de Bruijn patterns with periods 32 to 2048, and on random 50% ones.
 6. **Correlation Distance** (opt-in) makes a branch repeat the random outcome of a branch d = 4 to 1024 constant-outcome branches earlier, against a reference where it is random.
 
-A run without `-t` runs Tests 1–4. Tests 5 and 6 run only when selected with `-t` or `--hard` (all six tests), so default runs stay comparable with [RESULTS.md](RESULTS.md).
+A run without `-t` runs Tests 1–4. It takes longer than before revision 3 (Test 2 measures 17 rows instead of 2): about 30 s instead of 10 s at the defaults on an i5-8350U laptop. Tests 5 and 6 run only when selected with `-t` or `--hard` (all six tests). Results are comparable only within one benchmark revision; RESULTS.md holds revision 1 (see [Seeds and revisions](#seeds-and-revisions)).
 
 ## Notes
 
-You **MUST** run this with ./run.sh, use a [prebuilt binary](#prebuilt-binaries), or build it with exactly `gcc -std=c99 -O2 -fno-tree-vectorize -fno-if-conversion -o branch_bench branch_bench.c`, adding `-Wa,-mbranches-within-32B-boundaries,-malign-branch=jcc+fused+jmp+call+ret+indirect` on x86-64 as `./run.sh` does. Without *-fno-tree-vectorize* and *-fno-if-conversion* the compiler optimizes the mispredictions away, and other optimization levels give results that cannot be compared with [RESULTS.md](RESULTS.md). The x86-64 assembler flags keep every jump in the kernels off 32-byte boundaries, which Intel's JCC-erratum fix slows on Skylake-derived CPUs. `./run.sh` builds and then runs the benchmark with any options you give it (e.g. `./run.sh -n 5 -o report.md`); after that, `./branch_bench` runs it directly. Build with GCC: Clang has no equivalent of *-fno-if-conversion* and makes Tests 1, 2, 5, 6 and Test 4's branch variant branchless, so its timings show no misprediction cost (see [AGENTS.md](AGENTS.md)).
+You **MUST** run this with ./run.sh, use a [prebuilt binary](#prebuilt-binaries), or build it with exactly `gcc -std=c99 -O2 -fno-tree-vectorize -fno-if-conversion -o branch_bench branch_bench.c`, adding `-Wa,-mbranches-within-32B-boundaries,-malign-branch=jcc+fused+jmp+call+ret+indirect` on x86-64 as `./run.sh` does. Without *-fno-tree-vectorize* and *-fno-if-conversion* the compiler optimizes the mispredictions away, and other optimization levels give results that cannot be compared with [RESULTS.md](RESULTS.md). The x86-64 assembler flags keep every jump in the kernels off 32-byte boundaries, which Intel's JCC-erratum fix slows on Skylake-derived CPUs. `./run.sh` builds and then runs the benchmark with any options you give it (e.g. `./run.sh -n 5 -o report.md`); after that, `./branch_bench` runs it directly. Build with GCC. On x86-64 and AArch64 the kernels of Tests 1, 2, 4 and 5 are written in assembly, so they keep their branch with any compiler, Clang included; Test 6's kernel is C, and Clang (which has no equivalent of *-fno-if-conversion*) makes it branchless, so its Clang timings show no misprediction cost. Other architectures use C versions of all kernels, whose branches depend on the compiler; the banner and report say which kernels ran (`Kernels:`). See [AGENTS.md](AGENTS.md).
 
 The benchmark builds on Linux with GCC; on Windows, use WSL2. Other POSIX systems build with GCC too but show times only. On macOS `gcc` is Clang, so install GCC (e.g. from Homebrew) and build with the command above using its versioned `gcc-<N>` (`./run.sh` calls plain `gcc`), without the `-Wa,...` flags: they need the GNU assembler (binutils 2.34 or later), which macOS does not use.
 
@@ -55,8 +55,10 @@ table-formatted Markdown report instead use `-o`/`--output`:
 This writes the report file in addition to the normal
 console output. An existing file is overwritten, and a new one is
 readable only by you. The program exits with status 1 on errors,
-including an invalid option or a mismatch between Test 4's branch and
-branchless sums.
+including an invalid option or a kernel result that differs from the
+reference computed without the kernel (Tests 1–4 check every row); such
+a run also ends its console output and report with an ERROR line, so its
+numbers are not mistaken for valid ones.
 
 The report heading shows the CPU's maximum (turbo/boost) clock where
 Linux reports it. Where it does not (WSL2, most VMs), the heading is the
@@ -83,9 +85,9 @@ emptied until both have opened:
 
 | `type` | One record per | Main fields |
 |---|---|---|
-| `meta` (first line) | run | `schema` 1, `revision`, CPU, microcode, arch, kernel, compiler, build flags, commit, `alignment_policy`, `seed` and `test_seeds`, size/reps/trials, `training_runs`, `schedule` (`AB/BA`), `affinity`, `hypervisor`, `smt_siblings`, `governor`, `max_ghz`, `effective_user_cycle_ghz`, and per counter its event type, config and `semantics` (`retired`, `speculative`, `cycles`, `unknown`) |
-| `kernel` | kernel | declared `data_branches`, `indirect_calls`, `inner_loop_branches`, unit, tests |
-| `variant` | report row | `test`, `variant` (row index), `label`, `kernel`, `work` and `unit` per trial |
+| `meta` (first line) | run | `schema` 1, `revision`, `results_ok` (false when a kernel result differed from its reference), CPU, microcode, arch, kernel, compiler, `kernel_backend` (`asm-x86_64`, `asm-aarch64` or `c`, for the data-branch kernels; each `kernel` record has its own `backend`), build flags, commit, `alignment_policy`, `seed` and `test_seeds`, size/reps/trials, `training_runs`, `schedule` (`AB/BA`), `affinity`, `hypervisor`, `smt_siblings`, `governor`, `max_ghz`, `effective_user_cycle_ghz`, and per counter its event type, config and `semantics` (`retired`, `speculative`, `cycles`, `unknown`) |
+| `kernel` | kernel | `id`, `revision`, `backend` (`asm-…` or `c`), `entry` (always `null`), unit, declared `data_branches`, `indirect_calls`, `inner_loop_branches`, `taken_when` (`"false"`: the asm data branch jumps, skipping the update, when its condition is false; `null` for C kernels), tests |
+| `variant` | report row | `test`, `variant` (row index), `label`, `kernel`, `work` and `unit` per trial; its input, recorded before measuring: `pass_items` (items per pass), `cond_true` (items per pass whose source condition holds) and `input_hash` (FNV-1a of the input buffer), each `null` where the test does not record it |
 | `trial` | measured trial | `test`, `variant`, `pair`, run-wide `seq`, `trial`, `train_runs`, `time_ms`, `result` (the kernel's checksum), `perf_status`, `enabled_ns`/`running_ns`, `counts` (scaled) and `raw_counts` |
 | `pair` | compared pair | `a`/`b` variants, `pairs`, `valid`, summed times, `slowdown`, signed `delta` per counter, `effective_cost` and `cost_status` (`resolved`, `inconclusive`, `unavailable`), and `cost_shown` (the cost line was printed) |
 
@@ -131,8 +133,10 @@ time of one variant's trials over the other's.
 ./branch_bench --hard               # all six tests
 ```
 
-Test 5 tiles whole periods of its longest pattern, so it needs a
-`--size` that is a multiple of 2048; at any other size it prints a skip
+Test 2 needs a `--size` that is a multiple of 16 (whole periods of
+every bias pattern), Test 3 a multiple of 64 (equal calls to every
+target), and Test 5, which tiles whole periods of its longest
+pattern, a multiple of 2048. At any other size such a test prints a skip
 note and the other selected tests still run. Test 6 needs `--size` ≥ 64
 and `--size` × `--reps` ≥ 65664.
 
@@ -159,7 +163,7 @@ The banner and report also show the **benchmark revision**. It goes up
 whenever a change alters what is measured (inputs, warm-up, pairing,
 summaries), even when the test numbers stay the same. Results from
 different revisions are not comparable; the entries in RESULTS.md so far
-are revision 1.
+are revision 1, and this version is revision 3.
 
 ## Adding results
 
@@ -185,7 +189,7 @@ target. The minimum penalty is roughly the pipeline depth, typically
 When the cycle and miss counters are available, each test prints the
 **Effective extra cycles per additional miss**: the extra cycles divided
 by the extra mispredictions between its predictable and unpredictable
-variant (for Test 4, its two branch variants), summed over the paired
+variant (for Test 4, its branch kernel on shuffled vs sorted data), summed over the paired
 trials whose counters both read correctly. Differences keep their sign,
 so a pair where the unpredictable variant happened to be faster pulls
 the figure down instead of being dropped. When the unpredictable variant
@@ -205,9 +209,11 @@ listed clock speeds put it at ~20–25 cycles for Test 1.
 
 The effective cost is only meaningful when the unpredictable variant adds
 many misses. When the two variants miss almost equally often, as in
-Test 3 on cores that cannot learn the sequential cycle, the small
-difference in work between the variants dominates and the figure is
-inflated (~54 cycles for Test 3 on the Raspberry Pi 4).
+revision 1's Test 3 on cores that could not learn its 32-target cycle,
+the small difference in work between the variants dominates and the
+figure is inflated (~54 cycles for that Test 3 on the Raspberry Pi 4).
+In revision 3 both rows of a Test 3 pair run the same code, so only the
+order differs; the figure comes from its 64-target pair.
 
 **Miss %** is misses divided by *all* branches in the timed loop,
 including the loop's own back-edge branch, which is almost always
@@ -230,25 +236,34 @@ on the non-VPS x86 machines in RESULTS.md (the low end, ~9.5 ms, is the
 Ryzen 5 9600X under WSL2).
 
 - **Tests 1 and 2** use direct conditional branches (a jump inside the
-  loop). Test 2 shows the predictor learning a repeating pattern (every
-  4th element taken) but not a random one with the same 25% rate.
+  loop). Test 2 separates how often the branch goes one way (the bias)
+  from the order: within a bias every row has the same number of ones,
+  so a shuffled row's extra misses come from its order alone. The
+  RESULTS.md entries (revision 1) still show the old Test 2, every 4th
+  element vs. a random 25%.
 - **Test 3** uses indirect calls through a function pointer, so the CPU
   must predict a target address, not just taken/not-taken. A plain branch
   target buffer (BTB) remembers only the last target of each branch and
-  would miss on every call of the sequential `i % 32` cycle; learning that
-  cycle takes an indirect predictor that uses branch history. Haswell
-  (i7-4770) and the newer x86 cores with counters in RESULTS.md predict
-  it almost perfectly, while the Ivy Bridge i5-3380M and the Cortex-A72
-  still miss ~27–28 of every 32 calls. The EPYC-Rome VPS (no counters;
-  its QEMU model name hides the host core) shows only a 1.20× slowdown,
-  like the i5-3380M's 1.17×, so it apparently does not learn the cycle,
-  possibly because of hypervisor mitigations. With random indices every
-  core is right only by chance, about 1 call in 32. On the Intel machines a missed indirect call costs
-  about the same as a missed conditional branch (~23–26 cycles).
+  would miss on every call of a cyclic sequence of two or more targets;
+  learning the cycle takes an indirect predictor that uses branch
+  history. A shuffled sequence of T targets can be right only by chance,
+  about 1 call in T; T = 1 is the single-target control. In RESULTS.md
+  (revision 1, which compared a sequential 32-target cycle with random
+  indices from two call sites), Haswell (i7-4770) and the newer x86 cores
+  with counters predict the cycle almost perfectly, while the Ivy Bridge
+  i5-3380M and the Cortex-A72 still miss ~27–28 of every 32 calls. The
+  EPYC-Rome VPS (no counters; its QEMU model name hides the host core)
+  shows only a 1.20× slowdown, like the i5-3380M's 1.17×, so it
+  apparently does not learn the cycle, possibly because of hypervisor
+  mitigations. On the Intel machines a missed indirect call costs about
+  the same as a missed conditional branch (~23–26 cycles).
 - **Test 4** removes the data-dependent branch but not the loop branch,
-  which is why its branch count halves. Its time barely changes between
-  sorted and random data, but it is not automatically faster: on sorted
-  data the branching version wins on the i7-4770 (144 ms vs 195 ms), the
+  which is why its branch count halves. Revision 3 reports branchless vs
+  branch for the sorted and the shuffled copy directly (below 1× means
+  branchless is faster). Its time barely changes between sorted and
+  shuffled data, but it is not automatically faster: in RESULTS.md
+  (revision 1, sorted vs separately generated random data) the branching
+  version wins on sorted data on the i7-4770 (144 ms vs 195 ms), the
   i5-3380M and the Ryzen 5 9600X, because a correctly predicted branch is
   nearly free while the branchless version always does the extra work.
   The i5-8350U and the Raspberry Pi 4 are exceptions, where branchless is
