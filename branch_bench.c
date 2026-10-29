@@ -1542,6 +1542,107 @@ static u64 count_decisions(const u8 *decisions, size_t n, unsigned n_reps)
     return acc;
 }
 
+/* Test 5's kernels: pattern_sites_N runs N static data branches per block,
+ * site s reading data[block * N + s] (block-major), over `blocks` blocks
+ * and `passes` passes, and returns the number of nonzero bytes seen.  One
+ * asm block holds the whole body, as in count_decisions; the N sites come
+ * from one .rept body whose offset .Lbb_site counts 0 ... N - 1, so every
+ * site is the same instruction sequence reading its own stream.  Without
+ * the asm kernels only N = 1 exists, as a C loop. */
+#if KERNEL_ASM
+#  if defined(__x86_64__)
+#    define PATTERN_ASM(N)                                                \
+    __asm__ __volatile__(                                                 \
+        "test %[b], %[b]\n\t"                                             \
+        "jz 4f\n\t"                                                       \
+        "test %k[r], %k[r]\n\t"                                           \
+        "jz 4f\n"                                                         \
+        "1:\n\t"                                                          \
+        "mov %[arr], %[p]\n"                                              \
+        "2:\n\t"                                                          \
+        ".set .Lbb_site, 0\n\t"                                           \
+        ".rept " #N "\n\t"                                                \
+        "cmpb $0, .Lbb_site(%[p])\n\t"                                    \
+        "je 3f\n\t"                  /* one data branch per site */       \
+        "inc %[acc]\n"                                                    \
+        "3:\n\t"                                                          \
+        ".set .Lbb_site, .Lbb_site + 1\n\t"                               \
+        ".endr\n\t"                                                       \
+        "add $" #N ", %[p]\n\t"                                           \
+        "cmp %[end], %[p]\n\t"                                            \
+        "jne 2b\n\t"                                                      \
+        "dec %k[r]\n\t"                                                   \
+        "jnz 1b\n"                                                        \
+        "4:"                                                              \
+        : [acc] "+r"(acc), [p] "=&r"(p), [r] "+r"(r)                      \
+        : [arr] "r"(data), [end] "r"(data + (size_t)(N) * blocks),        \
+          [b] "r"(blocks)                                                 \
+        : "cc", "memory")
+#  else
+#    define PATTERN_ASM(N)                                                \
+    u64 v;                                                                \
+    __asm__ __volatile__(                                                 \
+        "cbz %[b], 4f\n\t"                                                \
+        "cbz %w[r], 4f\n"                                                 \
+        "1:\n\t"                                                          \
+        "mov %[p], %[arr]\n"                                              \
+        "2:\n\t"                                                          \
+        ".set .Lbb_site, 0\n\t"                                           \
+        ".rept " #N "\n\t"                                                \
+        "ldrb %w[v], [%[p], #.Lbb_site]\n\t"                              \
+        "cbz %w[v], 3f\n\t"          /* one data branch per site */       \
+        "add %[acc], %[acc], #1\n"                                        \
+        "3:\n\t"                                                          \
+        ".set .Lbb_site, .Lbb_site + 1\n\t"                               \
+        ".endr\n\t"                                                       \
+        "add %[p], %[p], #" #N "\n\t"                                     \
+        "cmp %[p], %[end]\n\t"                                            \
+        "b.ne 2b\n\t"                                                     \
+        "subs %w[r], %w[r], #1\n\t"                                       \
+        "b.ne 1b\n"                                                       \
+        "4:"                                                              \
+        : [acc] "+r"(acc), [p] "=&r"(p), [v] "=&r"(v), [r] "+r"(r)        \
+        : [arr] "r"(data), [end] "r"(data + (size_t)(N) * blocks),        \
+          [b] "r"(blocks)                                                 \
+        : "cc", "memory")
+#  endif
+/* used: emitted (and checked) before Test 5 calls them. */
+#  define DEF_PATTERN_KERNEL(N)                                           \
+    __attribute__((noinline, used))                                      \
+    static u64 pattern_sites_##N(const u8 *data, size_t blocks, unsigned passes) \
+    {                                                                     \
+        u64 acc = 0;                                                      \
+        const u8 *p;                                                      \
+        unsigned r = passes;                                              \
+        PATTERN_ASM(N);                                                   \
+        return acc;                                                       \
+    }
+DEF_PATTERN_KERNEL(1)
+DEF_PATTERN_KERNEL(4)
+DEF_PATTERN_KERNEL(16)
+DEF_PATTERN_KERNEL(64)
+DEF_PATTERN_KERNEL(256)
+DEF_PATTERN_KERNEL(512)
+#else
+__attribute__((noinline, used))
+static u64 pattern_sites_1(const u8 *data, size_t blocks, unsigned passes)
+{
+    u64 acc = 0;
+    for (unsigned rep = 0; rep < passes; rep++)
+        for (size_t i = 0; i < blocks; i++)
+            if (data[i])        /* the one site */
+                acc++;
+    return acc;
+}
+#endif
+
+/* 1 if this build has pattern_sites_n. */
+__attribute__((unused))  /* called from Task 5 (Test 5) on */
+static int pattern_kernel_available(unsigned n)
+{
+    return KERNEL_ASM || n == 1;
+}
+
 #define T2_TITLE "Test 2 — Bias and Ordering"
 #define T2_DESC  "Same number of ones per bias in periodic, clustered and shuffled order, plus constant controls; one branch site."
 #define T2_ROWS  (3 * T2_BIASES + 2)
@@ -2573,6 +2674,14 @@ static const KernelDesc kernel_descs[] = {
     { KERNEL(sum_threshold, 2, KERNEL_BACKEND),   "elem",  1, 0, 2, ASM_TAKEN_WHEN, "1,4" },
     { KERNEL(sum_branchless, 1, "c"),             "elem",  0, 0, 1, NULL,           "4"   },
     { KERNEL(count_decisions, 2, KERNEL_BACKEND), "elem",  1, 0, 2, ASM_TAKEN_WHEN, "2,5" },
+    { KERNEL(pattern_sites_1, 1, KERNEL_BACKEND), "branch", 1, 0, 2, ASM_TAKEN_WHEN, "5"  },
+#if KERNEL_ASM
+    { KERNEL(pattern_sites_4, 1, KERNEL_BACKEND),   "branch", 4,   0, 5,   ASM_TAKEN_WHEN, "5" },
+    { KERNEL(pattern_sites_16, 1, KERNEL_BACKEND),  "branch", 16,  0, 17,  ASM_TAKEN_WHEN, "5" },
+    { KERNEL(pattern_sites_64, 1, KERNEL_BACKEND),  "branch", 64,  0, 65,  ASM_TAKEN_WHEN, "5" },
+    { KERNEL(pattern_sites_256, 1, KERNEL_BACKEND), "branch", 256, 0, 257, ASM_TAKEN_WHEN, "5" },
+    { KERNEL(pattern_sites_512, 1, KERNEL_BACKEND), "branch", 512, 0, 513, ASM_TAKEN_WHEN, "5" },
+#endif
     { KERNEL(dispatch_indexed, 1, "c"),           "call",  0, 1, 2, NULL,           "3"   },
     { KERNEL(loop_exit, 1, KERNEL_BACKEND),       "iter",  0, 0, 1, NULL,           "6"   },
     { KERNEL(loop_exit_body2, 1, KERNEL_BACKEND), "iter",  0, 0, 1, NULL,           "6"   },

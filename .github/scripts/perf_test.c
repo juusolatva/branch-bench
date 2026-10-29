@@ -791,6 +791,41 @@ static void loop_inputs(void)
     puts("ok   loop-exit kernels match their closed forms");
 }
 
+/* Each pattern kernel on blocks of N sites: no blocks, no passes, one
+ * block and three blocks twice, against a direct count.  The byte after
+ * the last block is 1 and must never be counted. */
+#define PATTERN_CHECK(N)                                                    \
+    do {                                                                    \
+        static u8 d[3 * (N) + 1];                                           \
+        u64 ones = 0;                                                       \
+        for (size_t i = 0; i < 3 * (size_t)(N); i++) {                      \
+            d[i] = (u8)((i * 7 + i / (N)) % 3 == 0);                        \
+            ones += d[i];                                                   \
+        }                                                                   \
+        d[3 * (N)] = 1;                                                     \
+        u64 first = 0;                                                      \
+        for (size_t i = 0; i < (size_t)(N); i++) first += d[i];             \
+        assert(pattern_sites_##N(d, 0, 5) == 0);                            \
+        assert(pattern_sites_##N(d, 3, 0) == 0);                            \
+        assert(pattern_sites_##N(d, 1, 1) == first);                        \
+        assert(pattern_sites_##N(d, 3, 2) == 2 * ones);                     \
+    } while (0)
+
+static void pattern_kernels(void)
+{
+    PATTERN_CHECK(1);
+#if KERNEL_ASM
+    PATTERN_CHECK(4);
+    PATTERN_CHECK(16);
+    PATTERN_CHECK(64);
+    PATTERN_CHECK(256);
+    PATTERN_CHECK(512);
+#endif
+    assert(pattern_kernel_available(1));
+    assert(pattern_kernel_available(512) == KERNEL_ASM);
+    puts("ok   pattern kernels count every site of every block, nothing past the end");
+}
+
 int main(void)
 {
     perf_leader = 42;
@@ -834,5 +869,6 @@ int main(void)
     variant_guards();
     trial_log_grows();
     loop_inputs();
+    pattern_kernels();
     return 0;
 }

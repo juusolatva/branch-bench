@@ -32,6 +32,36 @@ dispatch_indexed:
     ret
 
     .p2align 4
+    .globl pattern_sites_1
+pattern_sites_1:
+    ret
+
+    .p2align 4
+    .globl pattern_sites_4
+pattern_sites_4:
+    ret
+
+    .p2align 4
+    .globl pattern_sites_16
+pattern_sites_16:
+    ret
+
+    .p2align 4
+    .globl pattern_sites_64
+pattern_sites_64:
+    ret
+
+    .p2align 4
+    .globl pattern_sites_256
+pattern_sites_256:
+    ret
+
+    .p2align 4
+    .globl pattern_sites_512
+pattern_sites_512:
+    ret
+
+    .p2align 4
     .globl loop_exit
 loop_exit:
     ret

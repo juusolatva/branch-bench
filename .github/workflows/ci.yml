@@ -102,7 +102,7 @@ jobs:
       - name: Kernel check rejects a loop guard, unrolled loops and merged or uneven leaves
         run: |
           out="$RUNNER_TEMP/check_fixture.txt"
-          for f in loop_guard unrolled asm_unrolled merged_leaves uneven_leaves loop_unrolled; do
+          for f in loop_guard unrolled asm_unrolled merged_leaves uneven_leaves loop_unrolled sites; do
             gcc $BENCH_FLAGS $WARN_FLAGS -o "$RUNNER_TEMP/$f" ".github/scripts/${f}_fixture.c"
             .github/scripts/check_kernels.sh "$RUNNER_TEMP/$f" > "$out" || true
             cat "$out"
@@ -113,6 +113,7 @@ jobs:
               merged_leaves) grep -q '^FAIL Test 3 leaves: 63 distinct addresses for 64 leaves' "$out" ;;
               uneven_leaves) grep -q '^FAIL Test 3 leaves: 2 instruction shapes for 64 leaves' "$out" ;;
               loop_unrolled) grep -q '^FAIL Test 6 loop_exit: expected 1 conditional branch in the inner loop, found 2' "$out" ;;
+              sites)         grep -q '^FAIL Test 5 pattern_sites_4: site offsets 0,1,1,3, expected 0..3 once each' "$out" ;;
             esac
           done
 
@@ -203,6 +204,8 @@ jobs:
           [ "$status" -eq 0 ]
           for label in 'Test 1/4 sum_threshold' 'Test 2/5 count_decisions' \
                        'Test 4 sum_branchless' 'Test 3 dispatch_indexed' 'Test 3 leaves' \
+                       'Test 5 pattern_sites_1' 'Test 5 pattern_sites_4' 'Test 5 pattern_sites_16' \
+                       'Test 5 pattern_sites_64' 'Test 5 pattern_sites_256' 'Test 5 pattern_sites_512' \
                        'Test 6 loop_exit' 'Test 6 loop_exit_body2'; do
             grep -qx "ok   $label" "$out" || { echo "missing: ok   $label"; exit 1; }
           done

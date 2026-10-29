@@ -15,6 +15,11 @@
 #       ignored), so every target does the same work.  A retpoline or
 #       indirect-thunk build turns the call into a direct call to a thunk,
 #       which the indirect-call check rejects by design.
+#   Test 5 pattern_sites_N (N = 1, 4, 16, 64, 256, 512): N data branches,
+#       whose loads read offsets 0 ... N-1 of the block, each once, and a
+#       block pointer advanced by N (mode sites), so every site reads its
+#       own stream.  A build without pattern_sites_4 but with
+#       pattern_sites_1 is a C-kernel build (only N = 1); N > 1 is skipped.
 #   Test 6 loop_exit, loop_exit_body2: two nested loops whose inner loop
 #       has exactly one conditional branch (its back-edge, the branch every
 #       trip count uses) and no memory access or call (mode loop-exit).
@@ -299,9 +304,63 @@ leaf_shapes() {
         }'
 }
 
+# Prints the data-load offsets of one pattern kernel in order (comma list,
+# decimal), then the immediate added to their base register (the block
+# advance), or "none".
+site_info() {
+    body "$1" | awk -v arch="$arch" '
+        function num(s) { return s ~ /^0x/ ? strtonum_(substr(s, 3)) : s + 0 }
+        function strtonum_(h,    i, n) {
+            n = 0
+            for (i = 1; i <= length(h); i++) n = n * 16 + index("0123456789abcdef", substr(h, i, 1)) - 1
+            return n
+        }
+        {
+            line = $0; gsub(/[ \t]+/, " ", line); sub(/^ /, "", line)
+            while (line ~ /^(cs|ds|data16) /) sub(/^[a-z0-9]+ /, "", line)   # alignment prefixes
+            if (arch == "aarch64" && line ~ /^ldrb /) {
+                m = line; sub(/^[^[]*\[/, "", m); sub(/\].*$/, "", m)
+                split(m, part, /, */); base = part[1]
+                off = part[2] == "" ? 0 : num(substr(part[2], 2))
+                list = list (list == "" ? "" : ",") off
+            } else if (arch != "aarch64" && line ~ /^cmpb \$0x0,/) {
+                m = line; sub(/^cmpb \$0x0,/, "", m)
+                off = m; sub(/\(.*$/, "", off); off = off == "" ? 0 : num(off)
+                base = m; sub(/^[^(]*\(/, "", base); sub(/\).*$/, "", base)
+                list = list (list == "" ? "" : ",") off
+            } else {
+                adds[++na] = line
+            }
+        }
+        END {
+            adv = "none"
+            for (i = 1; i <= na; i++) {
+                if (arch == "aarch64" && adds[i] ~ ("^add " base ", " base ", #")) {
+                    v = adds[i]; sub(/^.*#/, "", v); adv = num(v)
+                }
+                if (arch != "aarch64" && adds[i] ~ ("^add \\$0x[0-9a-f]+," base "$")) {
+                    v = adds[i]; sub(/^add \$/, "", v); sub(/,.*$/, "", v); adv = num(v)
+                }
+            }
+            print (list == "" ? "none" : list), adv
+        }'
+}
+
+# 1 if this is a C-kernel build: pattern_sites_1 without pattern_sites_4.
+c_kernel_build() {
+    [ -n "$(body pattern_sites_1)" ] && [ -z "$(body pattern_sites_4)" ]
+}
+
+pattern_kernels="pattern_sites_1 pattern_sites_4 pattern_sites_16 pattern_sites_64 pattern_sites_256 pattern_sites_512"
+
 if [ "$counts" -eq 1 ]; then
     missing=0
-    for k in sum_threshold sum_branchless count_decisions dispatch_indexed loop_exit loop_exit_body2; do
+    c_build=0
+    if c_kernel_build; then c_build=1; fi
+    for k in sum_threshold sum_branchless count_decisions dispatch_indexed $pattern_kernels loop_exit loop_exit_body2; do
+        if [ "$c_build" -eq 1 ] && [ "${k#pattern_sites_}" != "$k" ] && [ "$k" != pattern_sites_1 ]; then
+            continue
+        fi
         # The body with the exact name, else the first clone.
         line=$(analyze "$k" | awk -v k="$k" '$1 == k { print; found = 1; exit }
                                           !first { first = $0 }
@@ -318,7 +377,7 @@ fi
 fail=0
 
 # check <label> <function regex> <mode> [N]
-#   modes: data-branch N, no-data-branch, indirect-call N, loop-exit
+#   modes: data-branch N, no-data-branch, indirect-call N, loop-exit, sites N
 check() {
     label=$1 re=$2 mode=$3 want=${4:-}
     insns=$(body "$re")
@@ -332,7 +391,7 @@ check() {
     set -- $(analyze "$re" | awk -v mode="$mode" -v want="${want:-0}" '
         { base = $1; sub(/\..*/, "", base); if (++per[base] > bodies) bodies = per[base] }
         NR == 1 { d = $2; c = $3; b = $5; ic = $6; ih = $7 }
-        mode == "data-branch"    && $2 != want { d = $2 }
+        (mode == "data-branch" || mode == "sites") && $2 != want { d = $2 }
         mode == "no-data-branch" && $2 != 0    { d = $2 }
         mode == "indirect-call"  && $3 != want { c = $3 }
         mode == "loop-exit" && ($5 != 2 || $6 != 1 || $7 != 0) { b = $5; ic = $6; ih = $7 }
@@ -351,6 +410,17 @@ check() {
         data-branch)
             if [ "$data" -ne "$want" ]; then
                 echo "FAIL $label: expected $want data branch(es), found $data"; bad=1
+            fi ;;
+        sites)
+            set -- $(site_info "$re")
+            expected=$(awk -v n="$want" 'BEGIN { for (i = 0; i < n; i++) printf "%s%d", i ? "," : "", i }')
+            sorted=$(printf '%s\n' "$1" | tr , '\n' | sort -n | paste -sd, -)
+            if [ "$data" -ne "$want" ]; then
+                echo "FAIL $label: expected $want data branch(es), found $data"; bad=1
+            elif [ "$sorted" != "$expected" ]; then
+                echo "FAIL $label: site offsets $1, expected 0..$((want - 1)) once each"; bad=1
+            elif [ "$2" != "$want" ]; then
+                echo "FAIL $label: block pointer advanced by $2, expected $want"; bad=1
             fi ;;
         no-data-branch)
             if [ "$data" -ne 0 ]; then
@@ -376,6 +446,14 @@ check "Test 1/4 sum_threshold"            'sum_threshold'             data-branc
 check "Test 2/5 count_decisions"          'count_decisions'           data-branch 1
 check "Test 4 sum_branchless"             'sum_branchless'            no-data-branch
 check "Test 3 dispatch_indexed"           'dispatch_indexed'          indirect-call 1
+if c_kernel_build; then
+    check "Test 5 pattern_sites_1"        'pattern_sites_1'           sites 1
+    echo "skip Test 5 pattern_sites_4-512: C-kernel build (only N = 1)"
+else
+    for k in $pattern_kernels; do
+        check "Test 5 $k" "$k" sites "${k#pattern_sites_}"
+    done
+fi
 check "Test 6 loop_exit"                  'loop_exit'                 loop-exit
 check "Test 6 loop_exit_body2"            'loop_exit_body2'           loop-exit
 
