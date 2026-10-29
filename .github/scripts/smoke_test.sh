@@ -38,6 +38,13 @@ expect 0 $small -n 3 -o "$dir/report.md"
 expect 0 --trials 2 --test 2 --test 4 --output "$dir/report2.md" --size 4k --reps 1
 expect 0 -t 1 -t 3 --size 1m --reps 1
 expect 0 -t 3 --size 1000 --reps 1
+# --cpu pins the run; a CPU that cannot be used is reported, not fatal.
+expect 0 -t 3 --cpu 0 --size 4K --reps 1 -o "$dir/cpu0.md"
+grep -q '^_Pinned to CPU 0._$' "$dir/cpu0.md" || { echo "FAIL cpu0.md lacks the pinned line"; fail=1; }
+expect 0 -t 3 --cpu 1023 --size 4K --reps 1 -o "$dir/cpu1023.md"
+grep -q '^_CPU affinity request for CPU 1023 failed: ' "$dir/cpu1023.md" ||
+    { echo "FAIL cpu1023.md lacks the failed-pin line"; fail=1; }
+grep -q 'running unpinned' "$dir/stderr" || { echo "FAIL failed pin lacks its warning"; fail=1; }
 # --seed takes a decimal or 0x hex base seed for every test's input.
 expect 0 -t 3 --seed 7 --size 4K --reps 1
 expect 0 -t 3 --seed 0x1f --size 4K --reps 1
@@ -94,6 +101,8 @@ fi
 # ... and describe the training and pairing protocol when trials > 1.
 grep -q '^_Median of 3 trials per variant; each trial follows one untimed training run' "$dir/report.md" ||
     { echo "FAIL report.md lacks the trial protocol line"; fail=1; }
+# ... and say nothing about affinity unless --cpu was given.
+if grep -q 'CPU affinity\|Pinned to' "$dir/report.md"; then echo "FAIL default report mentions affinity"; fail=1; fi
 # ... and record the compiler that built it.
 grep -q '^| Array size | Repetitions | Perf counters | Compiler |$' "$dir/report.md" ||
     { echo "FAIL report.md lacks a Compiler column"; fail=1; }
@@ -107,6 +116,9 @@ expect 1 --reps 0
 expect 1 --reps
 expect 1 -n 100
 expect 1 -t 7
+expect 1 --cpu 1024
+expect 1 --cpu
+expect 1 --cpu x
 expect 1 --seed
 expect 1 --seed -1
 expect 1 --seed 18446744073709551616

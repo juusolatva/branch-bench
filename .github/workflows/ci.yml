@@ -259,7 +259,7 @@ jobs:
           .github/scripts/smoke_test.sh ./branch_bench_cov "$dir"
           # Fails if the shim was not used: these lines need the counters.
           grep -q '^\*\*Effective extra cycles per additional miss:\*\* -\{0,1\}[0-9]' "$dir/report.md"
-          grep -q '^\*\*Average clock during measurements:\*\*' "$dir/report.md"
+          grep -q '^\*\*Effective user-cycle rate during measurements:\*\*' "$dir/report.md"
           grep -q '^\*\*Periods at' "$dir/t5.md"
           grep -q '^\*\*Correlation used:\*\* d=4 [0-9][0-9]*%, d=8 n/a' "$dir/t6.md"
           grep -q '^_n/a: ' "$dir/t6.md"

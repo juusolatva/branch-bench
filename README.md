@@ -62,10 +62,12 @@ The report heading shows the CPU's maximum (turbo/boost) clock where
 Linux reports it. Where it does not (WSL2, most VMs), the heading is the
 model name as is, which on Intel CPUs may end in the base clock
 (e.g. `@ 2.90GHz`). The CPU rarely holds its maximum clock under sustained load,
-so the report also ends with the **average clock during measurements**,
-calculated from the cycle counter. That is the clock the results were
-actually produced at, and it often explains why timings differ between
-runs on the same machine.
+so the report also ends with the **effective user-cycle rate during
+measurements**: user-mode cycles divided by wall time over all measured
+trials. It is close to the clock the results were actually produced at,
+and often explains why timings differ between runs on the same machine.
+Time spent in the kernel or preempted lowers it, so it is not the core's
+instantaneous clock.
 
 ## Repeated measurements
 
@@ -109,6 +111,11 @@ and `--size` × `--reps` ≥ 65664.
 Test 3); `K`/`M` suffixes are allowed. `--reps` sets how many passes each
 trial makes over the array (for Test 6, it scales the branch budget). Results are only comparable with
 [RESULTS.md](RESULTS.md) at the defaults (`--size 4M --reps 64`).
+`--cpu <N>` pins the whole run to CPU N before the counters open, which
+keeps the scheduler from moving it between cores (e.g. P- and E-cores).
+If the CPU cannot be used, a warning says so, the banner and report say
+the pin failed, and the run continues unpinned.
+
 Run `./branch_bench --help` for all options.
 
 ## Seeds and revisions

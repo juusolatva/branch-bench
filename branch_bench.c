@@ -70,6 +70,7 @@
 #define MAX_TRIALS    99           /* upper limit for -n/--trials             */
 #define MAX_SIZE      (1UL << 30)  /* upper limit for --size                  */
 #define MAX_REPS      100000UL     /* upper limit for --reps                  */
+#define MAX_CPU       1023         /* highest CPU number for --cpu            */
 #define BENCH_REVISION 2           /* bumped whenever measurements change     */
 #define DEFAULT_SEED  0xdeadbeefcafe1234ULL  /* --seed default */
 
@@ -118,6 +119,7 @@ static unsigned tests_selected = 0;    /* -t/--test bitmask (bit n-1 = test n);
 static int      hard_selected = 0;     /* --hard: all tests, including 5 and 6 */
 static u64      base_seed = DEFAULT_SEED;  /* --seed: every test's input derives from it */
 static int      seed_given = 0;        /* --seed was on the command line */
+static int      cpu_requested = -1;    /* --cpu: CPU to pin to, -1 = none */
 
 /* ── Types ───────────────────────────────────────────────────────────────── */
 
@@ -806,6 +808,58 @@ static double cpu_max_ghz(void)
     }
 #endif
     return (double)khz_max / 1e6;
+}
+
+/* CPU affinity (--cpu).  Set once, before the counters open, so they and
+ * every measurement run on the requested CPU.  A failure is recorded and
+ * reported, never hidden: the run goes on unpinned. */
+enum { AFF_NOT_REQUESTED, AFF_PINNED, AFF_FAILED, AFF_UNSUPPORTED };
+static int affinity_status = AFF_NOT_REQUESTED;
+static int affinity_errno  = 0;
+
+static const char *affinity_error(void)
+{
+    return strerror(affinity_errno);
+}
+
+#if defined(__linux__) && defined(__NR_sched_setaffinity) && defined(__NR_sched_getaffinity)
+/* Pins to cpu_requested through the raw syscalls (glibc's wrappers need
+ * _GNU_SOURCE) and reads the mask back: exactly that CPU must be set. */
+static void pin_to_cpu(void)
+{
+    unsigned long want[(MAX_CPU + 1) / (8 * sizeof(unsigned long))];
+    unsigned long got[sizeof want / sizeof want[0]];
+    const size_t bits = 8 * sizeof want[0];
+    const size_t cpu = (size_t)cpu_requested;
+    memset(want, 0, sizeof want);
+    memset(got, 0, sizeof got);
+    want[cpu / bits] = 1UL << (cpu % bits);
+    affinity_status = AFF_FAILED;
+    if (syscall(__NR_sched_setaffinity, 0, sizeof want, want) != 0 ||
+        syscall(__NR_sched_getaffinity, 0, sizeof got, got) < 0) {
+        affinity_errno = errno;
+        return;
+    }
+    if (memcmp(want, got, sizeof want) != 0) {
+        affinity_errno = EINVAL;
+        return;
+    }
+    affinity_status = AFF_PINNED;
+}
+#else
+static void pin_to_cpu(void)
+{
+    affinity_status = AFF_UNSUPPORTED;
+}
+#endif
+
+static void apply_affinity(void)
+{
+    if (cpu_requested < 0) return;
+    pin_to_cpu();
+    if (affinity_status == AFF_FAILED)
+        fprintf(stderr, "Warning: could not pin to CPU %d (%s); running unpinned.\n",
+                cpu_requested, affinity_error());
 }
 
 /* Report heading: the CPU model, with any "@ <base clock>" it carries
@@ -1875,6 +1929,7 @@ static void print_usage(const char *prog)
            "      --reps <N>       passes over the array per trial, tests 1/2/4/5;\n"
            "                       scales test 6's branch budget with --size\n"
            "                       (default: %u, max: %lu)\n"
+           "      --cpu <N>        pin the benchmark to CPU N (0–1023) before measuring\n"
            "      --seed <N>       base seed for all test inputs (default: 16045690984503054900)\n"
            "  -h, --help           show this help\n",
            prog, MAX_TRIALS, NUM_TESTS, DEFAULT_SIZE, MAX_SIZE, DEFAULT_REPS, MAX_REPS);
@@ -1926,6 +1981,11 @@ static int apply_option(int argc, char **argv, int *i, const char **out_path)
     if (is_opt(arg, NULL, "--reps")) {
         if (!option_number(argc, argv, i, "repetition count", 1, MAX_REPS, &v)) return 1;
         reps = (unsigned)v;
+        return -1;
+    }
+    if (is_opt(arg, NULL, "--cpu")) {
+        if (!option_number(argc, argv, i, "CPU number", 0, MAX_CPU, &v)) return 1;
+        cpu_requested = (int)v;
         return -1;
     }
     if (is_opt(arg, NULL, "--seed")) {
@@ -1999,6 +2059,14 @@ static void print_banner(const char *tests_list)
         printf("  Tests:           %10s (all, with --hard)\n", tests_list);
     else if (tests_selected)
         printf("  Tests:           %10s (selected with -t)\n", tests_list);
+    if (affinity_status == AFF_PINNED)
+        printf("  CPU affinity:    pinned to CPU %d\n", cpu_requested);
+    else if (affinity_status == AFF_FAILED)
+        printf("  CPU affinity:    FAILED to pin to CPU %d (%s)\n", cpu_requested,
+               affinity_error());
+    else if (affinity_status == AFF_UNSUPPORTED)
+        printf("  CPU affinity:    not supported on this system (CPU %d requested)\n",
+               cpu_requested);
     printf("  Perf counters:   %s\n",
            perf_available() ? "AVAILABLE (hardware branch-miss counts shown)"
                             : "unavailable — showing wall-clock timing only");
@@ -2053,19 +2121,29 @@ static void write_report_header(FILE *report, const char *tests_list)
         fprintf(report, "_All tests were run (--hard), including the hard tests 5 and 6._\n\n");
     else if (tests_selected)
         fprintf(report, "_Only test(s) %s were run._\n\n", tests_list);
+    if (affinity_status == AFF_PINNED)
+        fprintf(report, "_Pinned to CPU %d._\n\n", cpu_requested);
+    else if (affinity_status == AFF_FAILED)
+        fprintf(report, "_CPU affinity request for CPU %d failed: %s._\n\n",
+                cpu_requested, affinity_error());
+    else if (affinity_status == AFF_UNSUPPORTED)
+        fprintf(report, "_CPU affinity not supported on this system (CPU %d requested)._\n\n",
+                cpu_requested);
 }
 
-/* Average clock over all measured trials, when the cycle counter worked. */
+/* User-mode cycles over wall time across all measured trials, when the
+ * cycle counter worked.  Kernel time and preemption lower it, so it is an
+ * effective rate, not the core's instantaneous clock. */
 static void print_clock_summary(FILE *report)
 {
     double avg_ghz = measured_ghz();
     double max_ghz = cpu_max_ghz();
     if (avg_ghz <= 0) return;
-    printf("Average clock during measurements: %.2f GHz", avg_ghz);
+    printf("Effective user-cycle rate during measurements: %.2f GHz", avg_ghz);
     if (max_ghz > 0) printf(" (max %.2f GHz)", max_ghz);
     printf("\n\n");
     if (report)
-        fprintf(report, "**Average clock during measurements:** %.2f GHz\n\n", avg_ghz);
+        fprintf(report, "**Effective user-cycle rate during measurements:** %.2f GHz\n\n", avg_ghz);
 }
 
 int main(int argc, char **argv)
@@ -2083,6 +2161,7 @@ int main(int argc, char **argv)
         if (!report) { perror("fdopen"); close(fd); return 1; }
     }
 
+    apply_affinity();
     perf_init();
 
     char tests_list[32];
