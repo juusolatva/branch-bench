@@ -11,7 +11,7 @@ A simple benchmark for testing out gains from branch prediction or conversely lo
 
 1. **Threshold Sum** sums the bytes above 128 in a sorted and a shuffled copy of the same random array, and prints how many bytes per pass are above 128 (about half).
 2. **Bias and Ordering** counts the ones in 0/1 arrays with 1/16, 1/4, 1/2, 3/4 or 15/16 ones. Each bias has exactly the same number of ones in three orders, a repeating word (e.g. `1000`), all ones first, and shuffled, plus all-0 and all-1 controls: 17 rows.
-3. **Indirect Dispatch** calls 32 functions through a pointer table, in sequential `i % 32` order or at random.
+3. **Indirect Dispatch** calls functions through a pointer table from one call site, for 1, 2, 4, … 64 targets, each in a repeating cycle (`i % T`) and in the same calls shuffled.
 4. **Branch vs Branchless** computes Test 1's sum with Test 1's conditional-jump kernel and with an arithmetic mask, on a sorted and a shuffled copy of one random array, and compares branchless with branch for each order directly.
 5. **Pattern Learnability** (opt-in) runs Test 2's kernel on repeating de Bruijn patterns with periods 32 to 2048, and on random 50% ones.
 6. **Correlation Distance** (opt-in) makes a branch repeat the random outcome of a branch d = 4 to 1024 constant-outcome branches earlier, against a reference where it is random.
@@ -56,7 +56,7 @@ This writes the report file in addition to the normal
 console output. An existing file is overwritten, and a new one is
 readable only by you. The program exits with status 1 on errors,
 including an invalid option or a kernel result that differs from the
-reference computed without the kernel (Tests 1, 2 and 4 check every row).
+reference computed without the kernel (Tests 1–4 check every row).
 
 The report heading shows the CPU's maximum (turbo/boost) clock where
 Linux reports it. Where it does not (WSL2, most VMs), the heading is the
@@ -132,7 +132,8 @@ time of one variant's trials over the other's.
 ```
 
 Test 2 needs a `--size` that is a multiple of 16 (whole periods of
-every bias pattern), and Test 5, which tiles whole periods of its longest
+every bias pattern), Test 3 a multiple of 64 (equal calls to every
+target), and Test 5, which tiles whole periods of its longest
 pattern, a multiple of 2048. At any other size such a test prints a skip
 note and the other selected tests still run. Test 6 needs `--size` ≥ 64
 and `--size` × `--reps` ≥ 65664.
@@ -243,7 +244,9 @@ Ryzen 5 9600X under WSL2).
   cycle takes an indirect predictor that uses branch history. Haswell
   (i7-4770) and the newer x86 cores with counters in RESULTS.md predict
   it almost perfectly, while the Ivy Bridge i5-3380M and the Cortex-A72
-  still miss ~27–28 of every 32 calls. The EPYC-Rome VPS (no counters;
+  still miss ~27–28 of every 32 calls (these figures are from revision 1,
+  which compared a 32-target cycle with random indices; revision 3 sweeps
+  1–64 targets through one call site). The EPYC-Rome VPS (no counters;
   its QEMU model name hides the host core) shows only a 1.20× slowdown,
   like the i5-3380M's 1.17×, so it apparently does not learn the cycle,
   possibly because of hypervisor mitigations. With random indices every

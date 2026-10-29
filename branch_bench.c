@@ -7,7 +7,7 @@
  *
  *  Test 1 — Threshold Sum       sorted vs shuffled array              (classic direct-branch demo)
  *  Test 2 — Bias and Ordering  5 biases × periodic/clustered/shuffled (bias vs sequence structure)
- *  Test 3 — Indirect Dispatch   sequential vs random function pointer  (indirect branch predictor)
+ *  Test 3 — Indirect Dispatch   cyclic vs shuffled, 1–64 targets       (indirect branch predictor)
  *  Test 4 — Branch vs Branchless sorted/shuffled × branch/arithmetic (branchless per order)
  *  Test 5 — Pattern Learnability de Bruijn periods 32..2048 vs random (pattern length, opt-in)
  *  Test 6 — Correlation Distance B copies A after d fillers vs random (correlation reach, opt-in)
@@ -66,7 +66,8 @@
 #define DEFAULT_SIZE  (1u << 22)   /* 4 194 304 elements (tests 1/2/4/5/6) or calls (test 3) */
 #define DEFAULT_REPS  64           /* passes (tests 1/2/4/5); test 6 budget  */
 #define THRESHOLD     128          /* byte comparison threshold               */
-#define NUM_FUNCS     32           /* distinct indirect call targets (test 3) */
+#define NUM_FUNCS     64           /* leaf targets, largest count (test 3)    */
+#define T3_COUNTS     7            /* target counts 1, 2, 4, ... 64 (test 3)  */
 #define NUM_TESTS     6
 #define DEFAULT_TESTS 0xFu         /* tests run without -t: 1–4 (5 and 6 are opt-in) */
 #define HARD_TESTS    0x3Fu        /* tests run with --hard: all six              */
@@ -1658,26 +1659,24 @@ static void run_test2(FILE *report)
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *
- *  TEST 3 — Indirect Branch Dispatch: Sequential vs Random  (indirect predictor)
+ *  TEST 3 — Indirect Branch Dispatch: cyclic vs shuffled, 1–64 targets
  *
- *  Calls one of NUM_FUNCS trivial leaf functions via a function-pointer table.
- *  The CPU's indirect-branch predictor tries to guess the *target address* of
- *  each indirect call, not just taken/not-taken.  A plain Branch Target
- *  Buffer (BTB) only remembers the last target of each branch, which is
- *  wrong on every call here, so any learning comes from a predictor that
- *  also uses branch history.
+ *  dispatch_indexed() loads a precomputed target index per call and calls
+ *  that leaf function through one indirect call site.  The CPU's indirect
+ *  predictor must guess the target address.  For each target count T (1, 2,
+ *  4, ... 64) two index sequences with exactly the same number of calls to
+ *  every target are compared:
  *
- *  Sequential (i % NUM_FUNCS):  a repeating cycle of 32 targets.  History-
- *                                based indirect predictors (e.g. Haswell and
- *                                newer) learn it → almost no misses; older
- *                                cores (e.g. Ivy Bridge, Cortex-A72) miss
- *                                ~28 of every 32 calls.
+ *  Cyclic:    0, 1, ..., T-1, 0, 1, ...  A plain Branch Target Buffer only
+ *             remembers the last target, so learning the cycle takes a
+ *             predictor that uses branch history.
  *
- *  Random:                      the next target is drawn from a pre-shuffled
- *                               array of random indices → nothing to learn
- *                               → right only by chance, ~1 call in 32.
+ *  Shuffled:  the cyclic sequence, randomly permuted: nothing to learn
+ *             beyond the target frequencies.
  *
- *  This mirrors stress-ng's --branch and --icache stressors.
+ *  Both rows of a pair run the same code on the same table; only the order
+ *  differs.  The leaves have identical instruction shapes (check_kernels.sh
+ *  checks this), so every call does the same work.
  *
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -1688,14 +1687,25 @@ typedef u64 (*leaf_fn_t)(u64);
     F( 0) F( 1) F( 2) F( 3) F( 4) F( 5) F( 6) F( 7) \
     F( 8) F( 9) F(10) F(11) F(12) F(13) F(14) F(15) \
     F(16) F(17) F(18) F(19) F(20) F(21) F(22) F(23) \
-    F(24) F(25) F(26) F(27) F(28) F(29) F(30) F(31)
+    F(24) F(25) F(26) F(27) F(28) F(29) F(30) F(31) \
+    F(32) F(33) F(34) F(35) F(36) F(37) F(38) F(39) \
+    F(40) F(41) F(42) F(43) F(44) F(45) F(46) F(47) \
+    F(48) F(49) F(50) F(51) F(52) F(53) F(54) F(55) \
+    F(56) F(57) F(58) F(59) F(60) F(61) F(62) F(63)
 
-/* Each function does one unique arithmetic op so it can't be merged by the
- * linker's identical-code folding (ICF). The constant is a unique Weyl-
- * sequence step derived from the golden ratio. */
+/* Leaf n's constant: a Weyl-sequence step, distinct and nonzero, with every
+ * 16-bit chunk in 1..0x7fff, so each constant needs the same instructions
+ * (x86-64 movabs; AArch64 mov + three movk) and every leaf has one shape.
+ * Distinct constants also keep identical code folding (ICF) from merging
+ * the leaves. */
+#define LEAF_CONST(n) \
+    ((((u64)(n) + 1) * 0x9e3779b97f4a7c15ULL & 0x7ffe7ffe7ffe7ffeULL) | 0x0001000100010001ULL)
+
+/* Rotate, then xor: order-dependent, so a call to the wrong target or in
+ * the wrong order changes the result. */
 #define DEF_LEAF(n) \
     __attribute__((noinline)) \
-    static u64 leaf_##n(u64 x) { return x ^ ((u64)(n) * 0x9e3779b97f4a7c15ULL); }
+    static u64 leaf_##n(u64 x) { return ((x << 1) | (x >> 63)) ^ LEAF_CONST(n); }
 
 FOR_EACH_LEAF(DEF_LEAF)
 
@@ -1703,16 +1713,7 @@ FOR_EACH_LEAF(DEF_LEAF)
 static leaf_fn_t leaf_table[NUM_FUNCS] = { FOR_EACH_LEAF(PTR_LEAF) };
 
 __attribute__((noinline))
-static u64 dispatch_sequential(size_t n)
-{
-    u64 acc = 0;
-    for (size_t i = 0; i < n; i++)
-        acc = leaf_table[i % NUM_FUNCS](acc);
-    return acc;
-}
-
-__attribute__((noinline))
-static u64 dispatch_random(const u8 *idx, size_t n)
+static u64 dispatch_indexed(const u8 *idx, size_t n)
 {
     u64 acc = 0;
     for (size_t i = 0; i < n; i++)
@@ -1720,42 +1721,125 @@ static u64 dispatch_random(const u8 *idx, size_t n)
     return acc;
 }
 
+/* dispatch_indexed()'s result without the calls. */
+static u64 dispatch_reference(const u8 *idx, size_t n)
+{
+    u64 acc = 0;
+    for (size_t i = 0; i < n; i++)
+        acc = ((acc << 1) | (acc >> 63)) ^ LEAF_CONST(idx[i]);
+    return acc;
+}
+
+static void fill_cyclic(u8 *idx, size_t n, unsigned targets)
+{
+    for (size_t i = 0; i < n; i++)
+        idx[i] = (u8)(i % targets);
+}
+
+/* 1 iff every index is below targets and each target gets n / targets
+ * calls. */
+static int equal_target_counts(const u8 *idx, size_t n, unsigned targets)
+{
+    size_t count[NUM_FUNCS] = {0};
+    for (size_t i = 0; i < n; i++) {
+        if (idx[i] >= targets) return 0;
+        count[idx[i]]++;
+    }
+    for (unsigned t = 0; t < targets; t++)
+        if (count[t] != n / targets) return 0;
+    return 1;
+}
+
+static int test3_size_ok(size_t len)
+{
+    return len >= NUM_FUNCS && len % NUM_FUNCS == 0;
+}
+
+#define T3_TITLE "Test 3 — Indirect Dispatch"
+#define T3_DESC  "One indirect call site over 1–64 leaf targets; cyclic vs shuffled index sequences with equal target counts."
+
+static const char *const t3_labels[2 * T3_COUNTS] = {
+    "T= 1 cyclic", "T= 1 shuffled", "T= 2 cyclic", "T= 2 shuffled",
+    "T= 4 cyclic", "T= 4 shuffled", "T= 8 cyclic", "T= 8 shuffled",
+    "T=16 cyclic", "T=16 shuffled", "T=32 cyclic", "T=32 shuffled",
+    "T=64 cyclic", "T=64 shuffled",
+};
+CHECK_LEN(t3_labels_len_check, t3_labels, 2 * T3_COUNTS);
+static const char *const t3_ratio[T3_COUNTS] = {
+    "T=1 shuffled vs cyclic", "T=2 shuffled vs cyclic", "T=4 shuffled vs cyclic",
+    "T=8 shuffled vs cyclic", "T=16 shuffled vs cyclic", "T=32 shuffled vs cyclic",
+    "T=64 shuffled vs cyclic",
+};
+static const char *const t3_prefix[T3_COUNTS] = {
+    "  → T= 1 shuffled vs cyclic: ", "  → T= 2 shuffled vs cyclic: ",
+    "  → T= 4 shuffled vs cyclic: ", "  → T= 8 shuffled vs cyclic: ",
+    "  → T=16 shuffled vs cyclic: ", "  → T=32 shuffled vs cyclic: ",
+    "  → T=64 shuffled vs cyclic: ",
+};
+
+/* Builds target count i's two sequences, checks their target counts and
+ * measures them as one pair. */
+static void measure_targets(int i, u8 *cyclic, u8 *shuffled, size_t len,
+                            ReportRow rows[2 * T3_COUNTS], int *pair)
+{
+    const unsigned targets = 1u << i;
+    fill_cyclic(cyclic, len, targets);
+    memcpy(shuffled, cyclic, len);
+    rng_state = test_seed(3, targets, 0);
+    shuffle_u8(shuffled, len);
+    if (!equal_target_counts(cyclic, len, targets) || !equal_target_counts(shuffled, len, targets)) {
+        fprintf(stderr, "Internal error: Test 3 input check failed for %u targets\n", targets);
+        exit(1);
+    }
+    log_input(2 * i, cyclic, len, 0, 0);
+    log_input(2 * i + 1, shuffled, len, 0, 0);
+    MEASURE_PAIR(rows[2 * i].r, 2 * i, dispatch_indexed(cyclic, len),
+                 rows[2 * i + 1].r, 2 * i + 1, dispatch_indexed(shuffled, len), *pair);
+    check_result(rows[2 * i].label, rows[2 * i].r.result, dispatch_reference(cyclic, len));
+    check_result(rows[2 * i + 1].label, rows[2 * i + 1].r.result,
+                 dispatch_reference(shuffled, len));
+}
+
 static void run_test3(FILE *report)
 {
     seed_test(3);
     const size_t len = size;
-    /* Pre-built random index sequence (uint8_t → 1 byte/call → cache-friendly) */
-    u8 *dispatch_indices = malloc(len);
-    if (!dispatch_indices) { perror("malloc"); exit(1); }
-    for (size_t i = 0; i < len; i++)
-        dispatch_indices[i] = (u8)rng_below(NUM_FUNCS);
-
     if (len % (1u << 20) == 0)
-        printf("TEST 3 — Indirect Dispatch  (%u targets, %zuM calls)\n",
+        printf("TEST 3 — Indirect Dispatch  (1–%u targets, cyclic vs shuffled, %zuM calls)\n",
                NUM_FUNCS, len >> 20);
     else
-        printf("TEST 3 — Indirect Dispatch  (%u targets, %zu calls)\n",
+        printf("TEST 3 — Indirect Dispatch  (1–%u targets, cyclic vs shuffled, %zu calls)\n",
                NUM_FUNCS, len);
     printf("  Calls leaf functions via pointer. The indirect predictor must guess the target address.\n\n");
+    if (!test3_size_ok(len)) {
+        emit_skip(report, T3_TITLE,
+                  "Test 3 needs --size to be a multiple of 64 (equal calls to every target).");
+        return;
+    }
+    u8 *cyclic   = malloc(len);
+    u8 *shuffled = malloc(len);
+    if (!cyclic || !shuffled) { perror("malloc"); exit(1); }
 
-    Result rs = {0};
-    Result rr = {0};
-    int pair;
-    MEASURE_PAIR(rs, 0, dispatch_sequential(len),
-                 rr, 1, dispatch_random(dispatch_indices, len), pair);
-
-    anti_dce_sink(rs.result + rr.result);
-
-    free(dispatch_indices);
+    const Result none = {0};
+    ReportRow rows[2 * T3_COUNTS];
+    for (int i = 0; i < 2 * T3_COUNTS; i++) {
+        rows[i].label = t3_labels[i];
+        rows[i].r     = none;
+        rows[i].work  = NULL;
+    }
+    int pairs[T3_COUNTS];
+    for (int i = 0; i < T3_COUNTS; i++)
+        measure_targets(i, cyclic, shuffled, len, rows, &pairs[i]);
+    free(cyclic);
+    free(shuffled);
 
     const Work work = { len, "call" };
-    const ReportRow rows[] = {
-        { "Sequential i%32 (learnable cycle)", rs, NULL },
-        { "Random index (unlearnable)",        rr, NULL },
-    };
-    emit_pair_summary(report, "Test 3 — Indirect Dispatch",
-                      "32 targets, function-pointer call. The indirect predictor must guess the target address.",
-                      rows, &work, pair);
+    emit_rows(report, T3_TITLE, T3_DESC, rows, 2 * T3_COUNTS, &work);
+    printf("\n");
+    for (int i = 0; i < T3_COUNTS; i++)
+        emit_pair_ratio(report, t3_prefix[i], t3_ratio[i], pairs[i], "");
+    print_pair_cost(report, pairs[T3_COUNTS - 1]);   /* 64 targets */
+    printf("\n");
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -2318,8 +2402,7 @@ static const KernelDesc kernel_descs[] = {
     { KERNEL(sum_threshold, 2, KERNEL_BACKEND),   "elem",  1, 0, 2, ASM_TAKEN_WHEN, "1,4" },
     { KERNEL(sum_branchless, 1, "c"),             "elem",  0, 0, 1, NULL,           "4"   },
     { KERNEL(count_decisions, 2, KERNEL_BACKEND), "elem",  1, 0, 2, ASM_TAKEN_WHEN, "2,5" },
-    { KERNEL(dispatch_sequential, 1, "c"),        "call",  0, 1, 2, NULL,           "3"   },
-    { KERNEL(dispatch_random, 1, "c"),            "call",  0, 1, 2, NULL,           "3"   },
+    { KERNEL(dispatch_indexed, 1, "c"),           "call",  0, 1, 2, NULL,           "3"   },
     { KERNEL(correlate_distance, 1, "c"),         "block", 3, 0, 2, NULL,           "6"   },
 };
 #undef KERNEL

@@ -37,7 +37,11 @@ expect 0 $small
 expect 0 $small -n 3 -o "$dir/report.md"
 expect 0 --trials 2 --test 2 --test 4 --output "$dir/report2.md" --size 4k --reps 1
 expect 0 -t 1 -t 3 --size 1m --reps 1
-expect 0 -t 3 --size 1000 --reps 1
+# Test 3 skips when --size is not a multiple of 64 (equal calls to every
+# target).
+expect 0 -t 3 --size 1000 --reps 1 -o "$dir/skip3.md"
+grep -q 'Skipped:' "$dir/skip3.md" || { echo "FAIL skip3.md lacks the skip reason"; fail=1; }
+expect 0 -t 3 --size 64 --reps 1
 # --cpu pins the run; a CPU that cannot be used is reported, not fatal.
 # The CPUs come from this process's own affinity mask, so the cases hold in
 # a cpuset-limited container and on hosts with up to 1024 CPUs.
@@ -94,9 +98,9 @@ grep -q 'Skipped:' "$dir/skip6b.md" || { echo "FAIL skip6b.md lacks the skip rea
 expect 0 --hard $small -o "$dir/hard.md"
 grep -q '(all, with --hard)' "$dir/stdout" || { echo "FAIL --hard banner lacks its tests line"; fail=1; }
 expect 0 --hard -t 2 --size 4K --reps 1 -o "$dir/hard2.md"
-# The largest legal run fits the trial log: 59 (variant, pair) streams
+# The largest legal run fits the trial log: 71 (variant, pair) streams
 # (Test 2's shuffled rows and Test 5's random row are in two pairs) × 99
-# trials = 5841 records.  Large
+# trials = 7029 records.  Large
 # enough that Test 6, the biggest user, runs.
 expect 0 --hard -n 99 --size 64K --reps 2 --json "$dir/max.jsonl"
 for f in hard.md hard2.md; do

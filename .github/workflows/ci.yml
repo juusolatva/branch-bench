@@ -95,10 +95,10 @@ jobs:
 
       # Each fixture breaks the kernels in a way an older check accepted or
       # never looked for; the check must reject each with its own message.
-      - name: Kernel check rejects a loop guard, unrolled loops and merged leaves
+      - name: Kernel check rejects a loop guard, unrolled loops and merged or uneven leaves
         run: |
           out="$RUNNER_TEMP/check_fixture.txt"
-          for f in loop_guard unrolled asm_unrolled merged_leaves; do
+          for f in loop_guard unrolled asm_unrolled merged_leaves uneven_leaves; do
             gcc $BENCH_FLAGS $WARN_FLAGS -o "$RUNNER_TEMP/$f" ".github/scripts/${f}_fixture.c"
             .github/scripts/check_kernels.sh "$RUNNER_TEMP/$f" > "$out" || true
             cat "$out"
@@ -106,7 +106,8 @@ jobs:
               loop_guard)    grep -q '^FAIL Test 1/4 .*expected 1 data branch(es), found 0' "$out" ;;
               unrolled|asm_unrolled)
                              grep -q '^FAIL Test 1/4 .*expected 1 data branch(es), found [2-9]' "$out" ;;
-              merged_leaves) grep -q '^FAIL Test 3 leaves: 31 distinct addresses for 32 leaves' "$out" ;;
+              merged_leaves) grep -q '^FAIL Test 3 leaves: 63 distinct addresses for 64 leaves' "$out" ;;
+              uneven_leaves) grep -q '^FAIL Test 3 leaves: 2 instruction shapes for 64 leaves' "$out" ;;
             esac
           done
 

@@ -9,8 +9,12 @@
 #       exactly one data branch, no branchless instruction (conditional
 #       move/select, flag arithmetic such as setcc/sbb/adc), no SIMD.
 #   Test 4 sum_branchless: no data branch (cmov/setcc allowed), no SIMD.
-#   Test 3 dispatch_sequential, dispatch_random: exactly one indirect call.
-#   Test 3 leaves: leaf_0 ... leaf_31 at 32 distinct addresses.
+#   Test 3 dispatch_indexed: exactly one indirect call.
+#   Test 3 leaves: leaf_0 ... leaf_63 at 64 distinct addresses, all with the
+#       same instruction shape (padding, prefixes, comments and immediates
+#       ignored), so every target does the same work.  A retpoline or
+#       indirect-thunk build turns the call into a direct call to a thunk,
+#       which the indirect-call check rejects by design.
 #   Test 6 correlate_distance: at least three conditional branches inside
 #       its loops (A, filler and B; mode loop-branch3).
 #   Every kernel except sum_branchless: no branchless instruction; every
@@ -245,16 +249,36 @@ analyze() {
         END { flush() }'
 }
 
-# Prints the number of distinct addresses of leaf_0 ... leaf_31, then how
+# Prints the number of distinct addresses of leaf_0 ... leaf_63, then how
 # many of those symbols exist.
 leaves() {
     nm "$bin" | awk '$3 ~ /^leaf_[0-9]+$/ { n++; if (!($1 in seen)) { seen[$1] = 1; d++ } }
                      END { printf "%d %d\n", d, n }'
 }
 
+# Prints how many distinct instruction shapes the leaves leaf_0 ... leaf_63
+# have: padding lines (nop, xchg %ax,%ax, data16 ... nop, which objdump
+# lists after ret up to the next symbol) dropped, cs/ds/data16 prefixes
+# (run.sh's ret alignment) and objdump comments removed, immediates masked.
+leaf_shapes() {
+    printf '%s\n' "$disassembly" | awk '
+        /^[0-9a-f]+ <leaf_[0-9]+>:$/ { name = $2; in_leaf = 1; shape[name] = ""; next }
+        in_leaf && /^$/              { in_leaf = 0; next }
+        in_leaf {
+            line = $0; sub(/^[^\t]*\t/, "", line)
+            sub(/[ \t]*(#|\/\/).*$/, "", line)
+            gsub(/[ \t]+/, " ", line); sub(/^ /, "", line); sub(/ $/, "", line)
+            while (line ~ /^(cs|ds|data16) /) sub(/^[a-z0-9]+ /, "", line)
+            if (line ~ /^(nop|xchg %ax,%ax)/ || line == "") next
+            gsub(/\$?0x[0-9a-f]+|#(0x)?[0-9a-f]+/, "IMM", line)
+            shape[name] = shape[name] line ";"
+        }
+        END { for (k in shape) if (!(shape[k] in seen)) { seen[shape[k]] = 1; d++ }; print d + 0 }'
+}
+
 if [ "$counts" -eq 1 ]; then
     missing=0
-    for k in sum_threshold sum_branchless count_decisions dispatch_sequential dispatch_random correlate_distance; do
+    for k in sum_threshold sum_branchless count_decisions dispatch_indexed correlate_distance; do
         line=$(analyze "$k" | awk 'NR == 1')
         if [ -z "$line" ]; then
             echo "check_kernels.sh: kernel $k not found" >&2; missing=1; continue
@@ -321,15 +345,17 @@ check() {
 check "Test 1/4 sum_threshold"            'sum_threshold'             data-branch 1
 check "Test 2/5 count_decisions"          'count_decisions'           data-branch 1
 check "Test 4 sum_branchless"             'sum_branchless'            no-data-branch
-check "Test 3 dispatch_sequential"        'dispatch_sequential'       indirect-call 1
-check "Test 3 dispatch_random"            'dispatch_random'           indirect-call 1
+check "Test 3 dispatch_indexed"           'dispatch_indexed'          indirect-call 1
 check "Test 6 correlate_distance"         'correlate_distance'        loop-branch3
 
 set -- $(leaves)
-if [ "$2" -ne 32 ]; then
-    echo "FAIL Test 3 leaves: found $2 of 32 leaves"; fail=1
-elif [ "$1" -ne 32 ]; then
-    echo "FAIL Test 3 leaves: $1 distinct addresses for 32 leaves"; fail=1
+shapes=$(leaf_shapes)
+if [ "$2" -ne 64 ]; then
+    echo "FAIL Test 3 leaves: found $2 of 64 leaves"; fail=1
+elif [ "$1" -ne 64 ]; then
+    echo "FAIL Test 3 leaves: $1 distinct addresses for 64 leaves"; fail=1
+elif [ "$shapes" -ne 1 ]; then
+    echo "FAIL Test 3 leaves: $shapes instruction shapes for 64 leaves"; fail=1
 else
     echo "ok   Test 3 leaves"
 fi

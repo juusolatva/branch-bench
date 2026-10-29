@@ -811,6 +811,35 @@ static void bias_inputs(void)
     assert(!test2_size_ok(8) && !test2_size_ok(1000));
 }
 
+/* Test 3: distinct nonzero leaf constants, equal target counts in every
+ * sequence, and a call-free reference that depends on the call order. */
+static void dispatch_inputs(void)
+{
+    for (unsigned a = 0; a < NUM_FUNCS; a++) {
+        assert(LEAF_CONST(a) != 0);
+        for (unsigned b = a + 1; b < NUM_FUNCS; b++) assert(LEAF_CONST(a) != LEAF_CONST(b));
+    }
+    u8 idx[256];
+    for (unsigned t = 1; t <= NUM_FUNCS; t <<= 1) {
+        fill_cyclic(idx, sizeof idx, t);
+        assert(equal_target_counts(idx, sizeof idx, t));
+        assert(dispatch_indexed(idx, sizeof idx) == dispatch_reference(idx, sizeof idx));
+    }
+    idx[0] = 1;                                   /* one call moved to another target */
+    assert(!equal_target_counts(idx, sizeof idx, NUM_FUNCS));
+    fill_cyclic(idx, sizeof idx, 4);
+    idx[0] = 4;                                   /* a target outside the count */
+    assert(!equal_target_counts(idx, sizeof idx, 4));
+    fill_cyclic(idx, sizeof idx, 4);
+    const u64 cyc = dispatch_reference(idx, sizeof idx);
+    const u8 tmp = idx[0];
+    idx[0] = idx[1];
+    idx[1] = tmp;
+    assert(dispatch_reference(idx, sizeof idx) != cyc);   /* order matters */
+    assert(test3_size_ok(64) && test3_size_ok(4096));
+    assert(!test3_size_ok(32) && !test3_size_ok(1000));
+}
+
 int main(void)
 {
     perf_leader = 42;
@@ -852,5 +881,6 @@ int main(void)
     kernels();
     threshold_inputs();
     bias_inputs();
+    dispatch_inputs();
     return 0;
 }
