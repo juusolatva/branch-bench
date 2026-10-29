@@ -13,14 +13,14 @@ A simple benchmark for testing out gains from branch prediction or conversely lo
 2. **Bias and Ordering** counts the ones in 0/1 arrays with 1/16, 1/4, 1/2, 3/4 or 15/16 ones. Each bias has exactly the same number of ones in three orders, a repeating word (e.g. `1000`), all ones first, and shuffled, plus all-0 and all-1 controls: 17 rows.
 3. **Indirect Dispatch** calls functions through a pointer table from one call site, for 1, 2, 4, … 64 targets, each in a repeating cycle (`i % T`) and in the same calls shuffled.
 4. **Branch vs Branchless** computes Test 1's sum with Test 1's conditional-jump kernel and with an arithmetic mask, on a sorted and a shuffled copy of one random array, and compares branchless with branch for each order directly.
-5. **Pattern Learnability** (opt-in) runs Test 2's kernel on repeating de Bruijn patterns with periods 32 to 2048, and on random 50% ones.
-6. **Correlation Distance** (opt-in) makes a branch repeat the random outcome of a branch d = 4 to 1024 constant-outcome branches earlier, against a reference where it is random.
+5. **Pattern Learnability Matrix** (opt-in) runs N = 1, 4, 16, 64, 256 or 512 conditional branches per block, each repeating its own random L-bit word, after a fixed number of training periods, and shows misses and cycles per data branch as N × L tables. Constant, alternating, de Bruijn and balanced-random patterns are controls.
+6. **Loop Exits** (opt-in) runs one counted inner loop for trip counts C = 1 to 512, always on the same branch, and shows cycles per inner iteration and misses per completed loop.
 
-A run without `-t` runs Tests 1–4. It takes longer than before revision 3 (Test 2 measures 17 rows instead of 2): about 30 s instead of 10 s at the defaults on an i5-8350U laptop. Tests 5 and 6 run only when selected with `-t` or `--hard` (all six tests). Results are comparable only within one benchmark revision; RESULTS.md holds revision 1 (see [Seeds and revisions](#seeds-and-revisions)).
+A run without `-t` runs Tests 1–4. It takes longer than before revision 3 (Test 2 measures 17 rows instead of 2): about 30 s instead of 10 s at the defaults on an i5-8350U laptop. Tests 5 and 6 run only when selected with `-t` or `--hard` (all six tests); their grids come from `--profile` (see [Profiles](#profiles)). Results are comparable only within one benchmark revision; RESULTS.md holds revision 1 (see [Seeds and revisions](#seeds-and-revisions)).
 
 ## Notes
 
-You **MUST** run this with ./run.sh, use a [prebuilt binary](#prebuilt-binaries), or build it with exactly `gcc -std=c99 -O2 -fno-tree-vectorize -fno-if-conversion -o branch_bench branch_bench.c`, adding `-Wa,-mbranches-within-32B-boundaries,-malign-branch=jcc+fused+jmp+call+ret+indirect` on x86-64 as `./run.sh` does. Without *-fno-tree-vectorize* and *-fno-if-conversion* the compiler optimizes the mispredictions away, and other optimization levels give results that cannot be compared with [RESULTS.md](RESULTS.md). The x86-64 assembler flags keep every jump in the kernels off 32-byte boundaries, which Intel's JCC-erratum fix slows on Skylake-derived CPUs. `./run.sh` builds and then runs the benchmark with any options you give it (e.g. `./run.sh -n 5 -o report.md`); after that, `./branch_bench` runs it directly. Build with GCC. On x86-64 and AArch64 the kernels of Tests 1, 2, 4 and 5 are written in assembly, so they keep their branch with any compiler, Clang included; Test 6's kernel is C, and Clang (which has no equivalent of *-fno-if-conversion*) makes it branchless, so its Clang timings show no misprediction cost. Other architectures use C versions of all kernels, whose branches depend on the compiler; the banner and report say which kernels ran (`Kernels:`). See [AGENTS.md](AGENTS.md).
+You **MUST** run this with ./run.sh, use a [prebuilt binary](#prebuilt-binaries), or build it with exactly `gcc -std=c99 -O2 -fno-tree-vectorize -fno-if-conversion -o branch_bench branch_bench.c`, adding `-Wa,-mbranches-within-32B-boundaries,-malign-branch=jcc+fused+jmp+call+ret+indirect` on x86-64 as `./run.sh` does. Without *-fno-tree-vectorize* and *-fno-if-conversion* the compiler optimizes the mispredictions away, and other optimization levels give results that cannot be compared with [RESULTS.md](RESULTS.md). The x86-64 assembler flags keep every jump in the kernels off 32-byte boundaries, which Intel's JCC-erratum fix slows on Skylake-derived CPUs. `./run.sh` builds and then runs the benchmark with any options you give it (e.g. `./run.sh -n 5 -o report.md`); after that, `./branch_bench` runs it directly. Build with GCC. On x86-64 and AArch64 the branch kernels of Tests 1, 2 and 4–6 are written in assembly, so they keep their branches with any compiler, Clang included. Other architectures use C versions of all kernels, whose branches depend on the compiler (Clang has no equivalent of *-fno-if-conversion*), and Test 5 then measures only its N = 1 cells; the banner and report say which kernels ran (`Kernels:`). See [AGENTS.md](AGENTS.md).
 
 The benchmark builds on Linux with GCC; on Windows, use WSL2. Other POSIX systems build with GCC too but show times only. On macOS `gcc` is Clang, so install GCC (e.g. from Homebrew) and build with the command above using its versioned `gcc-<N>` (`./run.sh` calls plain `gcc`), without the `-Wa,...` flags: they need the GNU assembler (binutils 2.34 or later), which macOS does not use.
 
@@ -74,7 +74,7 @@ instantaneous clock.
 ## Machine-readable export
 
 `--json <file>` writes every measured trial and every summary as JSON
-Lines (one JSON object per line, schema 1), next to the console output
+Lines (one JSON object per line, schema 2), next to the console output
 and any `-o` report. The two must be different files; naming the same
 file (also via a hard link or `./`) is an error, and neither file is
 emptied until both have opened:
@@ -85,17 +85,19 @@ emptied until both have opened:
 
 | `type` | One record per | Main fields |
 |---|---|---|
-| `meta` (first line) | run | `schema` 1, `revision`, `results_ok` (false when a kernel result differed from its reference), CPU, microcode, arch, kernel, compiler, `kernel_backend` (`asm-x86_64`, `asm-aarch64` or `c`, for the data-branch kernels; each `kernel` record has its own `backend`), build flags, commit, `alignment_policy`, `seed` and `test_seeds`, size/reps/trials, `training_runs`, `schedule` (`AB/BA`), `affinity`, `hypervisor`, `smt_siblings`, `governor`, `max_ghz`, `effective_user_cycle_ghz`, and per counter its event type, config and `semantics` (`retired`, `speculative`, `cycles`, `unknown`) |
+| `meta` (first line) | run | `schema` 2, `revision`, `profile`, `results_ok` (false when a kernel result differed from its reference), CPU, microcode, arch, kernel, compiler, `kernel_backend` (`asm-x86_64`, `asm-aarch64` or `c`, for the data-branch kernels; each `kernel` record has its own `backend`), build flags, commit, `alignment_policy`, `seed` and `test_seeds`, size/reps/trials, `training_runs` (the untimed runs before each trial of Tests 1–4 and 6; Test 5 trains by exposure instead), `schedule` (`AB/BA`), `affinity`, `hypervisor`, `smt_siblings`, `governor`, `max_ghz`, `effective_user_cycle_ghz`, and per counter its event type, config and `semantics` (`retired`, `speculative`, `cycles`, `unknown`) |
+| `test` | selected test | `test` number, `id` (`threshold-sum`, `bias-ordering`, `indirect-dispatch`, `branch-vs-branchless`, `pattern-matrix`, `loop-exits`), `revision` and `title`; the id says which test a number means, since Test 6 meant Correlation Distance up to revision 3 |
 | `kernel` | kernel | `id`, `revision`, `backend` (`asm-…` or `c`), `entry` (always `null`), unit, declared `data_branches`, `indirect_calls`, `inner_loop_branches`, `taken_when` (`"false"`: the asm data branch jumps, skipping the update, when its condition is false; `null` for C kernels), tests |
-| `variant` | report row | `test`, `variant` (row index), `label`, `kernel`, `work` and `unit` per trial; its input, recorded before measuring: `pass_items` (items per pass), `cond_true` (items per pass whose source condition holds) and `input_hash` (FNV-1a of the input buffer), each `null` where the test does not record it |
-| `trial` | measured trial | `test`, `variant`, `pair`, run-wide `seq`, `trial`, `train_runs`, `time_ms`, `result` (the kernel's checksum), `perf_status`, `enabled_ns`/`running_ns`, `counts` (scaled) and `raw_counts` |
+| `variant` | report row | `test`, `variant` (row index), `label`, `kernel`, `work` and `unit` per trial; its input, recorded before measuring: `pass_items` (items per pass), `cond_true` (items per pass whose source condition holds) and `input_hash` (FNV-1a of the input buffer), each `null` where the test does not record it; `params`, the test's own parameters (Test 5: `N`, `L`, `blocks`, `passes`, `exposure`, `family`, `group`, `data_bytes`, `skipped`, `reason`, `ones`, `distinct`, `short_period`; Test 6: `C`, `loops`, `iters`, `body`), else `null` |
+| `trial` | measured trial | `test`, `variant`, `pair`, run-wide `seq`, `trial`, `train_runs` (`null` in Test 5, which trains by exposure), `exposure_before` (Test 5: the kernel's executions per site before this trial's timed call, training included; else `null`), `time_ms`, `result` (the kernel's checksum), `perf_status`, `enabled_ns`/`running_ns`, `counts` (scaled) and `raw_counts` |
 | `pair` | compared pair | `a`/`b` variants, `pairs`, `valid`, summed times, `slowdown`, signed `delta` per counter, `effective_cost` and `cost_status` (`resolved`, `inconclusive`, `unavailable`), and `cost_shown` (the cost line was printed) |
 
 Counters print as exact integers; a value that does not exist (a counter
 that is not open, a trial whose read failed, a ratio without data) is
 `null`, never 0. `.github/scripts/check_export.py run.jsonl --report
 report.md` rebuilds every pair summary from the trials and checks the
-report's medians, ranges, counter columns, ratios and cost lines against
+report's medians, ranges, counter columns, ratios, cost lines, Test 5's
+matrices and exposure records and Test 6's loop-exit curve against
 them. Seeds and counts are 64-bit integers, which exceed the 2⁵³ that
 JavaScript numbers (and `jq`) hold exactly; read them with a parser that
 keeps integers, such as Python's `json`.
@@ -114,7 +116,8 @@ reported, together with the fastest–slowest range, so you can see how
 noisy the run was.
 
 Every measured trial, also with the default `-n 1`, follows one untimed
-training run of the same variant, so the predictor has seen that
+training run of the same variant (Test 5 instead trains a fixed number of
+complete periods of every branch; see [Profiles](#profiles)), so the predictor has seen that
 variant's pattern just before it is timed. This does not reset predictor
 state left by other variants; it only makes the exposure the same for
 every trial. A run takes about twice as long per trial as the measured
@@ -128,21 +131,21 @@ time of one variant's trials over the other's.
 ```sh
 ./branch_bench -t 3                 # run only Test 3 (repeat -t for more)
 ./branch_bench --size 1M --reps 8   # smaller, quicker run (e.g. small boards)
-./branch_bench -t 5                 # opt-in Test 5 (pattern learnability)
-./branch_bench -t 6                 # opt-in Test 6 (correlation distance)
+./branch_bench -t 5                 # opt-in Test 5 (pattern learnability matrix)
+./branch_bench -t 6                 # opt-in Test 6 (loop exits)
 ./branch_bench --hard               # all six tests
+./branch_bench -t 5 --profile quick # a small Test 5 grid
 ```
 
 Test 2 needs a `--size` that is a multiple of 16 (whole periods of
-every bias pattern), Test 3 a multiple of 64 (equal calls to every
-target), and Test 5, which tiles whole periods of its longest
-pattern, a multiple of 2048. At any other size such a test prints a skip
-note and the other selected tests still run. Test 6 needs `--size` ≥ 64
-and `--size` × `--reps` ≥ 65664.
+every bias pattern) and Test 3 a multiple of 64 (equal calls to every
+target). At any other size such a test prints a skip note and the other
+selected tests still run.
 
-`--size` sets the elements per array (and the calls per trial for
-Test 3); `K`/`M` suffixes are allowed. `--reps` sets how many passes each
-trial makes over the array (for Test 6, it scales the branch budget). Results are only comparable with
+`--size` sets the elements per array of Tests 1, 2 and 4 (and the calls
+per trial for Test 3); `K`/`M` suffixes are allowed. `--reps` sets how
+many passes each trial makes over the array. Neither changes Tests 5
+and 6, whose sizes come from `--profile`. Results are only comparable with
 [RESULTS.md](RESULTS.md) at the defaults (`--size 4M --reps 64`).
 `--cpu <N>` pins the whole run to CPU N before the counters open, which
 keeps the scheduler from moving it between cores (e.g. P- and E-cores).
@@ -150,6 +153,32 @@ If the CPU cannot be used, a warning says so, the banner and report say
 the pin failed, and the run continues unpinned.
 
 Run `./branch_bench --help` for all options.
+
+## Profiles
+
+`--profile quick|standard|research` (default `standard`) picks what
+Tests 5 and 6 measure; Tests 1–4 ignore it. Every expanded value is in
+the export (`params`), and the banner and report name the profile.
+
+| Profile | Test 5 cells (N × L, blocks per pass) | Test 5 training | Test 6 counts C |
+|---|---|---|---|
+| `quick` | {1, 4, 16, 64} × {8, 32} over 256 blocks; {256, 512} × {16} over 96 | 8 periods | 1, 2, 4, 16, 64, 256 (2¹⁸ inner iterations per row) |
+| `standard` | {1, 4, 16, 64} × {8, 16, 32, 64, 128, 256} over 256 blocks; {256, 512} × {16, 32, 48} over 96 | 64 periods | 1–4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 160, 192, 256, 384, 512 (2²⁴ per row) |
+| `research` | {1, 4, 16, 64} × {8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256} over 768 blocks; {256, 512} × {16, 32, 48} over 96; {1} × {512 … 65536} over 65536 | 8, 64 and 512 periods, each a separate table | every C from 1 to 160, then 192, 256, 384, 512, plus a second loop body at the standard counts (2²⁴ per row) |
+
+The standard values are provisional until the hardware pilots of the
+first six-test release fix them. Test 5's controls (constant 0,
+alternating, de Bruijn periods 32–2048 (only 32 and 2048 in `quick`), and a balanced random reference
+of 65536 outcomes) run at N = 1 over 65536 blocks in every profile.
+
+In Test 5, the blocks per pass are a multiple of every L in a group, so
+a given N has the same data footprint (N × blocks bytes) at every period,
+and every branch trains for exactly the profile's number of complete
+periods before each trial. Each measured row runs at least 64 complete
+periods per branch and 2²² data-branch executions (2¹⁶ in `quick`).
+A cell whose training and measurement would exceed the profile's
+execution budget is skipped with a note, never shrunk; builds without the
+assembly kernels skip every N > 1 cell.
 
 ## Seeds and revisions
 
@@ -163,7 +192,23 @@ The banner and report also show the **benchmark revision**. It goes up
 whenever a change alters what is measured (inputs, warm-up, pairing,
 summaries), even when the test numbers stay the same. Results from
 different revisions are not comparable; the entries in RESULTS.md so far
-are revision 1, and this version is revision 3.
+are revision 1, and this version is revision 4.
+
+### Revision 4 migration
+
+Revision 4 replaces Tests 5 and 6 under the same numbers:
+
+- **Test 5** was a de Bruijn period sweep over `--size` elements on
+  Test 2's kernel. It is now the pattern learnability matrix
+  (`pattern-matrix`, kernels `pattern_sites_N`), sized by `--profile`.
+- **Test 6** was Correlation Distance (`correlate_distance`). It is now
+  Loop Exits (`loop-exits`, kernels `loop_exit` and `loop_exit_body2`).
+
+Results of the old tests keep their old identity: an export from
+revision 3 or earlier (schema 1, or no export) with a Test 5 or 6 means the old
+tests, and nothing of theirs is comparable with revision 4. Correlation
+experiments are planned to return only as an explicitly experimental
+Test 10. `--size` and `--reps` no longer affect Tests 5 and 6.
 
 ## Adding results
 
@@ -277,31 +322,37 @@ Ryzen 5 9600X under WSL2).
   on sorted data (319 ms vs 390 ms), but its QEMU model name hides the
   host's real core, so it neither confirms nor refutes this. The
   Raspberry Pi 4's reason has not been investigated.
-- **Test 5** feeds Test 2's branch binary de Bruijn sequences of order
-  k = 5 to 11. Each period of 2^k outcomes contains every k-bit word
-  exactly once, so the last k outcomes always identify the position, and
-  a long period does not need an equally long history. Read the misses
-  per element against the period: they show how well this kernel's branch
-  learns each pattern, compared with the random row's ~0.5. They do not
-  measure a predictor's capacity, history length or table structure. In
-  the GCC x86-64 build the loop has two conditional branches per element
-  (the data branch and the back-edge), so a global-history predictor would
-  see about 2k outcomes per k-bit context, and results also depend on
-  table sizes, hashing and training. Below `--size 64K` the summary lines
-  show n/a: the random row repeats so often that a predictor may learn it.
-- **Test 6** asks how far back a correlated outcome can be and still be
-  used. Each block runs branch A on a random outcome, d filler branches
-  with a constant outcome, then branch B. In the correlated row B equals A,
-  so B is predictable only if the predictor's history still reaches A; in
-  the reference row B is random. "Correlation used" is the share of the
-  0.5 misses per block that a random B costs which the correlated row
-  avoids. The filler
-  loop's exit can also mispredict, but equally in both rows, so it cancels.
-  d counts filler iterations, not history bits: each adds two conditional
-  branches in the GCC build (the filler and the loop back-edge). The
-  percentage need not fall steadily with d, and "Largest d with ≥ 90%" is
-  a description of this run, not a measured history length. A distance
-  with fewer than 65536 blocks per pass shows n/a: its random sequences
-  repeat so often that a predictor may learn them, which could make B
-  predictable without A. At the defaults every distance has enough. Rows do
-  different amounts of work, so compare times only within a pair.
+- **Test 5** asks how the misses depend on the number of branches N and
+  the pattern length L. Each of the N branches of a block reads its own
+  byte of the block, and each repeats its own random L-bit word, so all
+  N patterns must be learned at once. Read the matrices against the
+  controls: the constant and alternating rows are the floor, and the
+  balanced reference (65536 random outcomes, about 0.5 misses per branch)
+  the ceiling. Where misses rise with N or L is a description of this
+  kernel after this much training on this machine; it is not a
+  predictor's table capacity, entry count or history length. Several
+  things the matrix does not separate: the block loop's own branch (one
+  per N data branches) and the pass loop's exit are in the counts; a
+  larger N also means more code and a larger data footprint (N × blocks
+  bytes), and cache effects are not measured; and training is fixed, so a
+  row that is still learning looks worse than a steady one. The research
+  profile repeats every cell after 8, 64 and 512 training periods to show
+  that. Random words are not filtered: with N = 512 and L = 8 many
+  branches share a word (`distinct` in the export), and a word can have a
+  shorter period than L (`short_period`). The de Bruijn controls contain
+  every k-bit word once per period of 2^k, so a short history identifies
+  the position; how well they are learned is again a property of this
+  kernel and machine.
+- **Test 6** runs one counted loop: the inner branch is taken C − 1 times
+  and not taken once per completed loop, and the trip count is a
+  run-time value, so every count uses the same branch address and body.
+  Misses per loop are near 0 where the exit is predicted and approach 1
+  where it is not; they include the outer loop branch and the call. A
+  count at which misses rise describes this kernel on this machine; it is
+  not a loop predictor's limit, and published loop-predictor sizes are
+  reference observations, not expected values. Look at the neighbouring
+  counts (the research profile measures every count up to 160) before
+  describing a transition. Rows do different work (about 2²⁴ inner
+  iterations, in C × loops), so compare the per-iteration and per-loop
+  figures, not the times. The research profile's `body 2` rows repeat
+  standard counts with a second loop body as a control.
