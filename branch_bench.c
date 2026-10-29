@@ -6,9 +6,9 @@
  * 5-6 probe longer-range behaviour and run only with -t or --hard:
  *
  *  Test 1 — Threshold Sum       sorted vs shuffled array              (classic direct-branch demo)
- *  Test 2 — Stride Conditional  periodic 25% vs random 25% take-rate  (repeating pattern stress)
+ *  Test 2 — Bias and Ordering  5 biases × periodic/clustered/shuffled (bias vs sequence structure)
  *  Test 3 — Indirect Dispatch   sequential vs random function pointer  (indirect branch predictor)
- *  Test 4 — Branch vs Branchless sorted/random × branch/arithmetic    (misprediction cost isolation)
+ *  Test 4 — Branch vs Branchless sorted/shuffled × branch/arithmetic (branchless per order)
  *  Test 5 — Pattern Learnability de Bruijn periods 32..2048 vs random (pattern length, opt-in)
  *  Test 6 — Correlation Distance B copies A after d fillers vs random (correlation reach, opt-in)
  *
@@ -76,6 +76,10 @@
 #define MAX_CPU       1023         /* highest CPU number for --cpu            */
 #define BENCH_REVISION 3           /* bumped whenever measurements change     */
 #define DEFAULT_SEED  0xdeadbeefcafe1234ULL  /* --seed default */
+
+/* Test 2: biases (each with its periodic word) and their common period */
+#define T2_BIASES      5
+#define T2_PERIOD      16
 
 /* Test 5: de Bruijn pattern orders k (periods 2^k) and the random reference */
 #define DB_MIN_ORDER   5
@@ -548,9 +552,9 @@ typedef struct {
  * Every measured trial is kept, with its test, variant (the row index in
  * that test's rows[]), pair and run-wide order, so every reported summary
  * can be rebuilt from the trials.  Static arrays: nothing is allocated
- * while measuring.  Up to 37 variant streams × 99 trials fit (--hard -n 99).
+ * while measuring.  Up to 71 variant streams × 99 trials fit (--hard -n 99).
  * ───────────────────────────────────────────────────────────────────────── */
-#define MAX_TRIAL_RECORDS 4096
+#define MAX_TRIAL_RECORDS 8192
 #define MAX_PAIRS         64
 #define TRAIN_RUNS        1         /* untimed runs before every measured trial */
 #define COST_MIN_MISSES_PER_PAIR 1000.0
@@ -621,7 +625,7 @@ static int new_pair(int a, int b)
 /* What each variant's rows describe, for the export: its label and work,
  * registered by emit_rows(), and its input, registered by log_input() at
  * setup.  One entry per (test, variant). */
-#define MAX_VARIANTS 64
+#define MAX_VARIANTS 128
 
 typedef struct {
     int         test;
@@ -1401,18 +1405,20 @@ static void run_test1(FILE *report)
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *
- *  TEST 2 — Stride Conditional: Periodic vs Random Same-Rate Pattern
+ *  TEST 2 — Bias and Ordering: periodic vs clustered vs shuffled
  *
- *  Counts how many array elements pass a condition.  Both variants have the
- *  same ~25% branch-taken rate, but one is perfectly periodic and the other
- *  is random.
+ *  Counts the ones in a 0/1 array.  For each bias (1/16, 1/4, 1/2, 3/4,
+ *  15/16 ones) the three arrays hold exactly the same number of ones, in
+ *  three orders:
  *
- *  Periodic ("every 4th"):  the predictor learns the T-N-N-N-T-N-N-N cycle
- *                           within the first few passes → nearly zero misses.
+ *  Periodic:   a short word repeated (e.g. 1000 for 1/4).
+ *  Clustered:  all the ones first, then all the zeros.
+ *  Shuffled:   the periodic array, randomly permuted.
  *
- *  Random 25%:              a lookup table of pre-randomised decisions
- *                           (generated offline so RNG overhead is excluded).
- *                           Same take-rate but no exploitable pattern.
+ *  Constant-0 and constant-1 arrays are controls.  Every row runs the same
+ *  branch site, so within a bias only the order differs.  The results show
+ *  how this kernel's branch responds to bias and order; they say nothing
+ *  general about a predictor's type.
  *
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -1477,43 +1483,177 @@ static u64 count_decisions(const u8 *decisions, size_t n, unsigned n_reps)
     return acc;
 }
 
+#define T2_TITLE "Test 2 — Bias and Ordering"
+#define T2_DESC  "Same number of ones per bias in periodic, clustered and shuffled order, plus constant controls; one branch site."
+#define T2_ROWS  (3 * T2_BIASES + 2)
+
+/* Each bias's periodic word; every length divides T2_PERIOD. */
+static const char *const t2_words[T2_BIASES] = {
+    "1000000000000000", "1000", "10", "1110", "1111111111111110",
+};
+
+/* Row labels: bias b's periodic, clustered and shuffled rows are 3b, 3b+1
+ * and 3b+2, then the two controls.  A bias row's first word is its bias
+ * (check_export.py reads it). */
+static const char *const t2_labels[T2_ROWS] = {
+    "1/16  periodic 1000000000000000", "1/16  clustered", "1/16  shuffled",
+    "1/4   periodic 1000",             "1/4   clustered", "1/4   shuffled",
+    "1/2   periodic 10",               "1/2   clustered", "1/2   shuffled",
+    "3/4   periodic 1110",             "3/4   clustered", "3/4   shuffled",
+    "15/16 periodic 1111111111111110", "15/16 clustered", "15/16 shuffled",
+    "Constant 0", "Constant 1",
+};
+CHECK_LEN(t2_labels_len_check, t2_labels, T2_ROWS);
+
+static const char *const t2_ratio_periodic[T2_BIASES] = {
+    "1/16 shuffled vs periodic", "1/4 shuffled vs periodic", "1/2 shuffled vs periodic",
+    "3/4 shuffled vs periodic", "15/16 shuffled vs periodic",
+};
+static const char *const t2_ratio_clustered[T2_BIASES] = {
+    "1/16 shuffled vs clustered", "1/4 shuffled vs clustered", "1/2 shuffled vs clustered",
+    "3/4 shuffled vs clustered", "15/16 shuffled vs clustered",
+};
+static const char *const t2_prefix_periodic[T2_BIASES] = {
+    "  → 1/16  shuffled vs periodic:  ", "  → 1/4   shuffled vs periodic:  ",
+    "  → 1/2   shuffled vs periodic:  ", "  → 3/4   shuffled vs periodic:  ",
+    "  → 15/16 shuffled vs periodic:  ",
+};
+static const char *const t2_prefix_clustered[T2_BIASES] = {
+    "  → 1/16  shuffled vs clustered: ", "  → 1/4   shuffled vs clustered: ",
+    "  → 1/2   shuffled vs clustered: ", "  → 3/4   shuffled vs clustered: ",
+    "  → 15/16 shuffled vs clustered: ",
+};
+
+static void fill_periodic(u8 *buf, size_t n, const char *word)
+{
+    const size_t wl = strlen(word);
+    for (size_t i = 0; i < n; i++)
+        buf[i] = word[i % wl] == '1';
+}
+
+/* `ones` ones, then zeros. */
+static void fill_clustered(u8 *buf, size_t n, size_t ones)
+{
+    memset(buf, 1, ones);
+    memset(buf + ones, 0, n - ones);
+}
+
+static size_t count_ones(const u8 *buf, size_t n)
+{
+    size_t ones = 0;
+    for (size_t i = 0; i < n; i++) ones += buf[i] != 0;
+    return ones;
+}
+
+/* The smallest p (≤ T2_PERIOD, dividing n) with buf[i] == buf[i % p]
+ * everywhere, else n. */
+static size_t fundamental_period(const u8 *buf, size_t n)
+{
+    for (size_t p = 1; p <= T2_PERIOD && p < n; p++) {
+        if (n % p) continue;
+        size_t i = p;
+        while (i < n && buf[i] == buf[i % p]) i++;
+        if (i == n) return p;
+    }
+    return n;
+}
+
+static int test2_size_ok(size_t len)
+{
+    return len >= T2_PERIOD && len % T2_PERIOD == 0;
+}
+
+/* Builds bias b's three orders, checks that they hold its exact number of
+ * ones (and the periodic one its word's period), and measures periodic and
+ * clustered each paired with shuffled. */
+static void measure_bias(int b, u8 *periodic, u8 *clustered, u8 *shuffled, size_t len,
+                         ReportRow rows[T2_ROWS], int *pair_p, int *pair_c)
+{
+    const char *word = t2_words[b];
+    const size_t wl = strlen(word);
+    if (!wl || T2_PERIOD % wl) {
+        fprintf(stderr, "Internal error: Test 2 word %s does not divide %d\n", word, T2_PERIOD);
+        exit(1);
+    }
+    size_t word_ones = 0;
+    for (size_t i = 0; i < wl; i++) word_ones += word[i] == '1';
+    const size_t want_ones = len / wl * word_ones;
+    fill_periodic(periodic, len, word);
+    fill_clustered(clustered, len, want_ones);
+    memcpy(shuffled, periodic, len);
+    rng_state = test_seed(2, (unsigned)b + 1, 0);
+    shuffle_u8(shuffled, len);
+    if (fundamental_period(periodic, len) != wl || count_ones(periodic, len) != want_ones ||
+        count_ones(clustered, len) != want_ones || count_ones(shuffled, len) != want_ones) {
+        fprintf(stderr, "Internal error: Test 2 input check failed for word %s\n", word);
+        exit(1);
+    }
+    const int v = 3 * b;
+    log_input(v, periodic, len, 1, want_ones);
+    log_input(v + 1, clustered, len, 1, want_ones);
+    log_input(v + 2, shuffled, len, 1, want_ones);
+    MEASURE_PAIR(rows[v].r, v, count_decisions(periodic, len, reps),
+                 rows[v + 2].r, v + 2, count_decisions(shuffled, len, reps), *pair_p);
+    MEASURE_PAIR(rows[v + 1].r, v + 1, count_decisions(clustered, len, reps),
+                 rows[v + 2].r, v + 2, count_decisions(shuffled, len, reps), *pair_c);
+    const u64 want = (u64)want_ones * reps;
+    for (int k = 0; k < 3; k++)
+        check_result(rows[v + k].label, rows[v + k].r.result, want);
+}
+
+/* A constant-0 or constant-1 control row, measured alone. */
+static void measure_constant(u8 *buf, size_t len, int one, ReportRow rows[T2_ROWS])
+{
+    const int v = 3 * T2_BIASES + one;
+    memset(buf, one, len);
+    log_input(v, buf, len, 1, one ? (u64)len : 0);
+    MEASURE(rows[v].r, v, count_decisions(buf, len, reps));
+    check_result(rows[v].label, rows[v].r.result, one ? (u64)len * reps : 0);
+}
+
 static void run_test2(FILE *report)
 {
     seed_test(2);
     const size_t len = size;
-    /* Pre-generated branch decision arrays (avoids RNG in hot loop) */
-    u8 *decisions_periodic = malloc(len);  /* 1 at every 4th position        */
-    u8 *decisions_random   = malloc(len);  /* 1 with 25% probability, random */
-    if (!decisions_periodic || !decisions_random) { perror("malloc"); exit(1); }
-
-    for (size_t i = 0; i < len; i++) {
-        decisions_periodic[i] = ((i & 3) == 0) ? 1 : 0;
-        decisions_random[i] = rng_below(4) == 0 ? 1 : 0;
-    }
-
-    printf("TEST 2 — Stride Conditional  (periodic vs random 25%%, %zu×%u reps)\n",
+    printf("TEST 2 — Bias and Ordering  (5 biases × periodic/clustered/shuffled, %zu×%u reps)\n",
            len, reps);
-    printf("  Both arrays have ~25%% ones; only the pattern differs.\n\n");
+    printf("  %s\n\n", T2_DESC);
+    if (!test2_size_ok(len)) {
+        emit_skip(report, T2_TITLE,
+                  "Test 2 needs --size to be a multiple of 16 (whole periods of every bias pattern).");
+        return;
+    }
+    u8 *periodic  = malloc(len);
+    u8 *clustered = malloc(len);
+    u8 *shuffled  = malloc(len);
+    if (!periodic || !clustered || !shuffled) { perror("malloc"); exit(1); }
 
-    Result rp = {0};
-    Result rr = {0};
-    int pair;
-    MEASURE_PAIR(rp, 0, count_decisions(decisions_periodic, len, reps),
-                 rr, 1, count_decisions(decisions_random, len, reps), pair);
-
-    anti_dce_sink(rp.result + rr.result);
-
-    free(decisions_periodic);
-    free(decisions_random);
+    const Result none = {0};
+    ReportRow rows[T2_ROWS];
+    for (int i = 0; i < T2_ROWS; i++) {
+        rows[i].label = t2_labels[i];
+        rows[i].r     = none;
+        rows[i].work  = NULL;
+    }
+    int pair_p[T2_BIASES];
+    int pair_c[T2_BIASES];
+    for (int b = 0; b < T2_BIASES; b++)
+        measure_bias(b, periodic, clustered, shuffled, len, rows, &pair_p[b], &pair_c[b]);
+    measure_constant(periodic, len, 0, rows);
+    measure_constant(periodic, len, 1, rows);
+    free(periodic);
+    free(clustered);
+    free(shuffled);
 
     const Work work = { (u64)len * reps, "elem" };
-    const ReportRow rows[] = {
-        { "Periodic (every 4th — learnable)",   rp, NULL },
-        { "Random   (same rate — unlearnable)", rr, NULL },
-    };
-    emit_pair_summary(report, "Test 2 — Stride Conditional",
-                      "Both arrays have ~25% ones; only the pattern differs.",
-                      rows, &work, pair);
+    emit_rows(report, T2_TITLE, T2_DESC, rows, T2_ROWS, &work);
+    printf("\n");
+    for (int b = 0; b < T2_BIASES; b++) {
+        emit_pair_ratio(report, t2_prefix_periodic[b], t2_ratio_periodic[b], pair_p[b], "");
+        emit_pair_ratio(report, t2_prefix_clustered[b], t2_ratio_clustered[b], pair_c[b], "");
+    }
+    print_pair_cost(report, pair_p[2]);   /* 1/2: shuffled vs periodic */
+    printf("\n");
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

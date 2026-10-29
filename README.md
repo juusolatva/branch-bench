@@ -10,13 +10,13 @@ A simple benchmark for testing out gains from branch prediction or conversely lo
 ## The tests
 
 1. **Threshold Sum** sums the bytes above 128 in a sorted and a shuffled copy of the same random array, and prints how many bytes per pass are above 128 (about half).
-2. **Stride Conditional** counts the ones in a 0/1 array that has them at every 4th position, or at random with the same 25% rate.
+2. **Bias and Ordering** counts the ones in 0/1 arrays with 1/16, 1/4, 1/2, 3/4 or 15/16 ones. Each bias has exactly the same number of ones in three orders, a repeating word (e.g. `1000`), all ones first, and shuffled, plus all-0 and all-1 controls: 17 rows.
 3. **Indirect Dispatch** calls 32 functions through a pointer table, in sequential `i % 32` order or at random.
 4. **Branch vs Branchless** computes Test 1's sum with Test 1's conditional-jump kernel and with an arithmetic mask, on a sorted and a shuffled copy of one random array, and compares branchless with branch for each order directly.
 5. **Pattern Learnability** (opt-in) runs Test 2's kernel on repeating de Bruijn patterns with periods 32 to 2048, and on random 50% ones.
 6. **Correlation Distance** (opt-in) makes a branch repeat the random outcome of a branch d = 4 to 1024 constant-outcome branches earlier, against a reference where it is random.
 
-A run without `-t` runs Tests 1–4. Tests 5 and 6 run only when selected with `-t` or `--hard` (all six tests), so default runs stay comparable with [RESULTS.md](RESULTS.md).
+A run without `-t` runs Tests 1–4. It takes longer than before revision 3 (Test 2 measures 17 rows instead of 2): about RUNTIME_TBD on a laptop i5-8350U at the defaults. Tests 5 and 6 run only when selected with `-t` or `--hard` (all six tests), so default runs stay comparable with [RESULTS.md](RESULTS.md).
 
 ## Notes
 
@@ -56,7 +56,7 @@ This writes the report file in addition to the normal
 console output. An existing file is overwritten, and a new one is
 readable only by you. The program exits with status 1 on errors,
 including an invalid option or a kernel result that differs from the
-reference sum computed without the kernel (Tests 1 and 4 check every row).
+reference computed without the kernel (Tests 1, 2 and 4 check every row).
 
 The report heading shows the CPU's maximum (turbo/boost) clock where
 Linux reports it. Where it does not (WSL2, most VMs), the heading is the
@@ -131,8 +131,9 @@ time of one variant's trials over the other's.
 ./branch_bench --hard               # all six tests
 ```
 
-Test 5 tiles whole periods of its longest pattern, so it needs a
-`--size` that is a multiple of 2048; at any other size it prints a skip
+Test 2 needs a `--size` that is a multiple of 16 (whole periods of
+every bias pattern), and Test 5, which tiles whole periods of its longest
+pattern, a multiple of 2048. At any other size such a test prints a skip
 note and the other selected tests still run. Test 6 needs `--size` ≥ 64
 and `--size` × `--reps` ≥ 65664.
 
@@ -230,8 +231,11 @@ on the non-VPS x86 machines in RESULTS.md (the low end, ~9.5 ms, is the
 Ryzen 5 9600X under WSL2).
 
 - **Tests 1 and 2** use direct conditional branches (a jump inside the
-  loop). Test 2 shows the predictor learning a repeating pattern (every
-  4th element taken) but not a random one with the same 25% rate.
+  loop). Test 2 separates how often the branch goes one way (the bias)
+  from the order: within a bias every row has the same number of ones,
+  so a shuffled row's extra misses come from its order alone. The
+  RESULTS.md entries (revision 1) still show the old Test 2, every 4th
+  element vs. a random 25%.
 - **Test 3** uses indirect calls through a function pointer, so the CPU
   must predict a target address, not just taken/not-taken. A plain branch
   target buffer (BTB) remembers only the last target of each branch and

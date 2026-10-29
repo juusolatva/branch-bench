@@ -8,7 +8,8 @@ also checks that the Markdown report shows the same medians, ranges,
 counter columns, Miss %, misses per item, ratios and effective-cost lines
 (resolved and inconclusive), Tests 1 and 4's condition-count line and
 Test 6's "Correlation used" lines.  Every
-pair must compare equal work and inputs.  Every check must have something
+pair must compare equal work and inputs, and every Test 2 row must have its
+exact bias.  Every check must have something
 to compare: an empty export or report fails.  Standard library only.  The
 schema, revision and the constants below must change together with
 branch_bench.c (JSON_SCHEMA, BENCH_REVISION, COST_MIN_MISSES_PER_PAIR,
@@ -184,6 +185,32 @@ def check_pair_inputs(records, variants):
                 check(a[field] == b[field], f"{where}: {field} {a[field]} vs {b[field]}")
         n += 1
     ok(f"{n} pairs compare equal work and inputs")
+
+
+def check_bias(variants):
+    """Test 2: each row has exactly its bias's ones per pass, a periodic
+    row's word has that bias, and one bias's three orders share one count."""
+    rows = {k: v for k, v in variants.items() if k[0] == 2}
+    per_bias = {}
+    for v in rows.values():
+        where = f"Test 2 {v['label']!r}"
+        check(v["cond_true"] is not None and v["pass_items"] is not None, f"{where}: no input record")
+        words = v["label"].split()
+        if words[0] == "Constant":
+            want = 0 if words[1] == "0" else v["pass_items"]
+            check(v["cond_true"] == want, f"{where}: cond_true {v['cond_true']}, want {want}")
+            continue
+        num, den = (int(x) for x in words[0].split("/"))
+        check(v["cond_true"] * den == v["pass_items"] * num,
+              f"{where}: {v['cond_true']} of {v['pass_items']} is not {num}/{den}")
+        if words[1] == "periodic":
+            word = words[2]
+            check(word.count("1") * den == len(word) * num, f"{where}: word {word} is not {num}/{den}")
+        per_bias.setdefault(words[0], set()).add(v["cond_true"])
+    for bias, counts in per_bias.items():
+        check(len(counts) == 1, f"Test 2 bias {bias}: orders differ in ones per pass {sorted(counts)}")
+    if rows:
+        ok(f"Test 2: {len(rows)} rows have their exact bias")
 
 
 def report_sections(path):
@@ -426,6 +453,7 @@ def main():
         check_trials(records)
         check_pairs(records)
         check_pair_inputs(records, variants)
+        check_bias(variants)
         if args.report:
             check_report(records, variants, args.report)
         if args.kernel_counts:

@@ -73,7 +73,12 @@ expect 0 -t 5 --size 2048 --reps 1 -o "$dir/short5.md"
 grep -q '^_n/a: --size below' "$dir/short5.md" || { echo "FAIL short5.md lacks the n/a note"; fail=1; }
 expect 0 -t 2 -t 5 --size 1000 --reps 1 -o "$dir/mixed.md"
 grep -q '^### Test 2 ' "$dir/mixed.md" || { echo "FAIL mixed.md lacks Test 2"; fail=1; }
-grep -q 'Skipped:' "$dir/mixed.md" || { echo "FAIL mixed.md lacks Test 5's skip reason"; fail=1; }
+[ "$(grep -c 'Skipped:' "$dir/mixed.md")" -eq 2 ] || { echo "FAIL mixed.md lacks Test 2's or 5's skip reason"; fail=1; }
+# Test 2 skips when --size is not a multiple of 16 (whole periods of every
+# bias pattern); other selected tests still run.
+expect 0 -t 2 --size 1000 --reps 1 -o "$dir/skip2.md"
+grep -q 'Skipped:' "$dir/skip2.md" || { echo "FAIL skip2.md lacks the skip reason"; fail=1; }
+expect 0 -t 2 --size 16 --reps 1
 # Test 6 is opt-in; it skips when --size < 64 or --size × --reps < 65664.
 # At 64K × 6 only d = 4 gets the 65536 blocks per pass that a "Correlation
 # used" figure needs, so with the miss counter (CI's fake_perf.so step
@@ -89,8 +94,9 @@ grep -q 'Skipped:' "$dir/skip6b.md" || { echo "FAIL skip6b.md lacks the skip rea
 expect 0 --hard $small -o "$dir/hard.md"
 grep -q '(all, with --hard)' "$dir/stdout" || { echo "FAIL --hard banner lacks its tests line"; fail=1; }
 expect 0 --hard -t 2 --size 4K --reps 1 -o "$dir/hard2.md"
-# The largest legal run fits the trial log: 37 (variant, pair) streams
-# (Test 5's random row is in two pairs) × 99 trials = 3663 records.  Large
+# The largest legal run fits the trial log: 59 (variant, pair) streams
+# (Test 2's shuffled rows and Test 5's random row are in two pairs) × 99
+# trials = 5841 records.  Large
 # enough that Test 6, the biggest user, runs.
 expect 0 --hard -n 99 --size 64K --reps 2 --json "$dir/max.jsonl"
 for f in hard.md hard2.md; do
@@ -134,6 +140,9 @@ export_ok "$dir/run.jsonl" --report "$dir/report3.md"
 # shellcheck disable=SC2086
 expect 0 --hard $small -o "$dir/hard3.md" --json "$dir/hard.jsonl"
 export_ok "$dir/hard.jsonl" --report "$dir/hard3.md"
+# A skipped Test 2 leaves a valid export of the tests that ran.
+expect 0 -t 1 -t 2 --size 1000 --reps 1 -o "$dir/skip2b.md" --json "$dir/skip2b.jsonl"
+export_ok "$dir/skip2b.jsonl" --report "$dir/skip2b.md"
 # One element per array: the kernels' smallest input, against the reference.
 expect 0 -t 1 -t 4 --size 1 --reps 1 -o "$dir/one.md" --json "$dir/one.jsonl"
 export_ok "$dir/one.jsonl" --report "$dir/one.md"

@@ -447,13 +447,6 @@ static void test5_summary(void)
     puts("ok   Test 5 summary: list, none, missing counts, n/a");
 }
 
-static u64 count_ones(const u8 *p, size_t n)
-{
-    u64 ones = 0;
-    for (size_t i = 0; i < n; i++) ones += p[i];
-    return ones;
-}
-
 /* Tests 5 and 6 feed their kernels the data their labels describe:
  * whole de Bruijn periods and the seeded random row; B a copy of A in each
  * correlated row and independently seeded in each reference row. */
@@ -797,6 +790,27 @@ static void threshold_inputs(void)
     sanity_failed = 0;
 }
 
+/* Test 2: every bias pattern has exactly its word's ones and period, and
+ * the size rule accepts only whole construction periods. */
+static void bias_inputs(void)
+{
+    u8 buf[64];
+    for (int b = 0; b < T2_BIASES; b++) {
+        const size_t wl = strlen(t2_words[b]);
+        assert(T2_PERIOD % wl == 0);
+        fill_periodic(buf, sizeof buf, t2_words[b]);
+        assert(fundamental_period(buf, sizeof buf) == wl);
+        size_t ones = 0;
+        for (size_t i = 0; i < wl; i++) ones += t2_words[b][i] == '1';
+        assert(count_ones(buf, sizeof buf) == sizeof buf / wl * ones);
+    }
+    fill_clustered(buf, sizeof buf, 12);
+    assert(count_ones(buf, sizeof buf) == 12 && buf[11] == 1 && buf[12] == 0);
+    assert(fundamental_period(buf, sizeof buf) == sizeof buf);
+    assert(test2_size_ok(16) && test2_size_ok(4096));
+    assert(!test2_size_ok(8) && !test2_size_ok(1000));
+}
+
 int main(void)
 {
     perf_leader = 42;
@@ -837,5 +851,6 @@ int main(void)
     json_escaping();
     kernels();
     threshold_inputs();
+    bias_inputs();
     return 0;
 }
