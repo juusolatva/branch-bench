@@ -9,10 +9,10 @@ A simple benchmark for testing out gains from branch prediction or conversely lo
 
 ## The tests
 
-1. **Threshold Sum** sums the bytes above 128 in a sorted and a shuffled copy of the same random array.
+1. **Threshold Sum** sums the bytes above 128 in a sorted and a shuffled copy of the same random array, and prints how many bytes per pass are above 128 (about half).
 2. **Stride Conditional** counts the ones in a 0/1 array that has them at every 4th position, or at random with the same 25% rate.
 3. **Indirect Dispatch** calls 32 functions through a pointer table, in sequential `i % 32` order or at random.
-4. **Branch vs Branchless** computes Test 1's sum with a conditional jump and with an arithmetic mask, on sorted and random data, and checks that both give the same result.
+4. **Branch vs Branchless** computes Test 1's sum with Test 1's conditional-jump kernel and with an arithmetic mask, on a sorted and a shuffled copy of one random array, and compares branchless with branch for each order directly.
 5. **Pattern Learnability** (opt-in) runs Test 2's kernel on repeating de Bruijn patterns with periods 32 to 2048, and on random 50% ones.
 6. **Correlation Distance** (opt-in) makes a branch repeat the random outcome of a branch d = 4 to 1024 constant-outcome branches earlier, against a reference where it is random.
 
@@ -55,8 +55,8 @@ table-formatted Markdown report instead use `-o`/`--output`:
 This writes the report file in addition to the normal
 console output. An existing file is overwritten, and a new one is
 readable only by you. The program exits with status 1 on errors,
-including an invalid option or a mismatch between Test 4's branch and
-branchless sums.
+including an invalid option or a kernel result that differs from the
+reference sum computed without the kernel (Tests 1 and 4 check every row).
 
 The report heading shows the CPU's maximum (turbo/boost) clock where
 Linux reports it. Where it does not (WSL2, most VMs), the heading is the
@@ -185,7 +185,7 @@ target. The minimum penalty is roughly the pipeline depth, typically
 When the cycle and miss counters are available, each test prints the
 **Effective extra cycles per additional miss**: the extra cycles divided
 by the extra mispredictions between its predictable and unpredictable
-variant (for Test 4, its two branch variants), summed over the paired
+variant (for Test 4, its branch kernel on shuffled vs sorted data), summed over the paired
 trials whose counters both read correctly. Differences keep their sign,
 so a pair where the unpredictable variant happened to be faster pulls
 the figure down instead of being dropped. When the unpredictable variant

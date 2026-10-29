@@ -134,6 +134,9 @@ export_ok "$dir/run.jsonl" --report "$dir/report3.md"
 # shellcheck disable=SC2086
 expect 0 --hard $small -o "$dir/hard3.md" --json "$dir/hard.jsonl"
 export_ok "$dir/hard.jsonl" --report "$dir/hard3.md"
+# One element per array: the kernels' smallest input, against the reference.
+expect 0 -t 1 -t 4 --size 1 --reps 1 -o "$dir/one.md" --json "$dir/one.jsonl"
+export_ok "$dir/one.jsonl" --report "$dir/one.md"
 # Test 6's "Correlation used" line is rebuilt from the export too.  At
 # 64K × 6, d = 4 has a figure and the other distances n/a (with counters).
 expect 0 -t 4 -t 6 --size 64K --reps 6 -o "$dir/t6j.md" --json "$dir/t6.jsonl"

@@ -6,7 +6,8 @@ C code, and compares it with the pair records, and checks each trial's
 scaled counts against its raw counts and scheduling times.  With --report,
 also checks that the Markdown report shows the same medians, ranges,
 counter columns, Miss %, misses per item, ratios and effective-cost lines
-(resolved and inconclusive) and Test 6's "Correlation used" lines.  Every
+(resolved and inconclusive), Tests 1 and 4's condition-count line and
+Test 6's "Correlation used" lines.  Every
 pair must compare equal work and inputs.  Every check must have something
 to compare: an empty export or report fails.  Standard library only.  The
 schema, revision and the constants below must change together with
@@ -311,6 +312,19 @@ def check_correlation(records, variants, sections):
     return len(want)
 
 
+def check_threshold_note(variants, sections, test):
+    """Tests 1 and 4: every row has the same multiset, and the report states
+    its condition-true count; returns how many lines were compared."""
+    rows = [v for (t, _), v in variants.items() if t == test]
+    check(all(v["cond_true"] is not None for v in rows), f"Test {test}: a row has no cond_true")
+    check(len({(v["cond_true"], v["pass_items"]) for v in rows}) == 1,
+          f"Test {test}: rows differ in cond_true or pass_items")
+    c, n = rows[0]["cond_true"], rows[0]["pass_items"]
+    want = f"_Elements > 128: {c} of {n} per pass ({100.0 * c / n:.1f}%)._"
+    check(want in sections.get(test, ""), f"Test {test}: report lacks {want!r}")
+    return 1
+
+
 def check_report(records, variants, path):
     sections = report_sections(path)
     trials = by_type(records, "trial")
@@ -350,6 +364,9 @@ def check_report(records, variants, path):
             want = cost_line(p)
             check(want + "\n" in section, f"Test {p['test']}: report lacks {want!r}")
             lines += 1
+    for test in (1, 4):
+        if any(t["test"] == test for t in trials):
+            lines += check_threshold_note(variants, sections, test)
     if any(t["test"] == 6 for t in trials):
         lines += check_correlation(records, variants, sections)
     check(rows, "report check compared no table rows")

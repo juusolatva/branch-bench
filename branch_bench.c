@@ -1220,20 +1220,76 @@ static void shuffle_u8(u8 *arr, size_t n)
     }
 }
 
+/* Set when a row's result differs from its reference, or Test 5's patterns
+ * fail their check; main() then exits 1. */
+static int sanity_failed = 0;
+
+/* Compares a measured kernel result with its independently computed
+ * reference. */
+static void check_result(const char *what, u64 got, u64 want)
+{
+    if (got == want) return;
+    fprintf(stderr, "  ERROR: %s result %" PRIu64 ", reference %" PRIu64 "\n", what, got, want);
+    sanity_failed = 1;
+}
+
+/* Tests 1 and 4: one random byte array, as a sorted and a shuffled copy, so
+ * both orders hold the same multiset.  Uses the current rng_state, so each
+ * test keeps its own seed. */
+static void prepare_threshold(u8 *sorted, u8 *shuffled, size_t n)
+{
+    fill_random_bytes(sorted, n);
+    memcpy(shuffled, sorted, n);
+    qsort(sorted, n, 1, cmp_u8_asc);
+    shuffle_u8(shuffled, n);
+}
+
+/* The threshold sum over n_reps passes, from a histogram rather than the
+ * kernel's compare-per-element loop; *above gets the elements > THRESHOLD
+ * per pass. */
+static u64 threshold_reference(const u8 *arr, size_t n, unsigned n_reps, u64 *above)
+{
+    u64 count[256] = {0};
+    for (size_t i = 0; i < n; i++) count[arr[i]]++;
+    u64 sum = 0;
+    *above = 0;
+    for (unsigned v = THRESHOLD + 1; v < 256; v++) {
+        sum += (u64)v * count[v];
+        *above += count[v];
+    }
+    return sum * n_reps;
+}
+
+/* "Elements > 128: <above> of <n> per pass (<pct>%)" */
+static void threshold_note(char *buf, size_t bufsz, u64 above, size_t n)
+{
+    snprintf(buf, bufsz, "Elements > %d: %" PRIu64 " of %zu per pass (%.1f%%)",
+             THRESHOLD, above, n, 100.0 * (double)above / (double)n);
+}
+
+/* The report's copy of the note the console prints in the test heading. */
+static void emit_threshold_note(FILE *report, u64 above, size_t n)
+{
+    if (!report) return;
+    char note[96];
+    threshold_note(note, sizeof note, above, n);
+    fprintf(report, "_%s._\n\n", note);
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  *
  *  TEST 1 — Threshold Sum: Sorted vs Shuffled Array
  *
- *  Accumulates all elements > THRESHOLD.  Both arrays contain identical data,
- *  just in different orders.
+ *  Accumulates all elements > THRESHOLD.  One random byte array is copied:
+ *  one copy is sorted, the other shuffled, so both hold the same multiset
+ *  (about 127/256 of the bytes are above the threshold; the run prints the
+ *  actual count).
  *
- *  Sorted:   the branch outcome is "not-taken" for the first ~50% of the
- *            array, then "always-taken" for the rest.  The predictor finds
- *            the crossover within a few iterations and then has near-zero
- *            mispredictions.
+ *  Sorted:   the branch is not taken up to the crossover and taken after
+ *            it, so the predictor is wrong only around the crossover.
  *
- *  Shuffled: each element's outcome is independent and ~50/50.  The predictor
- *            can do no better than chance, yielding ~50% misprediction rate.
+ *  Shuffled: each element's outcome is effectively random, so a predictor
+ *            cannot learn it.
  *
  * ═══════════════════════════════════════════════════════════════════════════ */
 /* Where KERNEL_ASM is set, the whole function body is one asm block: the
@@ -1309,36 +1365,38 @@ static void run_test1(FILE *report)
     u8 *sorted   = malloc(len);
     u8 *shuffled = malloc(len);
     if (!sorted || !shuffled) { perror("malloc"); exit(1); }
-
-    /* Fill with uniform random bytes, then sort one copy */
-    fill_random_bytes(sorted, len);
-    memcpy(shuffled, sorted, len);
-    qsort(sorted, len, 1, cmp_u8_asc);
-    shuffle_u8(shuffled, len);
+    prepare_threshold(sorted, shuffled, len);
+    u64 above = 0;
+    const u64 want = threshold_reference(sorted, len, reps, &above);
+    char note[96];
+    threshold_note(note, sizeof note, above, len);
 
     printf("TEST 1 — Threshold Sum  (sorted vs shuffled array, %zu×%u reps)\n",
            len, reps);
-    printf("  Counts/sums elements > %d.  Identical data, different order.\n\n",
-           THRESHOLD);
+    printf("  Counts/sums elements > %d.  Identical data, different order.\n", THRESHOLD);
+    printf("  %s\n\n", note);
 
+    log_input(0, sorted, len, 1, above);
+    log_input(1, shuffled, len, 1, above);
     Result rs = {0};
     Result rr = {0};
     int pair;
     MEASURE_PAIR(rs, 0, sum_threshold(sorted, len, reps),
                  rr, 1, sum_threshold(shuffled, len, reps), pair);
 
-    anti_dce_sink(rs.result + rr.result);
-
     free(sorted); free(shuffled);
+    check_result("Test 1 sorted", rs.result, want);
+    check_result("Test 1 shuffled", rr.result, want);
 
     const Work work = { (u64)len * reps, "elem" };
     const ReportRow rows[] = {
-        { "Sorted   (predictable, ~0% misses)",    rs, NULL },
-        { "Shuffled (unpredictable, ~50% misses)", rr, NULL },
+        { "Sorted",   rs, NULL },
+        { "Shuffled", rr, NULL },
     };
     emit_pair_summary(report, "Test 1 — Threshold Sum",
-                      "Sorted vs shuffled array, same direct branch. Identical data, different order.",
+                      "Sorted vs shuffled copies of one random byte array, same branch kernel.",
                       rows, &work, pair);
+    emit_threshold_note(report, above, len);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1562,34 +1620,28 @@ static void run_test3(FILE *report)
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *
- *  TEST 4 — Branch vs Branchless Computation  (misprediction cost isolation)
+ *  TEST 4 — Branch vs Branchless Computation
  *
- *  Both variants compute the same result: sum of elements > THRESHOLD.
- *  Tested on sorted data (predictable) and random data (unpredictable).
+ *  Both kernels compute the same result: the sum of elements > THRESHOLD,
+ *  on a sorted and a shuffled copy of one random byte array (as in Test 1,
+ *  with Test 4's own seed).
  *
- *  Branch version:
- *      if (arr[i] > T) acc += arr[i];
- *    The compiler emits a conditional jump.  On random data this mispredicts
- *    ~50% of the time.
+ *  Branch version:     sum_threshold(), Test 1's kernel: one conditional
+ *                      jump per element.
  *
  *  Branchless version (arithmetic mask):
  *      mask = 0 - (u64)(arr[i] > T);   → 0 or 0xFFFF...FFFF
  *      acc += arr[i] & mask;
- *    No conditional jump at all — the comparison result is a 0/1 integer
- *    that is sign-extended into a bitmask.  Performance is the same regardless
- *    of data distribution.
+ *    No data-dependent jump; the compiler may use setcc or a conditional
+ *    select for the comparison.
  *
- *  Expected pattern:
- *      Sorted   + branch    ≈ Sorted   + branchless  (few misses anyway)
- *      Random   + branch    >> Random  + branchless  (misprediction penalty)
- *
- *  This directly quantifies the penalty per misprediction and shows why
- *  modern compilers emit CMOV/branchless code for data-independent conditions.
+ *  Three paired comparisons: the branch kernel on shuffled vs sorted (its
+ *  effective cost per miss: same instructions, different predictability),
+ *  and branchless vs branch for each order.  Branch and branchless run
+ *  different instructions, so their time difference is not a pure
+ *  misprediction penalty.
  *
  * ═══════════════════════════════════════════════════════════════════════════ */
-
-/* Set when Test 4's branch and branchless sums differ; main() then exits 1. */
-static int sanity_failed = 0;
 
 /* Branchless version — arithmetic mask, no conditional jump possible */
 __attribute__((noinline))
@@ -1609,53 +1661,58 @@ static void run_test4(FILE *report)
     seed_test(4);
     const size_t len = size;
     u8 *sorted   = malloc(len);
-    u8 *random_d = malloc(len);
-    if (!sorted || !random_d) { perror("malloc"); exit(1); }
+    u8 *shuffled = malloc(len);
+    if (!sorted || !shuffled) { perror("malloc"); exit(1); }
+    prepare_threshold(sorted, shuffled, len);
+    u64 above = 0;
+    const u64 want = threshold_reference(sorted, len, reps, &above);
+    char note[96];
+    threshold_note(note, sizeof note, above, len);
 
-    fill_random_bytes(sorted, len);
-    qsort(sorted, len, 1, cmp_u8_asc);
-    fill_random_bytes(random_d, len);
-
-    printf("TEST 4 — Branch vs Branchless  (sorted and random data, %zu×%u reps)\n",
+    printf("TEST 4 — Branch vs Branchless  (sorted and shuffled copies, %zu×%u reps)\n",
            len, reps);
-    printf("  Branchless uses arithmetic mask: 0 - (u64)(v > T) to avoid jumps.\n\n");
+    printf("  Branchless uses arithmetic mask: 0 - (u64)(v > T) to avoid jumps.\n");
+    printf("  %s\n\n", note);
 
-    Result r_sb = {0};
-    Result r_sl = {0};
-    Result r_rb = {0};
-    Result r_rl = {0};
-    int pair_branch;
-    int pair_branchless;
-    MEASURE_PAIR(r_sb, 0, sum_threshold(sorted, len, reps),
-                 r_rb, 2, sum_threshold(random_d, len, reps), pair_branch);
-    MEASURE_PAIR(r_sl, 1, sum_branchless(sorted, len, reps),
-                 r_rl, 3, sum_branchless(random_d, len, reps), pair_branchless);
+    const Result none = {0};
+    ReportRow rows[] = {
+        { "Sorted   + branch",     none, NULL },
+        { "Sorted   + branchless", none, NULL },
+        { "Shuffled + branch",     none, NULL },
+        { "Shuffled + branchless", none, NULL },
+    };
+    for (int v = 0; v < 4; v++)
+        log_input(v, v < 2 ? sorted : shuffled, len, 1, above);
+    int pb;
+    int ps;
+    int pr;
+    MEASURE_PAIR(rows[0].r, 0, sum_threshold(sorted, len, reps),
+                 rows[2].r, 2, sum_threshold(shuffled, len, reps), pb);
+    MEASURE_PAIR(rows[0].r, 0, sum_threshold(sorted, len, reps),
+                 rows[1].r, 1, sum_branchless(sorted, len, reps), ps);
+    MEASURE_PAIR(rows[2].r, 2, sum_threshold(shuffled, len, reps),
+                 rows[3].r, 3, sum_branchless(shuffled, len, reps), pr);
 
-    free(sorted); free(random_d);
-
-    /* verify both produce same result on the same data (sanity check) —
-     * this comparison already reads all four .result fields, so unlike
-     * tests 1-3 there's no separate anti-DCE sink needed here. */
-    if (r_sb.result != r_sl.result || r_rb.result != r_rl.result) {
-        fprintf(stderr, "  ERROR: branch/branchless results differ!\n");
-        sanity_failed = 1;
-    }
+    free(sorted); free(shuffled);
+    /* Every row is checked against the reference, so no anti-DCE sink is
+     * needed. */
+    for (int v = 0; v < 4; v++)
+        check_result(rows[v].label, rows[v].r.result, want);
 
     const Work work = { (u64)len * reps, "elem" };
-    const ReportRow rows[] = {
-        { "Sorted  + branch",     r_sb, NULL },
-        { "Sorted  + branchless", r_sl, NULL },
-        { "Random  + branch",     r_rb, NULL },
-        { "Random  + branchless", r_rl, NULL },
-    };
     emit_rows(report, "Test 4 — Branch vs Branchless",
-              "Same sum, computed via conditional jump vs. arithmetic mask, on sorted and random data.",
+              "Same sum via Test 1's branch kernel and an arithmetic mask, on sorted and "
+              "shuffled copies of one byte array. A branchless vs branch ratio below 1 "
+              "means branchless is faster.",
               rows, 4, &work);
-    emit_pair_ratio(report, "\n  Branch penalty on random data:  ",
-                    "Branch penalty on random data", pair_branch, " vs sorted-branch");
-    emit_pair_ratio(report, "  Branchless is consistent:       ",
-                    "Branchless is consistent", pair_branchless, " random vs sorted");
-    print_pair_cost(report, pair_branch);
+    emit_pair_ratio(report, "\n  Branch, shuffled vs sorted:     ",
+                    "Branch, shuffled vs sorted", pb, "");
+    emit_pair_ratio(report, "  Sorted, branchless vs branch:   ",
+                    "Sorted, branchless vs branch", ps, "");
+    emit_pair_ratio(report, "  Shuffled, branchless vs branch: ",
+                    "Shuffled, branchless vs branch", pr, "");
+    print_pair_cost(report, pb);
+    emit_threshold_note(report, above, len);
     printf("\n");
 }
 

@@ -770,6 +770,33 @@ static void kernels(void)
     assert(KERNEL_ASM == (strcmp(KERNEL_BACKEND, "c") != 0));
 }
 
+/* Tests 1 and 4: one multiset in two orders, and a reference sum that does
+ * not use the kernel's comparison loop. */
+static void threshold_inputs(void)
+{
+    static const u8 edge[] = { 0, 128, 129, 255, 255 };
+    u64 above = 0;
+    assert(threshold_reference(edge, sizeof edge, 2, &above) == 2 * (129 + 255 + 255));
+    assert(above == 3);
+    static u8 s[4096];
+    static u8 h[4096];
+    rng_state = test_seed(1, 0, 0);
+    prepare_threshold(s, h, sizeof s);
+    for (size_t i = 1; i < sizeof s; i++) assert(s[i - 1] <= s[i]);
+    u64 as = 0;
+    u64 ah = 0;
+    assert(threshold_reference(s, sizeof s, 1, &as) == threshold_reference(h, sizeof h, 1, &ah));
+    assert(as == ah);
+    assert(fnv1a64(s, sizeof s) != fnv1a64(h, sizeof h));
+    assert(sum_threshold(h, sizeof h, 3) == threshold_reference(h, sizeof h, 3, &ah));
+    sanity_failed = 0;
+    check_result("match", 5, 5);
+    assert(!sanity_failed);
+    check_result("mismatch", 5, 6);
+    assert(sanity_failed);
+    sanity_failed = 0;
+}
+
 int main(void)
 {
     perf_leader = 42;
@@ -809,5 +836,6 @@ int main(void)
     paired_cost();
     json_escaping();
     kernels();
+    threshold_inputs();
     return 0;
 }
