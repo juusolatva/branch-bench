@@ -56,7 +56,9 @@ This writes the report file in addition to the normal
 console output. An existing file is overwritten, and a new one is
 readable only by you. The program exits with status 1 on errors,
 including an invalid option or a kernel result that differs from the
-reference computed without the kernel (Tests 1–4 check every row).
+reference computed without the kernel (Tests 1–4 check every row); such
+a run also ends its console output and report with an ERROR line, so its
+numbers are not mistaken for valid ones.
 
 The report heading shows the CPU's maximum (turbo/boost) clock where
 Linux reports it. Where it does not (WSL2, most VMs), the heading is the
@@ -83,7 +85,7 @@ emptied until both have opened:
 
 | `type` | One record per | Main fields |
 |---|---|---|
-| `meta` (first line) | run | `schema` 1, `revision`, CPU, microcode, arch, kernel, compiler, `kernel_backend` (`asm-x86_64`, `asm-aarch64` or `c`), build flags, commit, `alignment_policy`, `seed` and `test_seeds`, size/reps/trials, `training_runs`, `schedule` (`AB/BA`), `affinity`, `hypervisor`, `smt_siblings`, `governor`, `max_ghz`, `effective_user_cycle_ghz`, and per counter its event type, config and `semantics` (`retired`, `speculative`, `cycles`, `unknown`) |
+| `meta` (first line) | run | `schema` 1, `revision`, `results_ok` (false when a kernel result differed from its reference), CPU, microcode, arch, kernel, compiler, `kernel_backend` (`asm-x86_64`, `asm-aarch64` or `c`, for the data-branch kernels; each `kernel` record has its own `backend`), build flags, commit, `alignment_policy`, `seed` and `test_seeds`, size/reps/trials, `training_runs`, `schedule` (`AB/BA`), `affinity`, `hypervisor`, `smt_siblings`, `governor`, `max_ghz`, `effective_user_cycle_ghz`, and per counter its event type, config and `semantics` (`retired`, `speculative`, `cycles`, `unknown`) |
 | `kernel` | kernel | `id`, `revision`, `backend` (`asm-…` or `c`), `entry` (always `null`), unit, declared `data_branches`, `indirect_calls`, `inner_loop_branches`, `taken_when` (`"false"`: the asm data branch jumps, skipping the update, when its condition is false; `null` for C kernels), tests |
 | `variant` | report row | `test`, `variant` (row index), `label`, `kernel`, `work` and `unit` per trial; its input, recorded before measuring: `pass_items` (items per pass), `cond_true` (items per pass whose source condition holds) and `input_hash` (FNV-1a of the input buffer), each `null` where the test does not record it |
 | `trial` | measured trial | `test`, `variant`, `pair`, run-wide `seq`, `trial`, `train_runs`, `time_ms`, `result` (the kernel's checksum), `perf_status`, `enabled_ns`/`running_ns`, `counts` (scaled) and `raw_counts` |
@@ -207,9 +209,11 @@ listed clock speeds put it at ~20–25 cycles for Test 1.
 
 The effective cost is only meaningful when the unpredictable variant adds
 many misses. When the two variants miss almost equally often, as in
-Test 3 on cores that cannot learn the sequential cycle, the small
-difference in work between the variants dominates and the figure is
-inflated (~54 cycles for Test 3 on the Raspberry Pi 4).
+revision 1's Test 3 on cores that could not learn its 32-target cycle,
+the small difference in work between the variants dominates and the
+figure is inflated (~54 cycles for that Test 3 on the Raspberry Pi 4).
+In revision 3 both rows of a Test 3 pair run the same code, so only the
+order differs; the figure comes from its 64-target pair.
 
 **Miss %** is misses divided by *all* branches in the timed loop,
 including the loop's own back-edge branch, which is almost always
@@ -240,22 +244,26 @@ Ryzen 5 9600X under WSL2).
 - **Test 3** uses indirect calls through a function pointer, so the CPU
   must predict a target address, not just taken/not-taken. A plain branch
   target buffer (BTB) remembers only the last target of each branch and
-  would miss on every call of the sequential `i % 32` cycle; learning that
-  cycle takes an indirect predictor that uses branch history. Haswell
-  (i7-4770) and the newer x86 cores with counters in RESULTS.md predict
-  it almost perfectly, while the Ivy Bridge i5-3380M and the Cortex-A72
-  still miss ~27–28 of every 32 calls (these figures are from revision 1,
-  which compared a 32-target cycle with random indices; revision 3 sweeps
-  1–64 targets through one call site). The EPYC-Rome VPS (no counters;
-  its QEMU model name hides the host core) shows only a 1.20× slowdown,
-  like the i5-3380M's 1.17×, so it apparently does not learn the cycle,
-  possibly because of hypervisor mitigations. With random indices every
-  core is right only by chance, about 1 call in 32. On the Intel machines a missed indirect call costs
-  about the same as a missed conditional branch (~23–26 cycles).
+  would miss on every call of a cyclic sequence of two or more targets;
+  learning the cycle takes an indirect predictor that uses branch
+  history. A shuffled sequence of T targets can be right only by chance,
+  about 1 call in T; T = 1 is the single-target control. In RESULTS.md
+  (revision 1, which compared a sequential 32-target cycle with random
+  indices from two call sites), Haswell (i7-4770) and the newer x86 cores
+  with counters predict the cycle almost perfectly, while the Ivy Bridge
+  i5-3380M and the Cortex-A72 still miss ~27–28 of every 32 calls. The
+  EPYC-Rome VPS (no counters; its QEMU model name hides the host core)
+  shows only a 1.20× slowdown, like the i5-3380M's 1.17×, so it
+  apparently does not learn the cycle, possibly because of hypervisor
+  mitigations. On the Intel machines a missed indirect call costs about
+  the same as a missed conditional branch (~23–26 cycles).
 - **Test 4** removes the data-dependent branch but not the loop branch,
-  which is why its branch count halves. Its time barely changes between
-  sorted and random data, but it is not automatically faster: on sorted
-  data the branching version wins on the i7-4770 (144 ms vs 195 ms), the
+  which is why its branch count halves. Revision 3 reports branchless vs
+  branch for the sorted and the shuffled copy directly (below 1× means
+  branchless is faster). Its time barely changes between sorted and
+  shuffled data, but it is not automatically faster: in RESULTS.md
+  (revision 1, sorted vs separately generated random data) the branching
+  version wins on sorted data on the i7-4770 (144 ms vs 195 ms), the
   i5-3380M and the Ryzen 5 9600X, because a correctly predicted branch is
   nearly free while the branchless version always does the extra work.
   The i5-8350U and the Raspberry Pi 4 are exceptions, where branchless is

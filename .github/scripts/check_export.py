@@ -5,15 +5,24 @@ Rebuilds every pair summary from the trial records, independently of the
 C code, and compares it with the pair records, and checks each trial's
 scaled counts against its raw counts and scheduling times.  With --report,
 also checks that the Markdown report shows the same medians, ranges,
-counter columns, Miss %, misses per item, ratios and effective-cost lines
+counter columns, Miss %, misses per item, ratios, effective-cost lines
 (resolved and inconclusive), Tests 1 and 4's condition-count line and
-Test 6's "Correlation used" lines.  Every
-pair must compare equal work and inputs, and every Test 2 row must have its
-exact bias.  Every check must have something
-to compare: an empty export or report fails.  Standard library only.  The
-schema, revision and the constants below must change together with
-branch_bench.c (JSON_SCHEMA, BENCH_REVISION, COST_MIN_MISSES_PER_PAIR,
-D6_MIN_SAMPLE).
+Test 6's "Correlation used" lines.
+
+Input records: every row of Tests 1-4 and 6 must have one.  Both rows of
+a pair must have equal work and, where recorded, equal item and
+condition-true counts; a pair that compares two kernels must see the same
+input hash, and a pair that compares two orders of one kernel different
+ones (except Test 3's single-target pair and inputs below 1024 items).  Test 2 must have all 17 rows
+with their exact bias.  These counts are what the C code recorded, so they
+catch a broken export or wiring, not a wrong buffer; the C code checks the
+buffers themselves.  The run must not have flagged a result mismatch
+(meta results_ok).
+
+Every check must have something to compare: an empty export or report
+fails.  Standard library only.  The schema, revision and the constants
+below must change together with branch_bench.c (JSON_SCHEMA,
+BENCH_REVISION, COST_MIN_MISSES_PER_PAIR, D6_MIN_SAMPLE, T2_ROWS).
 
 Usage: check_export.py EXPORT [--report REPORT.md] [--kernel-counts FILE]
                        [--same-results OTHER --test N]
@@ -28,6 +37,11 @@ import sys
 
 COST_MIN_MISSES_PER_PAIR = 1000.0
 D6_MIN_SAMPLE = 65536
+T2_ROWS = 17
+INPUT_TESTS = (1, 2, 3, 4, 6)   # tests whose rows record their input
+# Below this many items per pass, two orders of one multiset can coincide
+# (one element; a 1/16 bias over 16 elements), so they may hash alike.
+ORDER_MIN_ITEMS = 1024
 COST_LABEL = "**Effective extra cycles per additional miss:**"
 
 
@@ -71,6 +85,8 @@ def check_structure(records):
     check(meta.get("type") == "meta", "first record is not meta")
     check(meta.get("schema") == 1, f"schema {meta.get('schema')}, want 1")
     check(meta.get("revision") == 3, f"revision {meta.get('revision')}, want 3")
+    check(meta.get("results_ok") is True,
+          "meta results_ok is not true: a kernel result differed from its reference")
     kernels = {k["id"] for k in by_type(records, "kernel")}
     variants = {(v["test"], v["variant"]): v for v in by_type(records, "variant")}
     for v in variants.values():
@@ -172,35 +188,60 @@ def check_pairs(records):
     ok(f"{len(pairs)} pair records rebuilt from {len(trials)} trials")
 
 
+def same_input_allowed(test, label, items):
+    """Test 3's single-target sequence is all zeros, so shuffling it cannot
+    change it; short inputs can be reordered into themselves."""
+    return (test == 3 and label.startswith("T= 1 ")) or items < ORDER_MIN_ITEMS
+
+
 def check_pair_inputs(records, variants):
-    """Both sides of a pair do the same work on inputs of the same size and,
-    where recorded, the same number of condition-true items."""
-    n = 0
-    for p in by_type(records, "pair"):
+    """Rows of the tests that record inputs have one; both sides of a pair
+    do the same work on inputs of the same size and condition count; a
+    kernel comparison sees one input, an order comparison two."""
+    for (test, _), v in variants.items():
+        if test in INPUT_TESTS:
+            check(v["pass_items"] is not None and v["input_hash"] is not None,
+                  f"Test {test} {v['label']!r}: no input record")
+    pairs = by_type(records, "pair")
+    for p in pairs:
         a, b = variants[(p["test"], p["a"])], variants[(p["test"], p["b"])]
         where = f"pair {p['pair']} (test {p['test']})"
         check(a["work"] == b["work"], f"{where}: work {a['work']} vs {b['work']}")
         for field in ("pass_items", "cond_true"):
             if a[field] is not None and b[field] is not None:
                 check(a[field] == b[field], f"{where}: {field} {a[field]} vs {b[field]}")
-        n += 1
-    ok(f"{n} pairs compare equal work and inputs")
+        if a["input_hash"] is None or b["input_hash"] is None:
+            continue
+        if a["kernel"] != b["kernel"]:
+            check(a["input_hash"] == b["input_hash"],
+                  f"{where}: {a['kernel']} and {b['kernel']} see different inputs")
+        elif not same_input_allowed(p["test"], a["label"], a["pass_items"]):
+            check(a["input_hash"] != b["input_hash"],
+                  f"{where}: {a['label']!r} and {b['label']!r} have the same input")
+    ok(f"{len(pairs)} pairs compare equal work and matching inputs")
 
 
 def check_bias(variants):
     """Test 2: each row has exactly its bias's ones per pass, a periodic
     row's word has that bias, and one bias's three orders share one count."""
     rows = {k: v for k, v in variants.items() if k[0] == 2}
+    if not rows:
+        return
+    check(len(rows) == T2_ROWS, f"Test 2: {len(rows)} rows, want {T2_ROWS}")
     per_bias = {}
     for v in rows.values():
         where = f"Test 2 {v['label']!r}"
         check(v["cond_true"] is not None and v["pass_items"] is not None, f"{where}: no input record")
         words = v["label"].split()
+        check(len(words) >= 2, f"{where}: unexpected label")
         if words[0] == "Constant":
             want = 0 if words[1] == "0" else v["pass_items"]
             check(v["cond_true"] == want, f"{where}: cond_true {v['cond_true']}, want {want}")
             continue
-        num, den = (int(x) for x in words[0].split("/"))
+        try:
+            num, den = (int(x) for x in words[0].split("/"))
+        except ValueError:
+            raise Failure(f"{where}: label does not start with a bias")
         check(v["cond_true"] * den == v["pass_items"] * num,
               f"{where}: {v['cond_true']} of {v['pass_items']} is not {num}/{den}")
         if words[1] == "periodic":
@@ -209,8 +250,7 @@ def check_bias(variants):
         per_bias.setdefault(words[0], set()).add(v["cond_true"])
     for bias, counts in per_bias.items():
         check(len(counts) == 1, f"Test 2 bias {bias}: orders differ in ones per pass {sorted(counts)}")
-    if rows:
-        ok(f"Test 2: {len(rows)} rows have their exact bias")
+    ok(f"Test 2: {len(rows)} rows have their exact bias")
 
 
 def report_sections(path):

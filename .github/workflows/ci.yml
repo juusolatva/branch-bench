@@ -57,9 +57,13 @@ jobs:
       - name: Build with the C kernels
         run: |
           gcc $BENCH_FLAGS $WARN_FLAGS -DBRANCH_BENCH_C_KERNELS -o bb_c branch_bench.c
-          ./bb_c $SMALL_RUN > bb_c.out
+          ./bb_c $SMALL_RUN -o bb_c.md --json bb_c.jsonl > bb_c.out
           grep -q '^  Kernels: *C only' bb_c.out
+          grep -q '"kernel_backend":"c"' bb_c.jsonl
+          python3 .github/scripts/check_export.py bb_c.jsonl --report bb_c.md
           .github/scripts/check_kernels.sh ./bb_c
+          gcc $BENCH_FLAGS $WARN_FLAGS -DBRANCH_BENCH_C_KERNELS -o "$RUNNER_TEMP/perf_test_c" .github/scripts/perf_test.c
+          "$RUNNER_TEMP/perf_test_c"
 
       - name: Run (small size)
         run: ./branch_bench $SMALL_RUN
@@ -194,9 +198,16 @@ jobs:
       - name: Clang keeps the controlled kernels' branches
         run: |
           out="$RUNNER_TEMP/check_kernels.txt"
-          .github/scripts/check_kernels.sh ./branch_bench > "$out" || true
+          status=0
+          .github/scripts/check_kernels.sh ./branch_bench > "$out" 2>&1 || status=$?
           cat "$out"
-          [ "$(grep -c '^FAIL' "$out")" -ge 1 ]
+          # 1 = some check failed; anything else means the script broke.
+          [ "$status" -eq 1 ]
+          for label in 'Test 1/4 sum_threshold' 'Test 2/5 count_decisions' \
+                       'Test 4 sum_branchless' 'Test 3 dispatch_indexed' 'Test 3 leaves'; do
+            grep -qx "ok   $label" "$out" || { echo "missing: ok   $label"; exit 1; }
+          done
+          grep -Eq '^FAIL Test 6 correlate_distance: (branchless instruction|fewer than three)' "$out"
           if grep '^FAIL' "$out" | grep -qv '^FAIL Test 6 '; then
             echo "check_kernels.sh rejected a controlled kernel in the Clang build"
             exit 1

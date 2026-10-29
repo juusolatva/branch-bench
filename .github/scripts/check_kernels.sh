@@ -259,27 +259,39 @@ leaves() {
 # Prints how many distinct instruction shapes the leaves leaf_0 ... leaf_63
 # have: padding lines (nop, xchg %ax,%ax, data16 ... nop, which objdump
 # lists after ret up to the next symbol) dropped, cs/ds/data16 prefixes
-# (run.sh's ret alignment) and objdump comments removed, immediates masked.
+# (run.sh's ret alignment) and objdump comments ("# ..." on x86-64,
+# "// ..." on aarch64, both after whitespace) removed, and immediates
+# masked ($0x..., #0x..., #16), which also masks aarch64 shift and rotate
+# amounts.  An empty shape counts as a failure.
 leaf_shapes() {
     printf '%s\n' "$disassembly" | awk '
         /^[0-9a-f]+ <leaf_[0-9]+>:$/ { name = $2; in_leaf = 1; shape[name] = ""; next }
         in_leaf && /^$/              { in_leaf = 0; next }
         in_leaf {
             line = $0; sub(/^[^\t]*\t/, "", line)
-            sub(/[ \t]*(#|\/\/).*$/, "", line)
+            sub(/[ \t]+(# |\/\/).*$/, "", line)
             gsub(/[ \t]+/, " ", line); sub(/^ /, "", line); sub(/ $/, "", line)
             while (line ~ /^(cs|ds|data16) /) sub(/^[a-z0-9]+ /, "", line)
             if (line ~ /^(nop|xchg %ax,%ax)/ || line == "") next
             gsub(/\$?0x[0-9a-f]+|#(0x)?[0-9a-f]+/, "IMM", line)
             shape[name] = shape[name] line ";"
         }
-        END { for (k in shape) if (!(shape[k] in seen)) { seen[shape[k]] = 1; d++ }; print d + 0 }'
+        END {
+            for (k in shape) {
+                if (shape[k] == "") empty = 1
+                if (!(shape[k] in seen)) { seen[shape[k]] = 1; d++ }
+            }
+            print empty ? 0 : d + 0
+        }'
 }
 
 if [ "$counts" -eq 1 ]; then
     missing=0
     for k in sum_threshold sum_branchless count_decisions dispatch_indexed correlate_distance; do
-        line=$(analyze "$k" | awk 'NR == 1')
+        # The body with the exact name, else the first clone.
+        line=$(analyze "$k" | awk -v k="$k" '$1 == k { print; found = 1; exit }
+                                          !first { first = $0 }
+                                          END { if (!found && first) print first }')
         if [ -z "$line" ]; then
             echo "check_kernels.sh: kernel $k not found" >&2; missing=1; continue
         fi

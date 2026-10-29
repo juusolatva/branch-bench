@@ -24,8 +24,8 @@
  *
  * Note: -fno-tree-vectorize prevents SIMD rewriting that would bypass branches.
  *       -fno-if-conversion keeps if-else as actual branch instructions (not CMOV)
- *       in the C kernels (Tests 3 and 6, and the C fallback of Tests 1, 2, 4
- *       and 5 on architectures without the asm kernels).
+ *       in the C kernels with a data branch (Test 6, and the C fallback of
+ *       Tests 1, 2, 4 and 5 on architectures without the asm kernels).
  *       Test 4's branchless variant uses arithmetic masks — unaffected by these flags.
  *       clang rejects -fno-if-conversion and has no equivalent; it builds with
  *       -fno-vectorize -fno-slp-vectorize instead.  The asm kernels keep their
@@ -671,7 +671,14 @@ static VariantInfo *variant_entry(int variant)
 static void log_variant(int variant, const char *label, const Work *w)
 {
     VariantInfo *v = variant_entry(variant);
-    if (v->label) return;
+    if (v->label) {
+        if (strcmp(v->label, label) || v->work.count != w->count) {
+            fprintf(stderr, "Internal error: test %d variant %d registered as two rows\n",
+                    current_test, variant);
+            exit(1);
+        }
+        return;
+    }
     v->label = label;
     v->work = *w;
 }
@@ -684,15 +691,18 @@ static void log_input(int variant, const u8 *buf, size_t pass_items, int has_con
 {
     VariantInfo *v = variant_entry(variant);
     const u64 hash = fnv1a64(buf, pass_items);
-    if (v->has_input && (v->pass_items != pass_items || v->has_cond != has_cond ||
-                         v->cond_true != cond_true || v->input_hash != hash)) {
-        fprintf(stderr, "Internal error: variant %d input logged twice\n", variant);
+    if (!has_cond) cond_true = 0;
+    if (cond_true > pass_items ||
+        (v->has_input && (v->pass_items != pass_items || v->has_cond != has_cond ||
+                          v->cond_true != cond_true || v->input_hash != hash))) {
+        fprintf(stderr, "Internal error: test %d variant %d input logged twice or inconsistent\n",
+                current_test, variant);
         exit(1);
     }
     v->has_input  = 1;
     v->pass_items = pass_items;
     v->has_cond   = has_cond;
-    v->cond_true  = has_cond ? cond_true : 0;
+    v->cond_true  = cond_true;
     v->input_hash = hash;
 }
 
@@ -1273,12 +1283,9 @@ static void threshold_note(char *buf, size_t bufsz, u64 above, size_t n)
 }
 
 /* The report's copy of the note the console prints in the test heading. */
-static void emit_threshold_note(FILE *report, u64 above, size_t n)
+static void emit_threshold_note(FILE *report, const char *note)
 {
-    if (!report) return;
-    char note[96];
-    threshold_note(note, sizeof note, above, n);
-    fprintf(report, "_%s._\n\n", note);
+    if (report) fprintf(report, "_%s._\n\n", note);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1290,8 +1297,10 @@ static void emit_threshold_note(FILE *report, u64 above, size_t n)
  *  (about 127/256 of the bytes are above the threshold; the run prints the
  *  actual count).
  *
- *  Sorted:   the branch is not taken up to the crossover and taken after
- *            it, so the predictor is wrong only around the crossover.
+ *  Sorted:   the condition (arr[i] > THRESHOLD) is false up to the
+ *            crossover and true after it (the asm jump, which skips the
+ *            add, is taken before it and not after), so the predictor is
+ *            wrong only around the crossover.
  *
  *  Shuffled: each element's outcome is effectively random, so a predictor
  *            cannot learn it.
@@ -1320,7 +1329,7 @@ static u64 sum_threshold(const u8 *arr, size_t n, unsigned n_reps)
         "2:\n\t"
         "movzbl (%[p]), %k[v]\n\t"
         "cmp $" BB_STR(THRESHOLD) ", %k[v]\n\t"
-        "jbe 3f\n\t"                 /* <── THE branch being predicted */
+        "jbe 3f\n\t"                 /* <── THE branch; skips: ASM_TAKEN_WHEN */
         "add %[v], %[acc]\n"
         "3:\n\t"
         "inc %[p]\n\t"
@@ -1401,7 +1410,7 @@ static void run_test1(FILE *report)
     emit_pair_summary(report, "Test 1 — Threshold Sum",
                       "Sorted vs shuffled copies of one random byte array, same branch kernel.",
                       rows, &work, pair);
-    emit_threshold_note(report, above, len);
+    emit_threshold_note(report, note);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1489,14 +1498,15 @@ static u64 count_decisions(const u8 *decisions, size_t n, unsigned n_reps)
 #define T2_ROWS  (3 * T2_BIASES + 2)
 
 /* Each bias's periodic word; every length divides T2_PERIOD. */
-static const char *const t2_words[T2_BIASES] = {
+static const char *const t2_words[] = {
     "1000000000000000", "1000", "10", "1110", "1111111111111110",
 };
+CHECK_LEN(t2_words_len_check, t2_words, T2_BIASES);
 
 /* Row labels: bias b's periodic, clustered and shuffled rows are 3b, 3b+1
  * and 3b+2, then the two controls.  A bias row's first word is its bias
  * (check_export.py reads it). */
-static const char *const t2_labels[T2_ROWS] = {
+static const char *const t2_labels[] = {
     "1/16  periodic 1000000000000000", "1/16  clustered", "1/16  shuffled",
     "1/4   periodic 1000",             "1/4   clustered", "1/4   shuffled",
     "1/2   periodic 10",               "1/2   clustered", "1/2   shuffled",
@@ -1506,24 +1516,39 @@ static const char *const t2_labels[T2_ROWS] = {
 };
 CHECK_LEN(t2_labels_len_check, t2_labels, T2_ROWS);
 
-static const char *const t2_ratio_periodic[T2_BIASES] = {
+static const char *const t2_ratio_periodic[] = {
     "1/16 shuffled vs periodic", "1/4 shuffled vs periodic", "1/2 shuffled vs periodic",
     "3/4 shuffled vs periodic", "15/16 shuffled vs periodic",
 };
-static const char *const t2_ratio_clustered[T2_BIASES] = {
+static const char *const t2_ratio_clustered[] = {
     "1/16 shuffled vs clustered", "1/4 shuffled vs clustered", "1/2 shuffled vs clustered",
     "3/4 shuffled vs clustered", "15/16 shuffled vs clustered",
 };
-static const char *const t2_prefix_periodic[T2_BIASES] = {
+static const char *const t2_prefix_periodic[] = {
     "  → 1/16  shuffled vs periodic:  ", "  → 1/4   shuffled vs periodic:  ",
     "  → 1/2   shuffled vs periodic:  ", "  → 3/4   shuffled vs periodic:  ",
     "  → 15/16 shuffled vs periodic:  ",
 };
-static const char *const t2_prefix_clustered[T2_BIASES] = {
+static const char *const t2_prefix_clustered[] = {
     "  → 1/16  shuffled vs clustered: ", "  → 1/4   shuffled vs clustered: ",
     "  → 1/2   shuffled vs clustered: ", "  → 3/4   shuffled vs clustered: ",
     "  → 15/16 shuffled vs clustered: ",
 };
+CHECK_LEN(t2_ratio_periodic_len_check, t2_ratio_periodic, T2_BIASES);
+CHECK_LEN(t2_ratio_clustered_len_check, t2_ratio_clustered, T2_BIASES);
+CHECK_LEN(t2_prefix_periodic_len_check, t2_prefix_periodic, T2_BIASES);
+CHECK_LEN(t2_prefix_clustered_len_check, t2_prefix_clustered, T2_BIASES);
+
+/* Rows with their labels, no result yet and the test's Work. */
+static void init_rows(ReportRow *rows, const char *const *labels, int n)
+{
+    const Result none = {0};
+    for (int i = 0; i < n; i++) {
+        rows[i].label = labels[i];
+        rows[i].r     = none;
+        rows[i].work  = NULL;
+    }
+}
 
 static void fill_periodic(u8 *buf, size_t n, const char *word)
 {
@@ -1564,12 +1589,16 @@ static int test2_size_ok(size_t len)
     return len >= T2_PERIOD && len % T2_PERIOD == 0;
 }
 
-/* Builds bias b's three orders, checks that they hold its exact number of
- * ones (and the periodic one its word's period), and measures periodic and
- * clustered each paired with shuffled. */
-static void measure_bias(int b, u8 *periodic, u8 *clustered, u8 *shuffled, size_t len,
+/* Builds bias b's three orders in bufs[] (periodic, clustered, shuffled),
+ * checks that they hold its exact number of ones (and the periodic one its
+ * word's period), and measures periodic and clustered each paired with
+ * shuffled. */
+static void measure_bias(int b, u8 *const bufs[3], size_t len,
                          ReportRow rows[T2_ROWS], int *pair_p, int *pair_c)
 {
+    u8 *periodic  = bufs[0];
+    u8 *clustered = bufs[1];
+    u8 *shuffled  = bufs[2];
     const char *word = t2_words[b];
     const size_t wl = strlen(word);
     if (!wl || T2_PERIOD % wl) {
@@ -1606,45 +1635,37 @@ static void measure_bias(int b, u8 *periodic, u8 *clustered, u8 *shuffled, size_
 static void measure_constant(u8 *buf, size_t len, int one, ReportRow rows[T2_ROWS])
 {
     const int v = 3 * T2_BIASES + one;
+    const u64 ones = one ? (u64)len : 0;
     memset(buf, one, len);
-    log_input(v, buf, len, 1, one ? (u64)len : 0);
+    log_input(v, buf, len, 1, ones);
     MEASURE(rows[v].r, v, count_decisions(buf, len, reps));
-    check_result(rows[v].label, rows[v].r.result, one ? (u64)len * reps : 0);
+    check_result(rows[v].label, rows[v].r.result, ones * reps);
 }
 
 static void run_test2(FILE *report)
 {
     seed_test(2);
     const size_t len = size;
-    printf("TEST 2 — Bias and Ordering  (5 biases × periodic/clustered/shuffled, %zu×%u reps)\n",
-           len, reps);
+    printf("TEST 2 — Bias and Ordering  (%d biases × periodic/clustered/shuffled, %zu×%u reps)\n",
+           T2_BIASES, len, reps);
     printf("  %s\n\n", T2_DESC);
     if (!test2_size_ok(len)) {
         emit_skip(report, T2_TITLE,
                   "Test 2 needs --size to be a multiple of 16 (whole periods of every bias pattern).");
         return;
     }
-    u8 *periodic  = malloc(len);
-    u8 *clustered = malloc(len);
-    u8 *shuffled  = malloc(len);
-    if (!periodic || !clustered || !shuffled) { perror("malloc"); exit(1); }
+    u8 *bufs[3] = { malloc(len), malloc(len), malloc(len) };
+    if (!bufs[0] || !bufs[1] || !bufs[2]) { perror("malloc"); exit(1); }
 
-    const Result none = {0};
     ReportRow rows[T2_ROWS];
-    for (int i = 0; i < T2_ROWS; i++) {
-        rows[i].label = t2_labels[i];
-        rows[i].r     = none;
-        rows[i].work  = NULL;
-    }
+    init_rows(rows, t2_labels, T2_ROWS);
     int pair_p[T2_BIASES];
     int pair_c[T2_BIASES];
     for (int b = 0; b < T2_BIASES; b++)
-        measure_bias(b, periodic, clustered, shuffled, len, rows, &pair_p[b], &pair_c[b]);
-    measure_constant(periodic, len, 0, rows);
-    measure_constant(periodic, len, 1, rows);
-    free(periodic);
-    free(clustered);
-    free(shuffled);
+        measure_bias(b, bufs, len, rows, &pair_p[b], &pair_c[b]);
+    measure_constant(bufs[0], len, 0, rows);
+    measure_constant(bufs[0], len, 1, rows);
+    for (int i = 0; i < 3; i++) free(bufs[i]);
 
     const Work work = { (u64)len * reps, "elem" };
     emit_rows(report, T2_TITLE, T2_DESC, rows, T2_ROWS, &work);
@@ -1667,9 +1688,10 @@ static void run_test2(FILE *report)
  *  4, ... 64) two index sequences with exactly the same number of calls to
  *  every target are compared:
  *
- *  Cyclic:    0, 1, ..., T-1, 0, 1, ...  A plain Branch Target Buffer only
- *             remembers the last target, so learning the cycle takes a
- *             predictor that uses branch history.
+ *  Cyclic:    0, 1, ..., T-1, 0, 1, ...  For T >= 2 a plain Branch Target
+ *             Buffer only remembers the last target, so learning the cycle
+ *             takes a predictor that uses branch history.  T = 1 is the
+ *             single-target control.
  *
  *  Shuffled:  the cyclic sequence, randomly permuted: nothing to learn
  *             beyond the target frequencies.
@@ -1758,24 +1780,28 @@ static int test3_size_ok(size_t len)
 #define T3_TITLE "Test 3 — Indirect Dispatch"
 #define T3_DESC  "One indirect call site over 1–64 leaf targets; cyclic vs shuffled index sequences with equal target counts."
 
-static const char *const t3_labels[2 * T3_COUNTS] = {
+static const char *const t3_labels[] = {
     "T= 1 cyclic", "T= 1 shuffled", "T= 2 cyclic", "T= 2 shuffled",
     "T= 4 cyclic", "T= 4 shuffled", "T= 8 cyclic", "T= 8 shuffled",
     "T=16 cyclic", "T=16 shuffled", "T=32 cyclic", "T=32 shuffled",
     "T=64 cyclic", "T=64 shuffled",
 };
 CHECK_LEN(t3_labels_len_check, t3_labels, 2 * T3_COUNTS);
-static const char *const t3_ratio[T3_COUNTS] = {
+static const char *const t3_ratio[] = {
     "T=1 shuffled vs cyclic", "T=2 shuffled vs cyclic", "T=4 shuffled vs cyclic",
     "T=8 shuffled vs cyclic", "T=16 shuffled vs cyclic", "T=32 shuffled vs cyclic",
     "T=64 shuffled vs cyclic",
 };
-static const char *const t3_prefix[T3_COUNTS] = {
+static const char *const t3_prefix[] = {
     "  → T= 1 shuffled vs cyclic: ", "  → T= 2 shuffled vs cyclic: ",
     "  → T= 4 shuffled vs cyclic: ", "  → T= 8 shuffled vs cyclic: ",
     "  → T=16 shuffled vs cyclic: ", "  → T=32 shuffled vs cyclic: ",
     "  → T=64 shuffled vs cyclic: ",
 };
+CHECK_LEN(t3_ratio_len_check, t3_ratio, T3_COUNTS);
+CHECK_LEN(t3_prefix_len_check, t3_prefix, T3_COUNTS);
+/* The largest target count is NUM_FUNCS: T = 1 << (T3_COUNTS - 1). */
+typedef char t3_counts_check[(1u << (T3_COUNTS - 1)) == NUM_FUNCS ? 1 : -1];
 
 /* Builds target count i's two sequences, checks their target counts and
  * measures them as one pair. */
@@ -1820,13 +1846,8 @@ static void run_test3(FILE *report)
     u8 *shuffled = malloc(len);
     if (!cyclic || !shuffled) { perror("malloc"); exit(1); }
 
-    const Result none = {0};
     ReportRow rows[2 * T3_COUNTS];
-    for (int i = 0; i < 2 * T3_COUNTS; i++) {
-        rows[i].label = t3_labels[i];
-        rows[i].r     = none;
-        rows[i].work  = NULL;
-    }
+    init_rows(rows, t3_labels, 2 * T3_COUNTS);
     int pairs[T3_COUNTS];
     for (int i = 0; i < T3_COUNTS; i++)
         measure_targets(i, cyclic, shuffled, len, rows, &pairs[i]);
@@ -1936,7 +1957,7 @@ static void run_test4(FILE *report)
     emit_pair_ratio(report, "  Shuffled, branchless vs branch: ",
                     "Shuffled, branchless vs branch", pr, "");
     print_pair_cost(report, pb);
-    emit_threshold_note(report, above, len);
+    emit_threshold_note(report, note);
     printf("\n");
 }
 
@@ -2381,7 +2402,8 @@ static int test_selected(int n)
  * --counts measures the same fields from the binary; -1 is "not declared".
  * taken_when says when the data branch jumps relative to its source
  * condition ("false": it skips the update), as written in the asm; NULL
- * when the compiler decides.  No function pointers here: taking a
+ * for C kernels (the compiler decides) and for kernels without a single
+ * data branch.  No function pointers here: taking a
  * kernel's address can change how GCC compiles and places the kernels.
  * Entry addresses therefore come from the binary (check_kernels.sh), and
  * the export's "entry" is null. */
@@ -2611,6 +2633,7 @@ static void write_meta(FILE *f)
     json_string(f, COMPILER_VERSION);
     fputs(",\"kernel_backend\":", f);
     json_string(f, KERNEL_BACKEND);
+    fprintf(f, ",\"results_ok\":%s", sanity_failed ? "false" : "true");
     fputs(",\"build_flags\":", f);
     json_string_or_null(f, BUILD_FLAGS);
     fputs(",\"commit\":", f);
@@ -2679,7 +2702,11 @@ static void write_variants(FILE *f)
 {
     for (int i = 0; i < variant_count; i++) {
         const VariantInfo *v = &variant_info[i];
-        if (!v->label) continue;   /* input logged, but no row was emitted */
+        if (!v->label) {   /* input logged, but no row was emitted */
+            fprintf(stderr, "Internal error: test %d variant %d has an input but no row\n",
+                    v->test, v->variant);
+            exit(1);
+        }
         char label[128];
         char kernel[64];
         collapse_spaces(v->label, label, sizeof label);
@@ -3160,6 +3187,18 @@ static void run_selected_tests(FILE *report)
     if (test_selected(6)) { begin_test(6); run_test6(report); }
 }
 
+/* After a result mismatch (sanity_failed), says so where the numbers are
+ * read, not only on stderr, so the report is not mistaken for a valid one. */
+static void emit_sanity_note(FILE *report)
+{
+    if (!sanity_failed) return;
+    static const char msg[] =
+        "ERROR: a kernel result differed from its reference (see stderr); "
+        "do not use these results.";
+    printf("\n  %s\n\n", msg);
+    if (report) fprintf(report, "**%s**\n\n", msg);
+}
+
 /* Closes the report, then writes and closes the export.  Nonzero if either
  * failed. */
 static int finish_outputs(FILE *report, const char *out_path, FILE *json)
@@ -3207,6 +3246,7 @@ int main(int argc, char **argv)
     run_selected_tests(report);
 
     print_clock_summary(report);
+    emit_sanity_note(report);
 
     printf("See README.md for how to interpret these results.\n");
 

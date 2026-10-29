@@ -14,6 +14,7 @@
 #undef read
 #undef ioctl
 #include <assert.h>
+#include <sys/wait.h>
 
 static u64 samples[8][3 + CTR_COUNT];
 static unsigned sample_count;
@@ -840,6 +841,77 @@ static void dispatch_inputs(void)
     assert(!test3_size_ok(32) && !test3_size_ok(1000));
 }
 
+/* Runs fn in a child process and returns its exit status (-1 if it did not
+ * exit normally), for the internal-error paths that call exit(1). */
+static int exit_status(void (*fn)(void))
+{
+    fflush(NULL);
+    const pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        freopen("/dev/null", "w", stderr);
+        fn();
+        _exit(0);
+    }
+    int st = 0;
+    assert(waitpid(pid, &st, 0) == pid);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+static const u8 input_a[4] = { 1, 0, 1, 1 };
+static const u8 input_b[4] = { 1, 1, 0, 1 };
+
+static void log_input_twice_same(void)
+{
+    log_input(0, input_a, 4, 1, 3);
+    log_input(0, input_a, 4, 1, 3);
+}
+static void log_input_twice_other_buffer(void)
+{
+    log_input(0, input_a, 4, 1, 3);
+    log_input(0, input_b, 4, 1, 3);
+}
+static void log_input_no_cond_twice(void)
+{
+    log_input(0, input_a, 4, 0, 0);
+    log_input(0, input_a, 4, 0, 7);   /* cond_true is ignored without has_cond */
+}
+static void log_input_too_many_true(void)
+{
+    log_input(0, input_a, 4, 1, 5);
+}
+static void log_variant_two_labels(void)
+{
+    const Work w = { 4, "elem" };
+    log_variant(0, "first", &w);
+    log_variant(0, "second", &w);
+}
+
+/* A variant's input and row can be registered again only unchanged; a row
+ * whose result differs from its reference is marked in the report. */
+static void variant_guards(void)
+{
+    reset_log(2);
+    assert(exit_status(log_input_twice_same) == 0);
+    assert(exit_status(log_input_twice_other_buffer) == 1);
+    assert(exit_status(log_input_too_many_true) == 1);
+    assert(exit_status(log_input_no_cond_twice) == 0);
+    assert(exit_status(log_variant_two_labels) == 1);
+
+    char buf[256] = "";
+    FILE *f = tmpfile();
+    assert(f);
+    sanity_failed = 0;
+    emit_sanity_note(f);
+    assert(ftell(f) == 0);
+    sanity_failed = 1;
+    emit_sanity_note(f);
+    rewind(f);
+    assert(fgets(buf, sizeof buf, f) && strstr(buf, "**ERROR:"));
+    fclose(f);
+    sanity_failed = 0;
+}
+
 int main(void)
 {
     perf_leader = 42;
@@ -882,5 +954,6 @@ int main(void)
     threshold_inputs();
     bias_inputs();
     dispatch_inputs();
+    variant_guards();
     return 0;
 }
