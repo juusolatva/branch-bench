@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Checks a branch_bench --json export (schema 1) against its own trials.
+"""Checks a branch_bench --json export (schema 2) against its own trials.
 
 Rebuilds every pair summary from the trial records, independently of the
 C code, and compares it with the pair records, and checks each trial's
@@ -7,9 +7,10 @@ scaled counts against its raw counts and scheduling times.  With --report,
 also checks that the Markdown report shows the same medians, ranges,
 counter columns, Miss %, misses per item, ratios, effective-cost lines
 (resolved and inconclusive), Tests 1 and 4's condition-count line and
-Test 6's "Correlation used" lines.
+Test 6's loop-exit curve.  Every selected test must have a test record
+with its id, and every Test 6 row its loop parameters.
 
-Input records: every row of Tests 1-4 and 6 must have one.  Both rows of
+Input records: every row of Tests 1-4 must have one.  Both rows of
 a pair must have equal work and, where recorded, equal item and
 condition-true counts; a pair that compares two kernels must see the same
 input hash, and a pair that compares two orders of one kernel different
@@ -22,7 +23,7 @@ buffers themselves.  The run must not have flagged a result mismatch
 Every check must have something to compare: an empty export or report
 fails.  Standard library only.  The schema, revision and the constants
 below must change together with branch_bench.c (JSON_SCHEMA,
-BENCH_REVISION, COST_MIN_MISSES_PER_PAIR, D6_MIN_SAMPLE, T2_ROWS).
+BENCH_REVISION, COST_MIN_MISSES_PER_PAIR, T2_ROWS).
 
 Usage: check_export.py EXPORT [--report REPORT.md] [--kernel-counts FILE]
                        [--same-results OTHER --test N]
@@ -36,9 +37,8 @@ import math
 import sys
 
 COST_MIN_MISSES_PER_PAIR = 1000.0
-D6_MIN_SAMPLE = 65536
 T2_ROWS = 17
-INPUT_TESTS = (1, 2, 3, 4, 6)   # tests whose rows record their input
+INPUT_TESTS = (1, 2, 3, 4)   # tests whose rows record their input
 # Below this many items per pass, two orders of one multiset can coincide
 # (one element; a 1/16 bias over 16 elements), so they may hash alike.
 ORDER_MIN_ITEMS = 1024
@@ -339,53 +339,69 @@ def cost_line(p):
     return text
 
 
-def correlation_lines(records, variants):
-    """The lines print_correlation_used() writes for Test 6, or None when no
-    pair has miss counts."""
-    entries = []
-    counted = short_na = evaluated = 0
-    best = 0
-    for p in sorted((p for p in by_type(records, "pair") if p["test"] == 6),
-                    key=lambda p: p["pair"]):
-        a = variants[(6, p["a"])]
-        d = int(a["label"].split("=")[1].split()[0])
-        has_misses = p["valid"] > 0 and p["delta"]["misses"] is not None
-        counted += has_misses
-        if not has_misses or a["pass_items"] < D6_MIN_SAMPLE:
-            short_na += has_misses
-            entries.append(f"d={d} n/a")
-            continue
-        avoided = p["delta"]["misses"] / p["valid"]
-        pct = min(100.0, max(0.0, 100.0 * avoided / (0.5 * a["work"])))
-        entries.append(f"d={d} {pct:.0f}%")
-        evaluated += 1
-        if pct >= 90.0:
-            best = d
-    if not counted:
-        return None
-    shown = (str(best) if best else "none") if evaluated else "n/a"
-    lines = [f"**Correlation used:** {', '.join(entries)}\n\n"
-             f"**Largest d with ≥ 90%:** {shown}\n\n"]
-    if short_na:
-        lines.append(f"_n/a: fewer than {D6_MIN_SAMPLE} blocks per pass, so a predictor "
-                     f"may learn the sequences._\n")
+LOOP_PARAMS = ("C", "loops", "iters", "body")
+LOOP_CURVE = "**Loop-exit curve:**"
+
+
+def check_loop_params(variants):
+    """Test 6: every row is one trip count C run `loops` times, and its work
+    is the completed loops."""
+    rows = [v for (t, _), v in variants.items() if t == 6]
+    for v in rows:
+        where = f"Test 6 {v['label']!r}"
+        prm = v.get("params") or {}
+        check(all(k in prm for k in LOOP_PARAMS), f"{where}: params {prm}, want {LOOP_PARAMS}")
+        check(prm["iters"] == prm["C"] * prm["loops"],
+              f"{where}: iters {prm['iters']} is not C × loops = {prm['C'] * prm['loops']}")
+        check(v["work"] == prm["loops"] and v["unit"] == "loop",
+              f"{where}: work {v['work']} {v['unit']}, want {prm['loops']} loop")
+    if rows:
+        ok(f"Test 6: {len(rows)} rows have consistent loop parameters")
+
+
+def curve_table(section):
+    """The loop-exit curve's table lines (header first), or []."""
+    if LOOP_CURVE not in section:
+        return []
+    lines = []
+    for line in section[section.index(LOOP_CURVE):].splitlines()[1:]:
+        if line.startswith("|"):
+            lines.append(line)
+        elif lines:
+            break
     return lines
 
 
-def check_correlation(records, variants, sections):
-    """Test 6's correlation lines, rebuilt from its pairs; returns how many
-    lines were compared."""
-    section = sections.get(6, "")
-    want = correlation_lines(records, variants)
-    if want is None:
-        check("**Correlation used:**" not in section,
-              "Test 6: report has a Correlation used line without miss counts")
-        return 0
-    for line in want:
-        check(line in section, f"Test 6: report lacks {line.strip()!r}")
-    if len(want) == 1:
-        check("_n/a: fewer than" not in section, "Test 6: report has an n/a note no pair needs")
-    return len(want)
+def check_loop_curve(records, variants, sections):
+    """Test 6's curve: one row per variant, its cycles per inner iteration
+    and misses per completed loop from the median trial; returns how many
+    rows were compared."""
+    lines = curve_table(sections.get(6, ""))
+    check(lines, "Test 6: report lacks the loop-exit curve")
+    curve = "\n".join(lines)
+    trials = by_type(records, "trial")
+    rows = 0
+    for (test, variant), v in variants.items():
+        if test != 6:
+            continue
+        where = f"Test 6 loop curve {v['label']}"
+        prm = v["params"]
+        mine = [t for t in trials if t["test"] == 6 and t["variant"] == variant]
+        med = representative(mine)[0]
+        header, row = table_row(curve, v["label"])
+        check(row is not None, f"{where}: no curve row")
+        col = dict(zip(header, row))
+        cycles, misses = med["counts"]["cycles"], med["counts"]["misses"]
+        want = {
+            "C": str(prm["C"]), "Iterations": str(prm["iters"]), "Loops": str(prm["loops"]),
+            "Cycles/iter": "–" if cycles is None else f"{cycles / prm['iters']:.3f}",
+            "Misses/loop": "–" if misses is None else f"{misses / prm['loops']:.3f}",
+        }
+        for name, cell in want.items():
+            check(col.get(name) == cell, f"{where}: {name} {col.get(name)}, median trial gives {cell}")
+        rows += 1
+    check(len(lines) - 2 == rows, f"Test 6: curve has {len(lines) - 2} rows for {rows} variants")
+    return rows
 
 
 def check_threshold_note(variants, sections, test):
@@ -444,7 +460,7 @@ def check_report(records, variants, path):
         if any(t["test"] == test for t in trials):
             lines += check_threshold_note(variants, sections, test)
     if any(t["test"] == 6 for t in trials):
-        lines += check_correlation(records, variants, sections)
+        lines += check_loop_curve(records, variants, sections)
     check(rows, "report check compared no table rows")
     ok(f"report matches the export: {rows} table rows, {lines} summary lines")
 
@@ -503,6 +519,7 @@ def main():
         check_pairs(records)
         check_pair_inputs(records, variants)
         check_bias(variants)
+        check_loop_params(variants)
         if args.report:
             check_report(records, variants, args.report)
         if args.kernel_counts:

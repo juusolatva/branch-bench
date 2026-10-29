@@ -90,13 +90,6 @@
 #define DB_ORDERS      (DB_MAX_ORDER - DB_MIN_ORDER + 1)
 #define DB_MIN_SAMPLE  65536  /* elements for test 5's summary lines */
 
-/* Test 6: distances d (filler branches between A and B), powers of two */
-#define D6_MIN_DIST    4
-#define D6_MAX_DIST    1024
-#define D6_DISTS       9
-#define D6_MIN_BLOCKS  64     /* blocks per pass at d = D6_MAX_DIST */
-#define D6_MIN_SAMPLE  65536  /* blocks per pass for a "Correlation used" figure */
-
 /* ── Kernel backend ───────────────────────────────────────────────────────
  * The data-branch kernels (sum_threshold, count_decisions) are one asm
  * block each on x86-64 and AArch64, so no compiler can turn their branch
@@ -745,7 +738,6 @@ static void log_input(int variant, const u8 *buf, size_t pass_items, int has_con
 /* Records one named parameter of a variant (exported in its "params"
  * object, in logging order).  The same key may be logged again only with
  * the same value. */
-__attribute__((unused))  /* used from Task 2 (Test 6) on */
 static void log_param(int variant, const char *key, u64 value)
 {
     VariantInfo *v = variant_entry(variant);
@@ -2227,215 +2219,277 @@ static void run_test5(FILE *report)
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *
- *  TEST 6 — Correlation Distance: correlated vs independent branch  (opt-in)
+ *  TEST 6 — Loop Exits: one counted loop over many trip counts  (opt-in)
  *
- *  Each block runs branch A on a random outcome, then d filler branches with
- *  a constant outcome, then branch B.  In the correlated row B's outcome equals
- *  A's, so a predictor whose history still reaches A can learn B; in the
- *  reference row B is independently random.  The pair's miss difference
- *  isolates B.  d counts filler iterations, not history bits (each adds a
- *  filler branch and the inner back-edge), so these are results for this
- *  kernel, not a history length.
+ *  loop_exit(c, loops) runs an inner loop of c iterations, loops times.
+ *  The trip count is a run-time argument, so every count uses the same
+ *  inner loop branch (taken c − 1 times, not taken once per loop) and the
+ *  same body.  loop_exit_body2 is the same loop with a second body shape,
+ *  a separately identified control.  Up to revision 3, Test 6 was
+ *  Correlation Distance; those results keep that identity.
  *
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-#define D6_TITLE "Test 6 — Correlation Distance"
-#define D6_DESC  "Branch B repeats branch A's random outcome after d constant filler branches; reference rows make B independently random."
+#define T6_TITLE "Test 6 — Loop Exits"
+#define T6_DESC  "One counted inner loop, same branch address for every trip count C; work is reported per completed loop and per inner iteration."
+#define T6_MAX_ROWS 200
+#define T6_CONSTRUCTION "Construction: one inner loop branch (dec/jnz; subs/b.ne on AArch64) " \
+    "serves every count, taken C−1 times and not taken once per loop; misses per loop " \
+    "include the outer loop branch and the call. Loop-count limits seen here describe " \
+    "this kernel on this machine, not a predictor's capacity."
 
-static const char *const d6_labels[] = {
-    "d=   4 correlated", "d=   4 random B", "d=   8 correlated", "d=   8 random B",
-    "d=  16 correlated", "d=  16 random B", "d=  32 correlated", "d=  32 random B",
-    "d=  64 correlated", "d=  64 random B", "d= 128 correlated", "d= 128 random B",
-    "d= 256 correlated", "d= 256 random B", "d= 512 correlated", "d= 512 random B",
-    "d=1024 correlated", "d=1024 random B",
-};
-CHECK_LEN(d6_labels_len_check, d6_labels, 2 * D6_DISTS);
-
+/* The whole body is one asm block, as in the data-branch kernels: the
+ * exits for no loops or a zero count, the outer loop and the inner loop. */
 __attribute__((noinline))
-static u64 correlate_distance(const u8 *a, const u8 *b, const u8 *fill,
-                              size_t n_blocks, unsigned d, unsigned n_passes)
+static u64 loop_exit(unsigned c, u64 loops)
 {
     u64 acc = 0;
-    for (unsigned p = 0; p < n_passes; p++)
-        for (size_t i = 0; i < n_blocks; i++) {
-            if (a[i]) acc += 1;              /* branch A */
-            for (unsigned j = 0; j < d; j++)
-                if (fill[j]) acc += 2;       /* filler branches */
-            if (b[i]) acc += 3;              /* branch B: a copy of A, or random */
+#if KERNEL_ASM
+    u64 i;
+#  if defined(__x86_64__)
+    __asm__ __volatile__(
+        "test %[l], %[l]\n\t"
+        "jz 4f\n\t"
+        "test %k[c], %k[c]\n\t"
+        "jz 4f\n"
+        "1:\n\t"
+        "mov %k[c], %k[i]\n"
+        "2:\n\t"
+        "inc %[acc]\n\t"
+        "dec %[i]\n\t"
+        "jnz 2b\n\t"                 /* <── THE inner loop branch */
+        "dec %[l]\n\t"
+        "jnz 1b\n"
+        "4:"
+        : [acc] "+r"(acc), [i] "=&r"(i), [l] "+r"(loops)
+        : [c] "r"(c)
+        : "cc");
+#  else
+    __asm__ __volatile__(
+        "cbz %[l], 4f\n\t"
+        "cbz %w[c], 4f\n"
+        "1:\n\t"
+        "mov %w[i], %w[c]\n"
+        "2:\n\t"
+        "add %[acc], %[acc], #1\n\t"
+        "subs %[i], %[i], #1\n\t"
+        "b.ne 2b\n\t"                /* <── THE inner loop branch */
+        "subs %[l], %[l], #1\n\t"
+        "b.ne 1b\n"
+        "4:"
+        : [acc] "+r"(acc), [i] "=&r"(i), [l] "+r"(loops)
+        : [c] "r"(c)
+        : "cc");
+#  endif
+#else
+    if (c == 0) return 0;   /* else GCC keeps an empty outer loop for c = 0 */
+    for (u64 l = 0; l < loops; l++)
+        for (unsigned i = c; i != 0; i--) {
+            acc++;
+            __asm__ __volatile__("" : "+r"(acc));   /* no closed form */
         }
+#endif
     return acc;
 }
 
-/* Even the longest distance gets D6_MIN_BLOCKS blocks per pass.  Which
- * distances are long enough for a "Correlation used" figure is decided
- * separately, by D6_MIN_SAMPLE. */
-static int test6_size_ok(size_t len, unsigned r)
+/* loop_exit with a second body: acc += i, then acc += 1. */
+__attribute__((noinline))
+static u64 loop_exit_body2(unsigned c, u64 loops)
 {
-    return len >= D6_MIN_BLOCKS &&
-           (u64)len * r / (D6_MAX_DIST + 2) >= D6_MIN_BLOCKS;
-}
-
-/* Splits a budget of `total` branches over blocks of d + 2: as many blocks
- * as fit (at most len), then whole passes over them.  The rest of the
- * budget is left unused. */
-static void d6_layout(u64 total, size_t len, unsigned d, size_t *blocks, unsigned *passes)
-{
-    const u64 per_block = (u64)d + 2;
-    const u64 fit = total / per_block;
-    *blocks = fit < len ? (size_t)fit : len;
-    /* test6_size_ok() guarantees blocks > 0; the guard is for the analyzer. */
-    *passes = *blocks ? (unsigned)(total / (per_block * *blocks)) : 0;
-}
-
-/* One distance's layout, and the work each of its two rows does. */
-typedef struct {
-    size_t   blocks;     /* per pass */
-    unsigned passes;
-    Work     work;       /* blocks × passes, unit "block" */
-    int      pair;       /* pair_info[] index of its two rows */
-} D6Point;
-
-/* Misses the correlated row avoided per valid pair, as a percentage of the
- * 0.5 misses per block that a random B costs; clamped to 0–100%.  Needs
- * s->valid and the miss counter. */
-static double correlation_used_pct(const PairStats *s, u64 blocks_run)
-{
-    const double avoided = s->delta[CTR_MISSES] / (double)s->valid;
-    const double pct = 100.0 * avoided / (0.5 * (double)blocks_run);
-    if (pct < 0) return 0;
-    if (pct > 100) return 100;
-    return pct;
-}
-
-/* Measures each distance's correlated row (B a copy of A) and reference row
- * (B random), recording each distance's layout in pts[] and pointing both
- * of its rows at that work. */
-static void measure_distances(const u8 *a, u8 *b_corr, u8 *b_ref, size_t len, u64 total,
-                              ReportRow rows[2 * D6_DISTS], D6Point pts[D6_DISTS])
-{
-    u8 fill[D6_MAX_DIST];
-    memset(fill, 1, sizeof fill);
-    for (int i = 0; i < D6_DISTS; i++) {
-        const unsigned d = (unsigned)D6_MIN_DIST << i;
-        D6Point *pt = &pts[i];
-        d6_layout(total, len, d, &pt->blocks, &pt->passes);
-        pt->work.count = (u64)pt->blocks * pt->passes;
-        pt->work.unit  = "block";
-        rows[2 * i].work = &pt->work;
-        rows[2 * i + 1].work = &pt->work;
-        const size_t blocks = pt->blocks;
-        const unsigned passes = pt->passes;
-        memcpy(b_corr, a, blocks);
-        fill_random_bits(b_ref, blocks, test_seed(6, 0, 1));
-        log_input(2 * i, b_corr, blocks, 0, 0);
-        log_input(2 * i + 1, b_ref, blocks, 0, 0);
-        MEASURE_PAIR(rows[2 * i].r, 2 * i, correlate_distance(a, b_corr, fill, blocks, d, passes),
-                     rows[2 * i + 1].r, 2 * i + 1,
-                     correlate_distance(a, b_ref, fill, blocks, d, passes), pt->pair);
-    }
-}
-
-/* Per distance, how much of B's randomness the correlation removed, and the
- * largest d at 90% or more; needs the miss counter on every row.  These are
- * descriptive thresholds, not a measured history length.  A distance with
- * fewer than D6_MIN_SAMPLE blocks per pass shows n/a: its random sequences
- * repeat so often that a predictor may learn them, which would make B
- * predictable without A. */
-static void print_correlation_used(FILE *report, const D6Point *pts)
-{
-    char list[256] = "";
-    size_t used = 0;
-    unsigned best = 0;
-    int evaluated = 0;
-    int counted = 0;   /* distances whose pair has valid miss counts */
-    int short_na = 0;  /* distances n/a because their sample is too short */
-    for (int i = 0; i < D6_DISTS; i++) {
-        const unsigned d = (unsigned)D6_MIN_DIST << i;
-        char entry[32];
-        const PairStats s = pair_stats(pts[i].pair);
-        const int has_misses = s.valid && ((s.open_mask >> CTR_MISSES) & 1u);
-        counted += has_misses;
-        if (!has_misses || pts[i].blocks < D6_MIN_SAMPLE) {
-            short_na += has_misses;
-            snprintf(entry, sizeof entry, "d=%u n/a", d);
-        } else {
-            const double pct = correlation_used_pct(&s, pts[i].work.count);
-            snprintf(entry, sizeof entry, "d=%u %.0f%%", d, pct);
-            evaluated++;
-            if (pct >= 90.0) best = d;
+    u64 acc = 0;
+#if KERNEL_ASM
+    u64 i;
+#  if defined(__x86_64__)
+    __asm__ __volatile__(
+        "test %[l], %[l]\n\t"
+        "jz 4f\n\t"
+        "test %k[c], %k[c]\n\t"
+        "jz 4f\n"
+        "1:\n\t"
+        "mov %k[c], %k[i]\n"
+        "2:\n\t"
+        "add %[i], %[acc]\n\t"
+        "inc %[acc]\n\t"
+        "dec %[i]\n\t"
+        "jnz 2b\n\t"                 /* <── THE inner loop branch */
+        "dec %[l]\n\t"
+        "jnz 1b\n"
+        "4:"
+        : [acc] "+r"(acc), [i] "=&r"(i), [l] "+r"(loops)
+        : [c] "r"(c)
+        : "cc");
+#  else
+    __asm__ __volatile__(
+        "cbz %[l], 4f\n\t"
+        "cbz %w[c], 4f\n"
+        "1:\n\t"
+        "mov %w[i], %w[c]\n"
+        "2:\n\t"
+        "add %[acc], %[acc], %[i]\n\t"
+        "add %[acc], %[acc], #1\n\t"
+        "subs %[i], %[i], #1\n\t"
+        "b.ne 2b\n\t"                /* <── THE inner loop branch */
+        "subs %[l], %[l], #1\n\t"
+        "b.ne 1b\n"
+        "4:"
+        : [acc] "+r"(acc), [i] "=&r"(i), [l] "+r"(loops)
+        : [c] "r"(c)
+        : "cc");
+#  endif
+#else
+    if (c == 0) return 0;   /* else GCC keeps an empty outer loop for c = 0 */
+    for (u64 l = 0; l < loops; l++)
+        for (unsigned i = c; i != 0; i--) {
+            acc += (u64)i + 1;
+            __asm__ __volatile__("" : "+r"(acc));   /* no closed form */
         }
-        list_append(list, sizeof list, &used, entry);
-    }
-    if (!counted) return;   /* no miss counts at all: no summary */
-    char best_d[16];
-    snprintf(best_d, sizeof best_d, "%u", best);
-    const char *shown = "n/a";
-    if (evaluated) shown = best ? best_d : "none";
-    printf("  → Correlation used: %s\n  → Largest d with ≥ 90%%: %s\n", list, shown);
-    if (report)
-        fprintf(report, "**Correlation used:** %s\n\n**Largest d with ≥ 90%%:** %s\n\n",
-                list, shown);
-    if (short_na) {
-        printf("  → n/a: fewer than %d blocks per pass, so a predictor may learn the sequences\n",
-               D6_MIN_SAMPLE);
-        if (report)
-            fprintf(report, "_n/a: fewer than %d blocks per pass, so a predictor may "
-                            "learn the sequences._\n\n", D6_MIN_SAMPLE);
-    }
+#endif
+    return acc;
 }
 
-/* Test 6's summary lines: the effective cost per additional miss from the
- * d = 4 pair (same work, only B's predictability differs) when its sample
- * is long enough, and the correlation used per distance.  Each pair decides
- * from its own trials whether it has usable counts, so one failed median
- * row cannot hide the other distances. */
-static void print_test6_summary(FILE *report, const D6Point *pts)
+/* Trip counts per profile.  The standard list is provisional until the
+ * hardware pilots; research adds every count 1–160. */
+static const unsigned t6_counts_quick[] = { 1, 2, 4, 16, 64, 256 };
+static const unsigned t6_counts_standard[] = {
+    1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 160, 192, 256, 384, 512,
+};
+static const unsigned t6_counts_research_tail[] = { 192, 256, 384, 512 };
+#define T6_RESEARCH_DENSE 160
+#define T6_N_STANDARD ((int)(sizeof t6_counts_standard / sizeof t6_counts_standard[0]))
+
+/* One Test 6 row: trip count, body shape (1 or 2) and loops run. */
+typedef struct {
+    unsigned c;
+    int      body;
+    u64      loops;
+} T6Row;
+
+/* Inner iterations per row (loops = budget / C). */
+static u64 t6_budget(void)
 {
-    if (pts[0].blocks >= D6_MIN_SAMPLE)
-        print_pair_cost(report, pts[0].pair);
-    print_correlation_used(report, pts);
+    return profile == PROFILE_QUICK ? 1ULL << 18 : 1ULL << 24;
 }
+
+static int t6_add(T6Row *rows, int n, unsigned c, int body)
+{
+    rows[n].c = c;
+    rows[n].body = body;
+    rows[n].loops = t6_budget() / c;
+    return n + 1;
+}
+
+/* The profile's rows in measurement order; returns how many. */
+static int t6_rows(T6Row rows[T6_MAX_ROWS])
+{
+    int n = 0;
+    if (profile == PROFILE_QUICK) {
+        for (size_t i = 0; i < sizeof t6_counts_quick / sizeof t6_counts_quick[0]; i++)
+            n = t6_add(rows, n, t6_counts_quick[i], 1);
+    } else if (profile == PROFILE_STANDARD) {
+        for (int i = 0; i < T6_N_STANDARD; i++)
+            n = t6_add(rows, n, t6_counts_standard[i], 1);
+    } else {
+        for (unsigned c = 1; c <= T6_RESEARCH_DENSE; c++)
+            n = t6_add(rows, n, c, 1);
+        for (size_t i = 0; i < sizeof t6_counts_research_tail / sizeof t6_counts_research_tail[0]; i++)
+            n = t6_add(rows, n, t6_counts_research_tail[i], 1);
+        for (int i = 0; i < T6_N_STANDARD; i++)
+            n = t6_add(rows, n, t6_counts_standard[i], 2);
+    }
+    return n;
+}
+
+/* What a row's kernel returns, computed without the kernel. */
+static u64 t6_reference(const T6Row *t)
+{
+    const u64 c = t->c;
+    return t->body == 1 ? t->loops * c : t->loops * (c * (c + 1) / 2 + c);
+}
+
+/* Measures one row and records its parameters. */
+static void measure_loop(int v, const T6Row *t, ReportRow *row, Work *work)
+{
+    const unsigned c = t->c;
+    const u64 loops = t->loops;
+    log_param(v, "C", c);
+    log_param(v, "loops", loops);
+    log_param(v, "iters", (u64)c * loops);
+    log_param(v, "body", (u64)t->body);
+    work->count = loops;
+    work->unit  = "loop";
+    row->work = work;
+    if (t->body == 1)
+        MEASURE(row->r, v, loop_exit(c, loops));
+    else
+        MEASURE(row->r, v, loop_exit_body2(c, loops));
+    check_result("Test 6 loop", row->r.result, t6_reference(t));
+}
+
+/* A curve cell: value / per with three decimals, or "–" without the counter. */
+static void curve_cell(char *buf, size_t n, const Result *r, int ctr, u64 per)
+{
+    if (result_has(r, ctr) && per)
+        snprintf(buf, n, "%.3f", (double)r->counts[ctr] / (double)per);
+    else
+        snprintf(buf, n, "–");
+}
+
+/* The loop-exit curve: per row, cycles per inner iteration and misses per
+ * completed loop, then how the loop is built. */
+static void emit_loop_curve(FILE *report, const ReportRow *rows, const T6Row *t, int n)
+{
+    printf("\n  Loop-exit curve:\n  %-14s %4s %12s %10s %12s %12s\n",
+           "Variant", "C", "Iterations", "Loops", "Cycles/iter", "Misses/loop");
+    if (report)
+        fprintf(report, "**Loop-exit curve:**\n\n"
+                        "| Variant | C | Iterations | Loops | Cycles/iter | Misses/loop |\n"
+                        "|---|---:|---:|---:|---:|---:|\n");
+    for (int i = 0; i < n; i++) {
+        char cyc[32];
+        char mis[32];
+        const u64 iters = (u64)t[i].c * t[i].loops;
+        curve_cell(cyc, sizeof cyc, &rows[i].r, CTR_CYCLES, iters);
+        curve_cell(mis, sizeof mis, &rows[i].r, CTR_MISSES, t[i].loops);
+        printf("  %-14s %4u %12" PRIu64 " %10" PRIu64 " %12s %12s\n",
+               rows[i].label, t[i].c, iters, t[i].loops, cyc, mis);
+        if (report) {
+            fputs("| ", report);
+            fputs_collapsed(report, rows[i].label);
+            fprintf(report, " | %u | %" PRIu64 " | %" PRIu64 " | %s | %s |\n",
+                    t[i].c, iters, t[i].loops, cyc, mis);
+        }
+    }
+    printf("\n  → %s\n", T6_CONSTRUCTION);
+    if (report) fprintf(report, "\n_%s_\n\n", T6_CONSTRUCTION);
+}
+
+/* Row labels; static because the variant table keeps pointers to them. */
+static char t6_labels[T6_MAX_ROWS][24];
 
 static void run_test6(FILE *report)
 {
     seed_test(6);
-    const size_t len = size;
-    const unsigned r = reps;
-    printf("TEST 6 — Correlation Distance  (d=%d..%d, budget %zu×%u branches per row)\n",
-           D6_MIN_DIST, D6_MAX_DIST, len, r);
-    printf("  %s\n\n", D6_DESC);
-    if (!test6_size_ok(len, r)) {
-        char reason[96];
-        snprintf(reason, sizeof reason,
-                 "Test 6 needs --size ≥ %d and --size × --reps ≥ %d.",
-                 D6_MIN_BLOCKS, D6_MIN_BLOCKS * (D6_MAX_DIST + 2));
-        emit_skip(report, D6_TITLE, reason);
-        return;
-    }
+    T6Row t[T6_MAX_ROWS];
+    const int n = t6_rows(t);
+    printf("TEST 6 — Loop Exits  (%s profile: %d rows, %" PRIu64 " inner iterations per row)\n",
+           profile_names[profile], n, t6_budget());
+    printf("  %s\n\n", T6_DESC);
 
-    u8 *a = malloc(len);
-    u8 *b_corr = malloc(len);
-    u8 *b_ref = malloc(len);
-    if (!a || !b_corr || !b_ref) { perror("malloc"); exit(1); }
-    fill_random_bits(a, len, test_seed(6, 0, 0));
+    ReportRow *rows = malloc((size_t)n * sizeof *rows);
+    Work *works = malloc((size_t)n * sizeof *works);
+    if (!rows || !works) { perror("malloc"); exit(1); }
     const Result none = {0};
-    ReportRow rows[2 * D6_DISTS];
-    D6Point pts[D6_DISTS];
-    for (int i = 0; i < 2 * D6_DISTS; i++) {
-        rows[i].label = d6_labels[i];
+    for (int i = 0; i < n; i++) {
+        snprintf(t6_labels[i], sizeof t6_labels[i],
+                 t[i].body == 1 ? "C=%4u" : "C=%4u body 2", t[i].c);
+        rows[i].label = t6_labels[i];
         rows[i].r     = none;
-        rows[i].work  = NULL;   /* set by measure_distances() */
+        measure_loop(i, &t[i], &rows[i], &works[i]);
     }
-    measure_distances(a, b_corr, b_ref, len, (u64)len * r, rows, pts);
-    free(a);
-    free(b_corr);
-    free(b_ref);
-    u64 sink = 0;
-    for (int i = 0; i < 2 * D6_DISTS; i++) sink += rows[i].r.result;
-    anti_dce_sink(sink);
-
-    emit_rows(report, D6_TITLE, D6_DESC, rows, 2 * D6_DISTS, &pts[0].work);
-    print_test6_summary(report, pts);
+    emit_rows(report, T6_TITLE, T6_DESC, rows, n, &works[0]);
+    emit_loop_curve(report, rows, t, n);
+    free(rows);
+    free(works);
     printf("\n");
 }
 
@@ -2468,8 +2522,12 @@ static int test_streams(int n)
         2 * T3_COUNTS,        /* Test 3: one pair per target count */
         6,                    /* Test 4: three pairs */
         2 * 2 + DB_ORDERS - 2,/* Test 5: two pairs, the other periods alone */
-        2 * D6_DISTS,         /* Test 6: one pair per distance */
+        0,                    /* Test 6: counted below, per profile */
     };
+    if (n == 6) {
+        T6Row rows[T6_MAX_ROWS];
+        return t6_rows(rows);
+    }
     return streams[n - 1];
 }
 
@@ -2516,7 +2574,8 @@ static const KernelDesc kernel_descs[] = {
     { KERNEL(sum_branchless, 1, "c"),             "elem",  0, 0, 1, NULL,           "4"   },
     { KERNEL(count_decisions, 2, KERNEL_BACKEND), "elem",  1, 0, 2, ASM_TAKEN_WHEN, "2,5" },
     { KERNEL(dispatch_indexed, 1, "c"),           "call",  0, 1, 2, NULL,           "3"   },
-    { KERNEL(correlate_distance, 1, "c"),         "block", 3, 0, 2, NULL,           "6"   },
+    { KERNEL(loop_exit, 1, KERNEL_BACKEND),       "iter",  0, 0, 1, NULL,           "6"   },
+    { KERNEL(loop_exit_body2, 1, KERNEL_BACKEND), "iter",  0, 0, 1, NULL,           "6"   },
 };
 #undef KERNEL
 

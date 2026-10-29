@@ -28,7 +28,7 @@ printf '%s\n' "$disassembly" | awk -F'\t' '
     /^[0-9a-f]+ </ {
         fn = $0; sub(/^[0-9a-f]+ /, "", fn); sub(/:$/, "", fn)
         base = fn; sub(/^</, "", base); sub(/[.>].*$/, "", base)
-        kernel = fn ~ /^<(sum_threshold|sum_branchless|count_decisions|dispatch_indexed|correlate_distance)(\.[^>]*)?>$/
+        kernel = fn ~ /^<(sum_threshold|sum_branchless|count_decisions|dispatch_indexed|loop_exit|loop_exit_body2)(\.[^>]*)?>$/
         if (kernel) seen[base] = 1
         pop = ""; next
     }
@@ -46,7 +46,7 @@ printf '%s\n' "$disassembly" | awk -F'\t' '
         ps = s; pe = e; pop = op
     }
     END {
-        n = split("sum_threshold sum_branchless count_decisions dispatch_indexed correlate_distance", want, " ")
+        n = split("sum_threshold sum_branchless count_decisions dispatch_indexed loop_exit loop_exit_body2", want, " ")
         for (i = 1; i <= n; i++)
             if (!(want[i] in seen)) {
                 printf "check_jcc.sh: kernel %s not found\n", want[i] > "/dev/stderr"

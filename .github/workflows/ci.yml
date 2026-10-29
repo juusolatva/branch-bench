@@ -102,7 +102,7 @@ jobs:
       - name: Kernel check rejects a loop guard, unrolled loops and merged or uneven leaves
         run: |
           out="$RUNNER_TEMP/check_fixture.txt"
-          for f in loop_guard unrolled asm_unrolled merged_leaves uneven_leaves; do
+          for f in loop_guard unrolled asm_unrolled merged_leaves uneven_leaves loop_unrolled; do
             gcc $BENCH_FLAGS $WARN_FLAGS -o "$RUNNER_TEMP/$f" ".github/scripts/${f}_fixture.c"
             .github/scripts/check_kernels.sh "$RUNNER_TEMP/$f" > "$out" || true
             cat "$out"
@@ -112,6 +112,7 @@ jobs:
                              grep -q '^FAIL Test 1/4 .*expected 1 data branch(es), found [2-9]' "$out" ;;
               merged_leaves) grep -q '^FAIL Test 3 leaves: 63 distinct addresses for 64 leaves' "$out" ;;
               uneven_leaves) grep -q '^FAIL Test 3 leaves: 2 instruction shapes for 64 leaves' "$out" ;;
+              loop_unrolled) grep -q '^FAIL Test 6 loop_exit: expected 1 conditional branch in the inner loop, found 2' "$out" ;;
             esac
           done
 
@@ -191,27 +192,20 @@ jobs:
       - name: Run all tests (small size, --hard)
         run: ./branch_bench --hard $SMALL_RUN
 
-      # The asm kernels keep their branches under Clang too; only Test 6's C
-      # kernel is still branchless (sbb/cmov, csel/cset on arm64) until
-      # Stage 3 replaces it.  Its failure also proves the checker still
-      # detects lost branches.
+      # Every kernel is asm or has no data-dependent branch, so Clang must
+      # pass every check, as GCC does.
       - name: Clang keeps the controlled kernels' branches
         run: |
           out="$RUNNER_TEMP/check_kernels.txt"
           status=0
           .github/scripts/check_kernels.sh ./branch_bench > "$out" 2>&1 || status=$?
           cat "$out"
-          # 1 = some check failed; anything else means the script broke.
-          [ "$status" -eq 1 ]
+          [ "$status" -eq 0 ]
           for label in 'Test 1/4 sum_threshold' 'Test 2/5 count_decisions' \
-                       'Test 4 sum_branchless' 'Test 3 dispatch_indexed' 'Test 3 leaves'; do
+                       'Test 4 sum_branchless' 'Test 3 dispatch_indexed' 'Test 3 leaves' \
+                       'Test 6 loop_exit' 'Test 6 loop_exit_body2'; do
             grep -qx "ok   $label" "$out" || { echo "missing: ok   $label"; exit 1; }
           done
-          grep -Eq '^FAIL Test 6 correlate_distance: (branchless instruction|fewer than three)' "$out"
-          if grep '^FAIL' "$out" | grep -qv '^FAIL Test 6 '; then
-            echo "check_kernels.sh rejected a controlled kernel in the Clang build"
-            exit 1
-          fi
 
       - name: clang --analyze
         run: |
@@ -324,22 +318,21 @@ jobs:
           grep -q '^\*\*Periods at' "$dir/t5.md"
           grep -q '"governor":"performance"' "$dir/run.jsonl"
           grep -q '"hypervisor":true' "$dir/run.jsonl"
-          grep -q '^\*\*Correlation used:\*\* d=4 [0-9][0-9]*%, d=8 n/a' "$dir/t6.md"
-          grep -q '^_n/a: ' "$dir/t6.md"
+          grep -Eq '^\| C= 16 \| 16 \| [0-9]+ \| [0-9]+ \| [0-9]+\.[0-9]{3} \| [0-9]+\.[0-9]{3} \|$' "$dir/t6.md"
           # Only some counters open.  Tests 1-2 come first: the shim fails the
           # first and third counter reads, and their four measurements absorb
-          # them.  The Test 5-6 summaries need misses, and only misses.
-          # check_export.py must accept both: the Test 6 line with misses,
-          # its absence without.
+          # them.  Test 5's summary and Test 6's Misses/loop curve column need
+          # misses, and only misses.  check_export.py must accept both runs.
           FAKE_PERF_EVENTS=misses ./branch_bench_cov -t 1 -t 2 -t 5 -t 6 $SMALL_RUN -o "$dir/part.md" --json "$dir/part.jsonl"
           grep -q '^\*\*Periods at' "$dir/part.md"
-          grep -q '^\*\*Correlation used' "$dir/part.md"
+          grep -Eq '^\| C= 16 \| .* \| – \| [0-9]+\.[0-9]{3} \|$' "$dir/part.md"
           python3 .github/scripts/check_export.py "$dir/part.jsonl" --report "$dir/part.md"
           FAKE_PERF_EVENTS=branches,cycles ./branch_bench_cov -t 1 -t 2 -t 5 -t 6 $SMALL_RUN -o "$dir/part.md" --json "$dir/part.jsonl"
           python3 .github/scripts/check_export.py "$dir/part.jsonl" --report "$dir/part.md"
-          if grep -q 'Periods at\|Correlation used' "$dir/part.md"; then
-            echo "Test 5-6 summaries printed without the miss counter"; exit 1
+          if grep -q 'Periods at' "$dir/part.md"; then
+            echo "Test 5 summary printed without the miss counter"; exit 1
           fi
+          grep -Eq '^\| C= 16 \| .* \| [0-9]+\.[0-9]{3} \| – \|$' "$dir/part.md"
 
       # Covers perf_stop()'s error paths, which need failing counter reads.
       - name: Perf regression tests with coverage

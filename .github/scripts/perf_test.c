@@ -250,40 +250,6 @@ static Result with_misses(u64 misses)
     return r;
 }
 
-/* Test 6's kernel, block layout, size rule and correlation percentage. */
-static void correlation_distance(void)
-{
-    const u8 a[3] = {1, 0, 1}, b[3] = {1, 0, 1}, fill[4] = {1, 1, 1, 1};
-    assert(correlate_distance(a, b, fill, 3, 4, 2) == 64);
-    assert(correlate_distance(a, b, fill, 3, 0, 2) == 16);
-
-    static const struct { unsigned d; size_t blocks; unsigned passes; } want[] = {
-        {4, 4194304, 10}, {32, 4194304, 1}, {64, 4067203, 1}, {1024, 261632, 1},
-    };
-    for (size_t i = 0; i < sizeof want / sizeof want[0]; i++) {
-        size_t blocks;
-        unsigned passes;
-        d6_layout(64ULL << 22, (size_t)1 << 22, want[i].d, &blocks, &passes);
-        assert(blocks == want[i].blocks && passes == want[i].passes);
-    }
-
-    assert(test6_size_ok(64, 1026) && test6_size_ok(65536, 2));
-    assert(!test6_size_ok(64, 1025) && !test6_size_ok(63, 100000));
-    assert(!test6_size_ok(1000, 1) && !test6_size_ok(32, 100000));
-
-    /* Per valid pair: 250 of 500 random-B misses avoided is 50%. */
-    PairStats ps;
-    memset(&ps, 0, sizeof ps);
-    ps.valid = 2;
-    ps.delta[CTR_MISSES] = 500;
-    assert(correlation_used_pct(&ps, 1000) == 50.0);
-    ps.delta[CTR_MISSES] = -200;                         /* noise: clamped */
-    assert(correlation_used_pct(&ps, 1000) == 0.0);
-    ps.delta[CTR_MISSES] = 4000;
-    assert(correlation_used_pct(&ps, 1000) == 100.0);
-    puts("ok   Test 6 kernel, layout and correlation");
-}
-
 /* Summary lists stay inside their buffer when an item does not fit. */
 static void bounded_list(void)
 {
@@ -299,104 +265,6 @@ static void bounded_list(void)
     assert(strcmp(buf, "1234567, abcdef") == 0);
     for (size_t i = 16; i < sizeof buf; i++) assert(buf[i] == 'X');
     puts("ok   bounded summary lists");
-}
-
-static Result with_misses_cycles(u64 misses, u64 cycles)
-{
-    Result r = with_misses(misses);
-    r.counts[CTR_CYCLES] = cycles;
-    return r;
-}
-
-/* Renders the Test 6 summary for the logged pairs of pts into buf. */
-static void test6_summary_text(const D6Point *pts,
-                               char *buf, size_t bufsz)
-{
-    FILE *f = tmpfile();
-    assert(f);
-    print_test6_summary(f, pts);
-    rewind(f);
-    memset(buf, 0, bufsz);
-    size_t n = fread(buf, 1, bufsz - 1, f);
-    (void)n;
-    assert(fclose(f) == 0);
-}
-
-/* Logs each distance's two rows as one pair and points pts[] at it. */
-static void log_d6(const ReportRow *rows, D6Point pts[D6_DISTS])
-{
-    reset_log(6);
-    for (int i = 0; i < D6_DISTS; i++)
-        pts[i].pair = log_pair(2 * i, 2 * i + 1, &rows[2 * i].r, &rows[2 * i + 1].r);
-}
-
-static void set_points(D6Point pts[D6_DISTS], size_t blocks, unsigned passes)
-{
-    for (int i = 0; i < D6_DISTS; i++) {
-        pts[i].blocks = blocks;
-        pts[i].passes = passes;
-        pts[i].work.count = (u64)blocks * passes;
-        pts[i].work.unit = "block";
-    }
-}
-
-/* Test 6's summary: n/a below 64K blocks per pass, multi-pass figures, the
- * 90% boundary, no effective cost from a short d = 4 sample, and a failed
- * median row that must not hide its pair's valid trials. */
-static void test6_summary(void)
-{
-    ReportRow rows[2 * D6_DISTS];
-    D6Point pts[D6_DISTS];
-    char out[2048];
-    for (int i = 0; i < 2 * D6_DISTS; i++) {
-        rows[i].label = "x";
-        rows[i].r = with_misses_cycles(0, 1000000);
-        rows[i].work = NULL;
-    }
-    /* d = 4 has 65536 blocks over 2 passes (50%); the rest are too short. */
-    set_points(pts, 4096, 1);
-    pts[0].blocks = 65536; pts[0].passes = 2; pts[0].work.count = 131072;
-    rows[0].r = with_misses_cycles(32768, 1000000);
-    rows[1].r = with_misses_cycles(65536, 2000000);
-    log_d6(rows, pts);
-    test6_summary_text(pts, out, sizeof out);
-    assert(strstr(out, "**Correlation used:** d=4 50%, d=8 n/a, "));
-    assert(strstr(out, "d=1024 n/a\n"));
-    assert(strstr(out, "**Largest d with ≥ 90%:** none\n"));
-    assert(strstr(out, "_n/a: fewer than 65536 blocks per pass"));
-    assert(strstr(out, "**Effective extra cycles per additional miss:** 30.5 cycles\n"));
-
-    /* Nothing evaluated: n/a, not "none", and no cost from d = 4. */
-    pts[0] = pts[1];
-    test6_summary_text(pts, out, sizeof out);
-    assert(strstr(out, "**Largest d with ≥ 90%:** n/a\n"));
-    assert(!strstr(out, "Effective extra cycles"));
-
-    /* Every distance evaluated; exactly 90% counts, 89.9% does not. */
-    set_points(pts, 100000, 1);
-    for (int i = 0; i < D6_DISTS; i++) {
-        rows[2 * i].r = with_misses(i == D6_DISTS - 1 ? 5050 : 5000);
-        rows[2 * i + 1].r = with_misses(50000);
-    }
-    log_d6(rows, pts);
-    test6_summary_text(pts, out, sizeof out);
-    assert(strstr(out, "d=512 90%, d=1024 90%\n"));
-    assert(strstr(out, "**Largest d with ≥ 90%:** 512\n"));
-    assert(!strstr(out, "_n/a:"));
-
-    /* A median row whose own read failed must not hide its pair's valid
-     * trials, nor every other distance. */
-    rows[2].r.perf_status = PERF_READ_FAILED;
-    test6_summary_text(pts, out, sizeof out);
-    assert(strstr(out, "**Correlation used:** d=4 90%, d=8 90%"));
-    assert(!strstr(out, "_n/a:"));
-
-    /* No pair with valid miss counts: no summary at all. */
-    for (int i = 0; i < 2 * D6_DISTS; i++) rows[i].r.perf_status = PERF_READ_FAILED;
-    log_d6(rows, pts);
-    test6_summary_text(pts, out, sizeof out);
-    assert(out[0] == '\0');
-    puts("ok   Test 6 summary: n/a, passes, 90% boundary, cost gate");
 }
 
 /* Renders the Test 5 summary into buf. */
@@ -449,9 +317,8 @@ static void test5_summary(void)
     puts("ok   Test 5 summary: list, none, missing counts, n/a");
 }
 
-/* Tests 5 and 6 feed their kernels the data their labels describe:
- * whole de Bruijn periods and the seeded random row; B a copy of A in each
- * correlated row and independently seeded in each reference row. */
+/* Test 5 feeds its kernel the data its labels describe: whole de Bruijn
+ * periods and the seeded random row. */
 static void measured_data(void)
 {
     const int saved_leader = perf_leader;
@@ -477,40 +344,9 @@ static void measured_data(void)
     fill_random_bits(expect, sizeof expect, test_seed(5, 0, 0));
     assert(rows5[DB_ORDERS].r.result == count_ones(expect, sizeof expect));
 
-    static u8 a[1024], b[1024], b2[1024], ref_b[1024];
-    reset_log(6);
-    const u64 total = 1024ULL * 1026;
-    ReportRow rows6[2 * D6_DISTS];
-    D6Point pts[D6_DISTS];
-    for (int i = 0; i < 2 * D6_DISTS; i++) {
-        rows6[i].label = "x";
-        rows6[i].r = none;
-        rows6[i].work = NULL;
-    }
-    assert(test_seed(6, 0, 0) != test_seed(6, 0, 1));
-    fill_random_bits(a, sizeof a, test_seed(6, 0, 0));
-    measure_distances(a, b, b2, sizeof a, total, rows6, pts);
-    for (int i = 0; i < D6_DISTS; i++) {
-        const unsigned d = (unsigned)D6_MIN_DIST << i;
-        size_t blocks;
-        unsigned passes;
-        d6_layout(total, sizeof a, d, &blocks, &passes);
-        assert(pts[i].blocks == blocks && pts[i].passes == passes);
-        assert(pts[i].work.count == (u64)blocks * passes);
-        assert(rows6[2 * i].work == &pts[i].work && rows6[2 * i + 1].work == &pts[i].work);
-        assert(pair_info[pts[i].pair].a == 2 * i && pair_info[pts[i].pair].b == 2 * i + 1);
-        /* Per block: A adds 1 and B 3 when set, each filler 2. */
-        fill_random_bits(ref_b, blocks, test_seed(6, 0, 1));
-        const u64 ones_a = count_ones(a, blocks);
-        const u64 fillers = 2ULL * d * blocks;
-        assert(rows6[2 * i].r.result == passes * (fillers + 4 * ones_a));
-        assert(rows6[2 * i + 1].r.result ==
-               passes * (fillers + ones_a + 3 * count_ones(ref_b, blocks)));
-    }
-
     perf_leader = saved_leader;
     reps = saved_reps;
-    puts("ok   Test 5 and 6 rows measure the data their labels describe");
+    puts("ok   Test 5 rows measure the data their labels describe");
 }
 
 /* Each trial keeps its raw and scaled counts, scheduling times and the
@@ -941,6 +777,20 @@ static void trial_log_grows(void)
     puts("ok   trial log grows to the reserved size");
 }
 
+/* Both loop-exit kernels against their closed forms, including no loops,
+ * a zero count and a single iteration. */
+static void loop_inputs(void)
+{
+    static const unsigned c[] = { 0, 5, 1, 1, 160, 512 };
+    static const u64 loops[] = { 5, 0, 1, 7, 3, 2 };
+    for (int i = 0; i < 6; i++) {
+        const u64 n = c[i];
+        assert(loop_exit(c[i], loops[i]) == loops[i] * n);
+        assert(loop_exit_body2(c[i], loops[i]) == loops[i] * (n * (n + 1) / 2 + n));
+    }
+    puts("ok   loop-exit kernels match their closed forms");
+}
+
 int main(void)
 {
     perf_leader = 42;
@@ -969,9 +819,7 @@ int main(void)
     raw_event_reporting();
     per_row_work();
     pattern_learnability();
-    correlation_distance();
     bounded_list();
-    test6_summary();
     test5_summary();
     measured_data();
     seeds();
@@ -985,5 +833,6 @@ int main(void)
     dispatch_inputs();
     variant_guards();
     trial_log_grows();
+    loop_inputs();
     return 0;
 }

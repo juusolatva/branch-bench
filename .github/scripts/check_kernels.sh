@@ -15,8 +15,9 @@
 #       ignored), so every target does the same work.  A retpoline or
 #       indirect-thunk build turns the call into a direct call to a thunk,
 #       which the indirect-call check rejects by design.
-#   Test 6 correlate_distance: at least three conditional branches inside
-#       its loops (A, filler and B; mode loop-branch3).
+#   Test 6 loop_exit, loop_exit_body2: two nested loops whose inner loop
+#       has exactly one conditional branch (its back-edge, the branch every
+#       trip count uses) and no memory access or call (mode loop-exit).
 #   Every kernel except sum_branchless: no branchless instruction; every
 #       kernel: no SIMD.
 #   Every kernel: exactly one function body (no clone or duplicate).
@@ -82,12 +83,14 @@ body() {
 }
 
 # analyze <function regex>: prints one line per matching function body:
-# "name data_branches indirect_calls inner_loop_branches loop_branches".
-# loop_branches counts forward conditional branches inside a loop of any
-# kind (mode loop-branch3).  inner_loop_branches counts the branch, call
-# and return instructions of the hot loop: the innermost loop that reads
-# memory or makes an indirect call (so not, e.g., GCC's empty loop for
-# n == 0).
+# "name data_branches indirect_calls inner_loop_branches back_edges
+# innermost_cond innermost_hot".  inner_loop_branches counts the branch,
+# call and return instructions of the hot loop: the innermost loop that
+# reads memory or makes an indirect call (so not, e.g., GCC's empty loop
+# for n == 0), else of the innermost loop.  back_edges counts backward
+# conditional branches; innermost_cond the conditional branches of the
+# innermost loop and innermost_hot whether it reads memory or calls
+# (mode loop-exit).
 analyze() {
     printf '%s\n' "$disassembly" | awk -v re="^[0-9a-f]+ <($1)(\\\\.[^>]*)?>:\$" \
         -v cond="^$cond_branch" -v arch="$arch" '
@@ -198,9 +201,9 @@ analyze() {
             }
             return 0
         }
-        function flush(    i, l, best, k, lo, hi, data_branches, indirect_calls, inner, loop_branches) {
+        function flush(    i, l, best, k, lo, hi, data_branches, indirect_calls, inner, back, small, icond, ihot) {
             if (!n) return
-            data_branches = indirect_calls = inner = loop_branches = 0
+            data_branches = indirect_calls = inner = back = icond = ihot = 0
             nb = 0
             for (i = 1; i <= n; i++) {
                 if (insn[i] ~ indirect) indirect_calls++
@@ -215,19 +218,30 @@ analyze() {
                     if (dest[l] < from[l] && dest[l] <= from[k] && from[k] < from[l] && dest[k] <= from[l])
                         if (!best || from[l] - dest[l] < from[best] - dest[best]) best = l
                 if (!best) continue
-                loop_branches++
                 if (data_fed(bi[k], dest[best])) data_branches++
+            }
+            small = 0
+            for (l = 1; l <= nb; l++) {
+                if (dest[l] >= from[l]) continue
+                back++
+                if (!small || from[l] - dest[l] < from[small] - dest[small]) small = l
+            }
+            if (small) {
+                for (i = 1; i <= n; i++)
+                    if (addr[i] >= dest[small] && addr[i] <= from[small] && insn[i] ~ cond) icond++
+                ihot = hot(dest[small], from[small])
             }
             best = 0
             for (l = 1; l <= nb; l++)
                 if (dest[l] < from[l] && hot(dest[l], from[l]) &&
                     (!best || from[l] - dest[l] < from[best] - dest[best])) best = l
+            if (!best) best = small
             if (best) {
                 lo = dest[best]; hi = from[best]
                 for (i = 1; i <= n; i++)
                     if (addr[i] >= lo && addr[i] <= hi && insn[i] ~ anybranch) inner++
             }
-            printf "%s %d %d %d %d\n", name, data_branches, indirect_calls, inner, loop_branches
+            printf "%s %d %d %d %d %d %d\n", name, data_branches, indirect_calls, inner, back, icond, ihot
             n = 0
         }
         BEGIN {
@@ -287,7 +301,7 @@ leaf_shapes() {
 
 if [ "$counts" -eq 1 ]; then
     missing=0
-    for k in sum_threshold sum_branchless count_decisions dispatch_indexed correlate_distance; do
+    for k in sum_threshold sum_branchless count_decisions dispatch_indexed loop_exit loop_exit_body2; do
         # The body with the exact name, else the first clone.
         line=$(analyze "$k" | awk -v k="$k" '$1 == k { print; found = 1; exit }
                                           !first { first = $0 }
@@ -304,7 +318,7 @@ fi
 fail=0
 
 # check <label> <function regex> <mode> [N]
-#   modes: data-branch N, no-data-branch, indirect-call N, loop-branch3
+#   modes: data-branch N, no-data-branch, indirect-call N, loop-exit
 check() {
     label=$1 re=$2 mode=$3 want=${4:-}
     insns=$(body "$re")
@@ -317,13 +331,13 @@ check() {
     # wanted one, else the first body's.  Each body is checked on its own.
     set -- $(analyze "$re" | awk -v mode="$mode" -v want="${want:-0}" '
         { base = $1; sub(/\..*/, "", base); if (++per[base] > bodies) bodies = per[base] }
-        NR == 1 { d = $2; c = $3; l = $5 }
+        NR == 1 { d = $2; c = $3; b = $5; ic = $6; ih = $7 }
         mode == "data-branch"    && $2 != want { d = $2 }
         mode == "no-data-branch" && $2 != 0    { d = $2 }
         mode == "indirect-call"  && $3 != want { c = $3 }
-        mode == "loop-branch3"   && $5 < 3     { l = $5 }
-        END { print bodies + 0, d + 0, c + 0, l + 0 }')
-    bodies=$1 data=$2 indirect=$3 loops=$4
+        mode == "loop-exit" && ($5 != 2 || $6 != 1 || $7 != 0) { b = $5; ic = $6; ih = $7 }
+        END { print bodies + 0, d + 0, c + 0, b + 0, ic + 0, ih + 0 }')
+    bodies=$1 data=$2 indirect=$3 back=$4 icond=$5 ihot=$6
     if [ "$bodies" -ne 1 ]; then
         echo "FAIL $label: $bodies bodies (clone or duplicate)"; bad=1
     fi
@@ -346,9 +360,13 @@ check() {
             if [ "$indirect" -ne "$want" ]; then
                 echo "FAIL $label: expected $want indirect call(s), found $indirect"; bad=1
             fi ;;
-        loop-branch3)
-            if [ "$loops" -lt 3 ]; then
-                echo "FAIL $label: fewer than three conditional branches inside the loops"; bad=1
+        loop-exit)
+            if [ "$back" -ne 2 ]; then
+                echo "FAIL $label: expected 2 nested loops, found $back backward branch(es)"; bad=1
+            elif [ "$icond" -ne 1 ]; then
+                echo "FAIL $label: expected 1 conditional branch in the inner loop, found $icond"; bad=1
+            elif [ "$ihot" -ne 0 ]; then
+                echo "FAIL $label: the inner loop reads memory or calls"; bad=1
             fi ;;
     esac
     if [ "$bad" -eq 0 ]; then echo "ok   $label"; else fail=1; fi
@@ -358,7 +376,8 @@ check "Test 1/4 sum_threshold"            'sum_threshold'             data-branc
 check "Test 2/5 count_decisions"          'count_decisions'           data-branch 1
 check "Test 4 sum_branchless"             'sum_branchless'            no-data-branch
 check "Test 3 dispatch_indexed"           'dispatch_indexed'          indirect-call 1
-check "Test 6 correlate_distance"         'correlate_distance'        loop-branch3
+check "Test 6 loop_exit"                  'loop_exit'                 loop-exit
+check "Test 6 loop_exit_body2"            'loop_exit_body2'           loop-exit
 
 set -- $(leaves)
 shapes=$(leaf_shapes)

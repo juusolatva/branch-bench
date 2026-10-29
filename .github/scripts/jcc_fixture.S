@@ -32,8 +32,13 @@ dispatch_indexed:
     ret
 
     .p2align 4
-    .globl correlate_distance
-correlate_distance:
+    .globl loop_exit
+loop_exit:
+    ret
+
+    .p2align 4
+    .globl loop_exit_body2
+loop_exit_body2:
     ret
 
     .section .note.GNU-stack,"",@progbits

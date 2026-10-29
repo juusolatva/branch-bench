@@ -91,16 +91,10 @@ grep -q 'Skipped:' "$dir/mixed.md" || { echo "FAIL mixed.md lacks Test 5's skip 
 expect 0 -t 2 --size 1000 --reps 1 -o "$dir/skip2.md"
 grep -q 'Skipped:' "$dir/skip2.md" || { echo "FAIL skip2.md lacks the skip reason"; fail=1; }
 expect 0 -t 2 --size 16 --reps 1
-# Test 6 is opt-in; it skips when --size < 64 or --size × --reps < 65664.
-# At 64K × 6 only d = 4 gets the 65536 blocks per pass that a "Correlation
-# used" figure needs, so with the miss counter (CI's fake_perf.so step
-# checks this) the report has both a figure and n/a entries.
-expect 0 -t 4 -t 6 --size 64K --reps 6 -o "$dir/t6.md"
-grep -q '^| d= 4 correlated |' "$dir/t6.md" || { echo "FAIL t6.md lacks Test 6's table"; fail=1; }
-expect 0 -t 6 --size 1000 --reps 1 -o "$dir/skip6.md"
-grep -q 'Skipped:' "$dir/skip6.md" || { echo "FAIL skip6.md lacks the skip reason"; fail=1; }
-expect 0 -t 6 --size 32 --reps 100000 -o "$dir/skip6b.md"
-grep -q 'Skipped:' "$dir/skip6b.md" || { echo "FAIL skip6b.md lacks the skip reason"; fail=1; }
+# Test 6 is opt-in; its counts come from --profile, not --size.
+expect 0 -t 4 -t 6 --profile quick -o "$dir/t6.md"
+grep -q '^| C= 16 |' "$dir/t6.md" || { echo "FAIL t6.md lacks Test 6's table"; fail=1; }
+grep -q '^_Construction: one inner loop branch' "$dir/t6.md" || { echo "FAIL t6.md lacks the construction note"; fail=1; }
 # --hard runs all six tests, also next to -t, and says so.
 # shellcheck disable=SC2086
 expect 0 --hard $small -o "$dir/hard.md"
@@ -108,7 +102,7 @@ grep -q '(all, with --hard)' "$dir/stdout" || { echo "FAIL --hard banner lacks i
 expect 0 --hard -t 2 --size 4K --reps 1 -o "$dir/hard2.md"
 # The largest trial count with every test: the trial log reserves each
 # test's streams × 99 trials before the test, so it must never fill up.
-expect 0 --hard -n 99 --size 64K --reps 2 --json "$dir/max.jsonl"
+expect 0 --hard -n 99 --profile quick --size 64K --reps 2 --json "$dir/max.jsonl"
 for f in hard.md hard2.md; do
     for t in 1 2 3 4 5 6; do
         grep -q "^### Test $t " "$dir/$f" || { echo "FAIL $f lacks Test $t"; fail=1; }
@@ -156,18 +150,19 @@ export_ok "$dir/skip2b.jsonl" --report "$dir/skip2b.md"
 # One element per array: the kernels' smallest input, against the reference.
 expect 0 -t 1 -t 4 --size 1 --reps 1 -o "$dir/one.md" --json "$dir/one.jsonl"
 export_ok "$dir/one.jsonl" --report "$dir/one.md"
-# Test 6's "Correlation used" line is rebuilt from the export too.  At
-# 64K × 6, d = 4 has a figure and the other distances n/a (with counters).
-expect 0 -t 4 -t 6 --size 64K --reps 6 -o "$dir/t6j.md" --json "$dir/t6.jsonl"
+# Test 6's loop-exit curve is rebuilt from the export too.
+expect 0 -t 6 --profile quick -o "$dir/t6j.md" --json "$dir/t6.jsonl"
 export_ok "$dir/t6.jsonl" --report "$dir/t6j.md"
-# The checker must notice a changed figure (none without the miss counter).
-sed 's/^\(\*\*Correlation used:\*\* d=4 \)[0-9]*%/\1101%/' "$dir/t6j.md" > "$dir/t6bad.md"
+# The checker must notice a changed curve cell (none without the miss counter).
+awk '/^\*\*Loop-exit curve:\*\*/ { curve = 1 }
+     curve && /^\| C= 16 \|/ && $(NF - 1) != "–" { $(NF - 1) = "9.999" }
+     { print }' "$dir/t6j.md" > "$dir/t6bad.md"
 if cmp -s "$dir/t6j.md" "$dir/t6bad.md"; then
-    echo "skip corrupted-correlation case: no miss counter"
+    echo "skip corrupted-curve case: no miss counter"
 elif python3 "$check_export" "$dir/t6.jsonl" --report "$dir/t6bad.md" > "$dir/check.out" 2>&1; then
-    echo "FAIL check_export.py accepted a corrupted Correlation used line"; fail=1
-elif grep -q '^FAIL Test 6: report lacks' "$dir/check.out"; then
-    echo "ok   check_export.py rejects a corrupted Correlation used line"
+    echo "FAIL check_export.py accepted a corrupted loop-exit curve"; fail=1
+elif grep -q '^FAIL Test 6 loop curve C= 16: Misses/loop' "$dir/check.out"; then
+    echo "ok   check_export.py rejects a corrupted loop-exit curve"
 else
     echo "FAIL check_export.py failed for another reason:"; cat "$dir/check.out"; fail=1
 fi
@@ -177,9 +172,13 @@ expect 0 -t 1 -t 3 --size 4K --reps 1 --json "$dir/b.jsonl"
 export_ok "$dir/a.jsonl" --same-results "$dir/b.jsonl" --test 3
 expect 0 -t 3 --seed 7 --size 4K --reps 1 --json "$dir/c.jsonl"
 export_ok "$dir/a.jsonl" --different-results "$dir/c.jsonl" --test 3
-# The same for every other test: its input must not depend on Test 1 having
-# run before it, and must change with --seed.
-for t in 1 2 4 5 6; do
+# The same for every other test with a seeded input: it must not depend on
+# Test 1 having run before it, and must change with --seed.  Test 6 has no
+# input; its results must not depend on another test either.
+expect 0 -t 6 --profile quick --json "$dir/t6-a.jsonl"
+expect 0 -t 1 -t 6 --profile quick --size 64K --reps 2 --json "$dir/t6-b.jsonl"
+export_ok "$dir/t6-a.jsonl" --same-results "$dir/t6-b.jsonl" --test 6
+for t in 1 2 4 5; do
     expect 0 -t "$t" --size 64K --reps 2 --json "$dir/t$t-a.jsonl"
     expect 0 -t 1 -t "$t" --size 64K --reps 2 --json "$dir/t$t-b.jsonl"
     expect 0 -t "$t" --seed 7 --size 64K --reps 2 --json "$dir/t$t-c.jsonl"
