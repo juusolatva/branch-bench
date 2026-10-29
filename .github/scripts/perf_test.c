@@ -63,6 +63,7 @@ static void reset_log(int test)
     pair_count = 0;
     variant_count = 0;
     begin_test(test);
+    reserve_trials(256);
 }
 
 static void invalid_reporting(Result good)
@@ -880,6 +881,16 @@ static void log_input_too_many_true(void)
 {
     log_input(0, input_a, 4, 1, 5);
 }
+static void log_param_twice_same(void)
+{
+    log_param(0, "N", 4);
+    log_param(0, "N", 4);
+}
+static void log_param_conflict(void)
+{
+    log_param(0, "N", 4);
+    log_param(0, "N", 5);
+}
 static void log_variant_two_labels(void)
 {
     const Work w = { 4, "elem" };
@@ -897,6 +908,8 @@ static void variant_guards(void)
     assert(exit_status(log_input_too_many_true) == 1);
     assert(exit_status(log_input_no_cond_twice) == 0);
     assert(exit_status(log_variant_two_labels) == 1);
+    assert(exit_status(log_param_twice_same) == 0);
+    assert(exit_status(log_param_conflict) == 1);
 
     char buf[256] = "";
     FILE *f = tmpfile();
@@ -910,6 +923,22 @@ static void variant_guards(void)
     assert(fgets(buf, sizeof buf, f) && strstr(buf, "**ERROR:"));
     fclose(f);
     sanity_failed = 0;
+}
+
+/* The trial log holds what was reserved for it, far beyond the old fixed
+ * 8192 records. */
+static void trial_log_grows(void)
+{
+    const int saved = trials;
+    trials = 1;
+    reset_log(5);
+    reserve_trials(40000);
+    const Result r = {0};
+    for (int i = 0; i < 40000; i++) log_trial(0, -1, i, "x", &r);
+    assert(trial_log_len == 40000);
+    trials = saved;
+    reset_log(1);
+    puts("ok   trial log grows to the reserved size");
 }
 
 int main(void)
@@ -955,5 +984,6 @@ int main(void)
     bias_inputs();
     dispatch_inputs();
     variant_guards();
+    trial_log_grows();
     return 0;
 }

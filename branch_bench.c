@@ -48,6 +48,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
@@ -75,7 +76,7 @@
 #define MAX_SIZE      (1UL << 30)  /* upper limit for --size                  */
 #define MAX_REPS      100000UL     /* upper limit for --reps                  */
 #define MAX_CPU       1023         /* highest CPU number for --cpu            */
-#define BENCH_REVISION 3           /* bumped whenever measurements change     */
+#define BENCH_REVISION 4           /* bumped whenever measurements change     */
 #define DEFAULT_SEED  0xdeadbeefcafe1234ULL  /* --seed default */
 
 /* Test 2: biases (each with its periodic word) and their common period */
@@ -159,6 +160,11 @@ static u64      base_seed = DEFAULT_SEED;  /* --seed: every test's input derives
 static int      seed_given = 0;        /* --seed was on the command line */
 static int      cpu_requested = -1;    /* --cpu: CPU to pin to, -1 = none */
 static const char *json_path = NULL;   /* --json: JSON Lines export file */
+
+/* --profile: which grids Tests 5 and 6 measure.  Tests 1–4 ignore it. */
+typedef enum { PROFILE_QUICK, PROFILE_STANDARD, PROFILE_RESEARCH } Profile;
+static const char *const profile_names[] = { "quick", "standard", "research" };
+static Profile  profile = PROFILE_STANDARD;
 
 /* ── Types ───────────────────────────────────────────────────────────────── */
 
@@ -552,10 +558,9 @@ typedef struct {
  *
  * Every measured trial is kept, with its test, variant (the row index in
  * that test's rows[]), pair and run-wide order, so every reported summary
- * can be rebuilt from the trials.  Static arrays: nothing is allocated
- * while measuring.  Up to 71 variant streams × 99 trials fit (--hard -n 99).
+ * can be rebuilt from the trials.  The trial log grows only between tests
+ * (reserve_trials()), so nothing is allocated while measuring.
  * ───────────────────────────────────────────────────────────────────────── */
-#define MAX_TRIAL_RECORDS 8192
 #define MAX_PAIRS         64
 #define TRAIN_RUNS        1         /* untimed runs before every measured trial */
 #define COST_MIN_MISSES_PER_PAIR 1000.0
@@ -568,10 +573,14 @@ typedef struct {
     int         trial;     /* 0-based trial of this variant in this pair */
     const char *call;      /* the kernel call, as written */
     Result      r;
+    int         has_exposure;
+    u64         exposure_before;  /* Test 5: per-site executions of this kernel
+                                     before the timed call (training included) */
 } TrialRecord;
 
-static TrialRecord trial_log[MAX_TRIAL_RECORDS];
+static TrialRecord *trial_log = NULL;
 static int         trial_log_len = 0;
+static int         trial_log_cap = 0;
 
 /* Two variants of one test measured in alternating order. */
 typedef struct {
@@ -597,10 +606,25 @@ static void log_full(const char *what)
     exit(1);
 }
 
+/* Makes room for `streams` more variant streams of trial_count() trials
+ * each (a variant in two pairs is two streams).  Called between tests,
+ * never while measuring. */
+static void reserve_trials(int streams)
+{
+    const long long need = (long long)trial_log_len + (long long)streams * trial_count();
+    if (need <= trial_log_cap) return;
+    if (need > INT_MAX / 2) log_full("trial log");
+    TrialRecord *grown = realloc(trial_log, (size_t)need * sizeof *grown);
+    if (!grown) { perror("realloc"); exit(1); }
+    trial_log = grown;
+    trial_log_cap = (int)need;
+}
+
 static void log_trial(int variant, int pair, int trial, const char *call, const Result *r)
 {
-    if (trial_log_len >= MAX_TRIAL_RECORDS) log_full("trial log");
+    if (trial_log_len >= trial_log_cap) log_full("trial log");
     TrialRecord *t = &trial_log[trial_log_len];
+    memset(t, 0, sizeof *t);
     t->test    = current_test;
     t->variant = variant;
     t->pair    = pair;
@@ -624,9 +648,10 @@ static int new_pair(int a, int b)
 }
 
 /* What each variant's rows describe, for the export: its label and work,
- * registered by emit_rows(), and its input, registered by log_input() at
- * setup.  One entry per (test, variant). */
-#define MAX_VARIANTS 128
+ * registered by emit_rows(), its input, registered by log_input() at setup,
+ * and its test-specific parameters (log_param()).  One entry per (test,
+ * variant); the table grows outside measurements. */
+#define MAX_PARAMS 16
 
 typedef struct {
     int         test;
@@ -638,10 +663,14 @@ typedef struct {
     int         has_cond;
     u64         cond_true;   /* items per pass whose source condition holds */
     u64         input_hash;  /* fnv1a64() of the input buffer */
+    int         n_params;
+    const char *param_key[MAX_PARAMS];
+    u64         param_val[MAX_PARAMS];
 } VariantInfo;
 
-static VariantInfo variant_info[MAX_VARIANTS];
+static VariantInfo *variant_info = NULL;
 static int         variant_count = 0;
+static int         variant_cap = 0;
 
 /* FNV-1a, 64-bit: identifies an input buffer in the export. */
 static u64 fnv1a64(const u8 *p, size_t n)
@@ -660,7 +689,14 @@ static VariantInfo *variant_entry(int variant)
     for (int i = 0; i < variant_count; i++)
         if (variant_info[i].test == current_test && variant_info[i].variant == variant)
             return &variant_info[i];
-    if (variant_count >= MAX_VARIANTS) log_full("variant table");
+    if (variant_count == variant_cap) {
+        if (variant_cap > INT_MAX / 4) log_full("variant table");
+        const int cap = variant_cap ? 2 * variant_cap : 64;
+        VariantInfo *grown = realloc(variant_info, (size_t)cap * sizeof *grown);
+        if (!grown) { perror("realloc"); exit(1); }
+        variant_info = grown;
+        variant_cap = cap;
+    }
     VariantInfo *v = &variant_info[variant_count++];
     memset(v, 0, sizeof *v);
     v->test = current_test;
@@ -704,6 +740,27 @@ static void log_input(int variant, const u8 *buf, size_t pass_items, int has_con
     v->has_cond   = has_cond;
     v->cond_true  = cond_true;
     v->input_hash = hash;
+}
+
+/* Records one named parameter of a variant (exported in its "params"
+ * object, in logging order).  The same key may be logged again only with
+ * the same value. */
+__attribute__((unused))  /* used from Task 2 (Test 6) on */
+static void log_param(int variant, const char *key, u64 value)
+{
+    VariantInfo *v = variant_entry(variant);
+    for (int i = 0; i < v->n_params; i++) {
+        if (strcmp(v->param_key[i], key) != 0) continue;
+        if (v->param_val[i] == value) return;
+        fprintf(stderr, "Internal error: test %d variant %d parameter %s logged as "
+                        "%" PRIu64 " and %" PRIu64 "\n", current_test, variant, key,
+                v->param_val[i], value);
+        exit(1);
+    }
+    if (v->n_params == MAX_PARAMS) log_full("parameter list");
+    v->param_key[v->n_params] = key;
+    v->param_val[v->n_params] = value;
+    v->n_params++;
 }
 
 /* The reported row for a variant: its median trial by time over all its
@@ -2382,6 +2439,40 @@ static void run_test6(FILE *report)
     printf("\n");
 }
 
+/* Each test's identity in the export: test numbers are reused across
+ * revisions (Test 6 was Correlation Distance up to revision 3), so the id
+ * says which test a number means. */
+typedef struct {
+    const char *id;
+    int         revision;
+    const char *title;
+} TestDesc;
+
+static const TestDesc test_descs[] = {
+    { "threshold-sum",        1, "Test 1 — Threshold Sum"         },
+    { "bias-ordering",        1, "Test 2 — Bias and Ordering"     },
+    { "indirect-dispatch",    1, "Test 3 — Indirect Dispatch"     },
+    { "branch-vs-branchless", 1, "Test 4 — Branch vs. Branchless" },
+    { "pattern-matrix",       1, "Test 5 — Pattern Learnability"  },
+    { "loop-exits",           1, "Test 6 — Loop Exits"            },
+};
+CHECK_LEN(test_descs_len_check, test_descs, NUM_TESTS);
+
+/* Measured variant streams of test n (a variant in two pairs counts
+ * twice), for reserve_trials(). */
+static int test_streams(int n)
+{
+    static const int streams[NUM_TESTS] = {
+        2,                    /* Test 1: one pair */
+        5 * 4 + 2,            /* Test 2: two pairs per bias, two constants */
+        2 * T3_COUNTS,        /* Test 3: one pair per target count */
+        6,                    /* Test 4: three pairs */
+        2 * 2 + DB_ORDERS - 2,/* Test 5: two pairs, the other periods alone */
+        2 * D6_DISTS,         /* Test 6: one pair per distance */
+    };
+    return streams[n - 1];
+}
+
 static int test_selected(int n)
 {
     return ((tests_selected ? tests_selected : DEFAULT_TESTS) >> (n - 1)) & 1u;
@@ -2396,7 +2487,7 @@ static int test_selected(int n)
  * .github/scripts/check_export.py does exactly that.  u64 values are bare
  * integers, doubles use %.17g, and anything absent is null.
  * ───────────────────────────────────────────────────────────────────────── */
-#define JSON_SCHEMA 1
+#define JSON_SCHEMA 2
 
 /* What each kernel's code is declared to contain.  check_kernels.sh
  * --counts measures the same fields from the binary; -1 is "not declared".
@@ -2642,6 +2733,7 @@ static void write_meta(FILE *f)
             strstr(BUILD_FLAGS, "mbranches-within-32B-boundaries") ? "jcc-32B" : "undeclared",
             base_seed);
     write_tests_meta(f);
+    fprintf(f, ",\"profile\":\"%s\"", profile_names[profile]);
     fprintf(f, ",\"size\":%zu,\"reps\":%u,\"trials\":%d,\"training_runs\":%d,"
                "\"schedule\":\"AB/BA\"", size, reps, trial_count(), TRAIN_RUNS);
     write_affinity_meta(f);
@@ -2698,6 +2790,22 @@ static void collapse_spaces(const char *s, char *out, size_t cap)
     out[n] = '\0';
 }
 
+/* A variant's parameters as a JSON object, or null without any. */
+static void write_params(FILE *f, const VariantInfo *v)
+{
+    if (!v->n_params) {
+        fputs("null", f);
+        return;
+    }
+    fputc('{', f);
+    for (int i = 0; i < v->n_params; i++) {
+        if (i) fputc(',', f);
+        json_string(f, v->param_key[i]);
+        fprintf(f, ":%" PRIu64, v->param_val[i]);
+    }
+    fputc('}', f);
+}
+
 static void write_variants(FILE *f)
 {
     for (int i = 0; i < variant_count; i++) {
@@ -2724,6 +2832,8 @@ static void write_variants(FILE *f)
         fputs(",\"input_hash\":", f);
         if (v->has_input) fprintf(f, "%" PRIu64, v->input_hash);
         else fputs("null", f);
+        fputs(",\"params\":", f);
+        write_params(f, v);
         fputs("}\n", f);
     }
 }
@@ -2754,6 +2864,9 @@ static void write_trials(FILE *f)
         write_counts(f, &t->r, t->r.counts);
         fputs(",\"raw_counts\":", f);
         write_counts(f, &t->r, t->r.raw_counts);
+        fputs(",\"exposure_before\":", f);
+        if (t->has_exposure) fprintf(f, "%" PRIu64, t->exposure_before);
+        else fputs("null", f);
         fputs("}\n", f);
     }
 }
@@ -2783,9 +2896,24 @@ static void write_pairs(FILE *f)
     }
 }
 
+/* One record per selected test: its number, id, revision and title. */
+static void write_tests(FILE *f)
+{
+    for (int n = 1; n <= NUM_TESTS; n++) {
+        if (!test_selected(n)) continue;
+        const TestDesc *d = &test_descs[n - 1];
+        fprintf(f, "{\"type\":\"test\",\"test\":%d,\"id\":", n);
+        json_string(f, d->id);
+        fprintf(f, ",\"revision\":%d,\"title\":", d->revision);
+        json_string(f, d->title);
+        fputs("}\n", f);
+    }
+}
+
 static void write_export(FILE *f)
 {
     write_meta(f);
+    write_tests(f);
     write_kernels(f);
     write_variants(f);
     write_trials(f);
@@ -2879,7 +3007,9 @@ static void print_usage(const char *prog)
            "      --reps <N>       passes over the array per trial, tests 1/2/4/5;\n"
            "                       scales test 6's branch budget with --size\n"
            "                       (default: %u, max: %lu)\n"
-           "      --json <file>    write every trial and summary as JSON Lines (schema 1)\n"
+           "      --profile <P>    quick, standard or research: the grids of tests 5\n"
+           "                       and 6 (default: standard)\n"
+           "      --json <file>    write every trial and summary as JSON Lines (schema 2)\n"
            "      --cpu <N>        pin the benchmark to CPU N (0–1023) before measuring\n"
            "      --seed <N>       base seed for all test inputs (default: 16045690984503054900)\n"
            "  -h, --help           show this help\n",
@@ -2939,8 +3069,20 @@ static int apply_option(int argc, char **argv, int *i, const char **out_path)
     return apply_run_option(argc, argv, i, arg);
 }
 
+/* Sets profile from its name; prints an error and returns 0 if unknown. */
+static int parse_profile(const char *s)
+{
+    for (int p = 0; p < (int)(sizeof profile_names / sizeof profile_names[0]); p++) {
+        if (strcmp(s, profile_names[p]) != 0) continue;
+        profile = (Profile)p;
+        return 1;
+    }
+    fprintf(stderr, "Invalid profile: %s (must be quick, standard or research)\n", s);
+    return 0;
+}
+
 /* apply_option()'s options that set up the run around the tests: --json,
- * --cpu and --seed.  Same return convention. */
+ * --cpu, --profile and --seed.  Same return convention. */
 static int apply_run_option(int argc, char **argv, int *i, const char *arg)
 {
     unsigned long v;
@@ -2952,6 +3094,10 @@ static int apply_run_option(int argc, char **argv, int *i, const char *arg)
         if (!option_number(argc, argv, i, "CPU number", 0, MAX_CPU, &v)) return 1;
         cpu_requested = (int)v;
         return -1;
+    }
+    if (is_opt(arg, NULL, "--profile")) {
+        const char *val = option_value(argc, argv, i, arg, "profile");
+        return val && parse_profile(val) ? -1 : 1;
     }
     if (is_opt(arg, NULL, "--seed")) {
         const char *val = option_value(argc, argv, i, arg, "seed");
@@ -3010,6 +3156,7 @@ static void print_banner(const char *tests_list)
     printf("  Array size:      %10zu elements\n", size);
     printf("  Repetitions:     %10u per trial\n", reps);
     printf("  Revision:        %10d\n", BENCH_REVISION);
+    printf("  Profile:         %s\n", profile_names[profile]);
     if (seed_given)
         printf("  Seed:            %20" PRIu64 "\n", base_seed);
     if (trials > 1)
@@ -3059,6 +3206,7 @@ static void write_report_header(FILE *report, const char *tests_list)
     fprintf(report, "## %s\n\n", cpu);
     fprintf(report, "_%s_\n\n", date);
     fprintf(report, "_Benchmark revision %d._\n\n", BENCH_REVISION);
+    fprintf(report, "_Profile: %s._\n\n", profile_names[profile]);
     fprintf(report, "%s\n\n", KERNEL_ASM
             ? "_Kernels: " KERNEL_BACKEND " for the data-branch kernels of Tests 1, 2, 4 "
               "and 5; the other kernels are C._"
@@ -3177,14 +3325,21 @@ static int close_output(FILE *f)
     return failed;
 }
 
+/* begin_test() plus room in the trial log for the test's trials. */
+static void start_test(int n)
+{
+    begin_test(n);
+    reserve_trials(test_streams(n));
+}
+
 static void run_selected_tests(FILE *report)
 {
-    if (test_selected(1)) { begin_test(1); run_test1(report); }
-    if (test_selected(2)) { begin_test(2); run_test2(report); }
-    if (test_selected(3)) { begin_test(3); run_test3(report); }
-    if (test_selected(4)) { begin_test(4); run_test4(report); }
-    if (test_selected(5)) { begin_test(5); run_test5(report); }
-    if (test_selected(6)) { begin_test(6); run_test6(report); }
+    if (test_selected(1)) { start_test(1); run_test1(report); }
+    if (test_selected(2)) { start_test(2); run_test2(report); }
+    if (test_selected(3)) { start_test(3); run_test3(report); }
+    if (test_selected(4)) { start_test(4); run_test4(report); }
+    if (test_selected(5)) { start_test(5); run_test5(report); }
+    if (test_selected(6)) { start_test(6); run_test6(report); }
 }
 
 /* After a result mismatch (sanity_failed), says so where the numbers are

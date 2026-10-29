@@ -42,6 +42,9 @@ INPUT_TESTS = (1, 2, 3, 4, 6)   # tests whose rows record their input
 # Below this many items per pass, two orders of one multiset can coincide
 # (one element; a 1/16 bias over 16 elements), so they may hash alike.
 ORDER_MIN_ITEMS = 1024
+PROFILES = ("quick", "standard", "research")
+TEST_IDS = {1: "threshold-sum", 2: "bias-ordering", 3: "indirect-dispatch",
+            4: "branch-vs-branchless", 5: "pattern-matrix", 6: "loop-exits"}
 COST_LABEL = "**Effective extra cycles per additional miss:**"
 
 
@@ -83,8 +86,9 @@ def by_type(records, kind):
 def check_structure(records):
     meta = records[0]
     check(meta.get("type") == "meta", "first record is not meta")
-    check(meta.get("schema") == 1, f"schema {meta.get('schema')}, want 1")
-    check(meta.get("revision") == 3, f"revision {meta.get('revision')}, want 3")
+    check(meta.get("schema") == 2, f"schema {meta.get('schema')}, want 2")
+    check(meta.get("revision") == 4, f"revision {meta.get('revision')}, want 4")
+    check(meta.get("profile") in PROFILES, f"profile {meta.get('profile')!r}, want one of {PROFILES}")
     check(meta.get("results_ok") is True,
           "meta results_ok is not true: a kernel result differed from its reference")
     kernels = {k["id"] for k in by_type(records, "kernel")}
@@ -96,10 +100,15 @@ def check_structure(records):
     for t in trials:
         check((t["test"], t["variant"]) in variants,
               f"trial seq {t['seq']}: no variant {t['test']}/{t['variant']}")
+    tests = {t["test"]: t for t in by_type(records, "test")}
+    for n in sorted({t["test"] for t in trials}):
+        check(n in tests, f"no test record for Test {n}")
+        check(tests[n].get("id") == TEST_IDS[n],
+              f"Test {n}: id {tests[n].get('id')!r}, want {TEST_IDS[n]!r}")
     used = {t["pair"] for t in trials if t["pair"] is not None}
     recorded = {p["pair"] for p in by_type(records, "pair")}
     check(used == recorded, f"trial pairs {sorted(used)} differ from pair records {sorted(recorded)}")
-    ok("structure: meta first, schema 1, revision 3, every trial has a variant and kernel, "
+    ok("structure: meta first, schema 2, revision 4, test records, every trial has a variant and kernel, "
        "every pair has a record")
     return variants
 

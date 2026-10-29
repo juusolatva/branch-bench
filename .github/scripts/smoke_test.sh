@@ -37,6 +37,14 @@ expect 0 $small
 expect 0 $small -n 3 -o "$dir/report.md"
 expect 0 --trials 2 --test 2 --test 4 --output "$dir/report2.md" --size 4k --reps 1
 expect 0 -t 1 -t 3 --size 1m --reps 1
+# --profile picks the Test 5-6 grids; it is printed in the banner.
+expect 0 --profile quick -t 1 --size 1K --reps 1
+grep -q '^  Profile:         quick$' "$dir/stdout" || { echo "FAIL banner lacks the profile line"; fail=1; }
+expect 0 --profile research -t 1 --size 1K --reps 1
+expect 0 --profile standard -t 1 --size 1K --reps 1 -o "$dir/profile.md"
+grep -q '^_Profile: standard._$' "$dir/profile.md" || { echo "FAIL report lacks the profile line"; fail=1; }
+expect 1 --profile fast
+expect 1 --profile
 # Test 3 skips when --size is not a multiple of 64 (equal calls to every
 # target).
 expect 0 -t 3 --size 1000 --reps 1 -o "$dir/skip3.md"
@@ -62,7 +70,7 @@ expect 0 -t 3 --seed 7 --size 4K --reps 1
 expect 0 -t 3 --seed 0x1f --size 4K --reps 1
 expect 0 -t 3 --seed 010 --size 4K --reps 1
 expect 0 -t 1 --size 4K --reps 1 -o "$dir/rev.md"
-grep -q '^_Benchmark revision 3._$' "$dir/rev.md" || { echo "FAIL rev.md lacks the revision line"; fail=1; }
+grep -q '^_Benchmark revision 4._$' "$dir/rev.md" || { echo "FAIL rev.md lacks the revision line"; fail=1; }
 # Test 5 is opt-in; it skips (exit 0) when --size is not a multiple of 2048,
 # while other selected tests still run.
 # Test 4 first: fake_perf.so fails the first and third counter reads, and its
@@ -98,10 +106,8 @@ grep -q 'Skipped:' "$dir/skip6b.md" || { echo "FAIL skip6b.md lacks the skip rea
 expect 0 --hard $small -o "$dir/hard.md"
 grep -q '(all, with --hard)' "$dir/stdout" || { echo "FAIL --hard banner lacks its tests line"; fail=1; }
 expect 0 --hard -t 2 --size 4K --reps 1 -o "$dir/hard2.md"
-# The largest legal run fits the trial log: 71 (variant, pair) streams
-# (Test 2's shuffled rows and Test 5's random row are in two pairs) × 99
-# trials = 7029 records.  Large
-# enough that Test 6, the biggest user, runs.
+# The largest trial count with every test: the trial log reserves each
+# test's streams × 99 trials before the test, so it must never fill up.
 expect 0 --hard -n 99 --size 64K --reps 2 --json "$dir/max.jsonl"
 for f in hard.md hard2.md; do
     for t in 1 2 3 4 5 6; do
