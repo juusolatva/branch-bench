@@ -38,6 +38,11 @@ expect 0 $small -n 3 -o "$dir/report.md"
 expect 0 --trials 2 --test 2 --test 4 --output "$dir/report2.md" --size 4k --reps 1
 expect 0 -t 1 -t 3 --size 1m --reps 1
 expect 0 -t 3 --size 1000 --reps 1
+# --seed takes a decimal or 0x hex base seed for every test's input.
+expect 0 -t 3 --seed 7 --size 4K --reps 1
+expect 0 -t 3 --seed 0x1f --size 4K --reps 1
+expect 0 -t 1 --size 4K --reps 1 -o "$dir/rev.md"
+grep -q '^_Benchmark revision 2._$' "$dir/rev.md" || { echo "FAIL rev.md lacks the revision line"; fail=1; }
 # Test 5 is opt-in; it skips (exit 0) when --size is not a multiple of 2048,
 # while other selected tests still run.
 # Test 4 first: fake_perf.so fails the first and third counter reads, and its
@@ -97,6 +102,10 @@ expect 1 --reps 0
 expect 1 --reps
 expect 1 -n 100
 expect 1 -t 7
+expect 1 --seed
+expect 1 --seed -1
+expect 1 --seed 18446744073709551616
+expect 1 --seed 12abc
 expect 1 -o
 expect 1 -o "$dir/no/such/dir/report.md"
 expect 1 --bogus

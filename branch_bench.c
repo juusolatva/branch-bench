@@ -47,6 +47,7 @@
 #include <inttypes.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <errno.h>
 
 /* ── Linux perf_event support (optional) ────────────────────────────────── */
 #ifdef __linux__
@@ -69,13 +70,14 @@
 #define MAX_TRIALS    99           /* upper limit for -n/--trials             */
 #define MAX_SIZE      (1UL << 30)  /* upper limit for --size                  */
 #define MAX_REPS      100000UL     /* upper limit for --reps                  */
+#define BENCH_REVISION 2           /* bumped whenever measurements change     */
+#define DEFAULT_SEED  0xdeadbeefcafe1234ULL  /* --seed default */
 
 /* Test 5: de Bruijn pattern orders k (periods 2^k) and the random reference */
 #define DB_MIN_ORDER   5
 #define DB_MAX_ORDER   11
 #define DB_MAX_PERIOD  (1u << DB_MAX_ORDER)
 #define DB_ORDERS      (DB_MAX_ORDER - DB_MIN_ORDER + 1)
-#define DB_RANDOM_SEED 0x2545f4914f6cdd1dULL  /* nonzero: xorshift64 sticks at 0 */
 #define DB_MIN_SAMPLE  65536  /* elements for test 5's summary lines */
 
 /* Test 6: distances d (filler branches between A and B), powers of two */
@@ -84,8 +86,6 @@
 #define D6_DISTS       9
 #define D6_MIN_BLOCKS  64     /* blocks per pass at d = D6_MAX_DIST */
 #define D6_MIN_SAMPLE  65536  /* blocks per pass for a "Correlation used" figure */
-#define D6_SEED_A      0x6a09e667f3bcc908ULL  /* nonzero, distinct seeds */
-#define D6_SEED_B      0xbb67ae8584caa73bULL
 
 /* ── Build provenance (printed in the banner and report) ────────────────── */
 /* Clang's __VERSION__ already names the compiler; GCC's is only the number. */
@@ -104,6 +104,9 @@
 #  define BUILD_COMMIT ""
 #endif
 
+typedef uint64_t        u64;
+typedef unsigned char   u8;
+
 /* Run-time settings, changed only by command-line options. */
 static size_t   size  = DEFAULT_SIZE;  /* --size: elements per array (tests 1/2/4/5/6),
                                           calls per trial (test 3) */
@@ -113,10 +116,10 @@ static int      trials = 1;            /* -n/--trials: 1 = single measurement, n
 static unsigned tests_selected = 0;    /* -t/--test bitmask (bit n-1 = test n);
                                           0 = DEFAULT_TESTS (1–4) */
 static int      hard_selected = 0;     /* --hard: all tests, including 5 and 6 */
+static u64      base_seed = DEFAULT_SEED;  /* --seed: every test's input derives from it */
+static int      seed_given = 0;        /* --seed was on the command line */
 
 /* ── Types ───────────────────────────────────────────────────────────────── */
-typedef uint64_t        u64;
-typedef unsigned char   u8;
 
 /* Perf counters, one row each in opening order: X(slot, generic event, ARM raw
  * code, Markdown header, console label, console width).  The CTR_* enum and
@@ -443,6 +446,43 @@ static inline u64 rng64(void)
     return rng_state;
 }
 
+/* Uniform in [0, bound) for bound >= 1: rejects the low values that would
+ * make some remainders more likely than others. */
+static u64 rng_below(u64 bound)
+{
+    const u64 reject = (0 - bound) % bound;
+    u64 r;
+    do r = rng64(); while (r < reject);
+    return r % bound;
+}
+
+/* The splitmix64 finalizer: a fixed, well-mixed bijection on 64 bits. */
+static u64 splitmix64(u64 x)
+{
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+/* Seed for one input stream of one test, derived only from --seed, the test
+ * number, a configuration number and a stream index, so selecting or
+ * reordering tests never changes another test's input.  Never 0, where
+ * xorshift64 would stick. */
+static u64 test_seed(int test, unsigned config, unsigned index)
+{
+    u64 s = splitmix64(base_seed ^ splitmix64((u64)test));
+    s = splitmix64(s ^ config);
+    s = splitmix64(s ^ index);
+    return s ? s : DEFAULT_SEED;
+}
+
+/* Restarts the generator for test n's setup. */
+static void seed_test(int test)
+{
+    rng_state = test_seed(test, 0, 0);
+}
+
 /* ─────────────────────────────────────────────────────────────────────────
  * Formatted report output (-o/--output)
  *
@@ -724,7 +764,7 @@ static void fill_random_bytes(u8 *arr, size_t n)
 static void shuffle_u8(u8 *arr, size_t n)
 {
     for (size_t i = n - 1; i > 0; --i) {
-        size_t j = rng64() % (i + 1);
+        size_t j = (size_t)rng_below((u64)i + 1);
         u8 tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
     }
 }
@@ -758,6 +798,7 @@ static u64 sum_threshold(const u8 *arr, size_t n, unsigned n_reps)
 
 static void run_test1(FILE *report)
 {
+    seed_test(1);
     /* Read once, so the allocation and every loop provably use the same length. */
     const size_t len = size;
     u8 *sorted   = malloc(len);
@@ -824,6 +865,7 @@ static u64 count_decisions(const u8 *decisions, size_t n, unsigned n_reps)
 
 static void run_test2(FILE *report)
 {
+    seed_test(2);
     const size_t len = size;
     /* Pre-generated branch decision arrays (avoids RNG in hot loop) */
     u8 *decisions_periodic = malloc(len);  /* 1 at every 4th position        */
@@ -832,7 +874,7 @@ static void run_test2(FILE *report)
 
     for (size_t i = 0; i < len; i++) {
         decisions_periodic[i] = ((i & 3) == 0) ? 1 : 0;
-        decisions_random[i] = (((rng64() >> 32) % 4) == 0) ? 1 : 0;
+        decisions_random[i] = rng_below(4) == 0 ? 1 : 0;
     }
 
     printf("TEST 2 — Stride Conditional  (periodic vs random 25%%, %zu×%u reps)\n",
@@ -925,12 +967,13 @@ static u64 dispatch_random(const u8 *idx, size_t n)
 
 static void run_test3(FILE *report)
 {
+    seed_test(3);
     const size_t len = size;
     /* Pre-built random index sequence (uint8_t → 1 byte/call → cache-friendly) */
     u8 *dispatch_indices = malloc(len);
     if (!dispatch_indices) { perror("malloc"); exit(1); }
     for (size_t i = 0; i < len; i++)
-        dispatch_indices[i] = (u8)((rng64() >> 32) % NUM_FUNCS);
+        dispatch_indices[i] = (u8)rng_below(NUM_FUNCS);
 
     if (len % (1u << 20) == 0)
         printf("TEST 3 — Indirect Dispatch  (%u targets, %zuM calls)\n",
@@ -1017,6 +1060,7 @@ static u64 sum_branchless(const u8 *arr, size_t n, unsigned n_reps)
 
 static void run_test4(FILE *report)
 {
+    seed_test(4);
     const size_t len = size;
     u8 *sorted   = malloc(len);
     u8 *random_d = malloc(len);
@@ -1177,7 +1221,7 @@ static int measure_patterns(u8 *buf, size_t len, ReportRow rows[DB_ORDERS + 1])
         for (size_t i = 0; i < len; i++) buf[i] = pattern[i & mask];
         MEASURE(rows[k - DB_MIN_ORDER].r, count_decisions(buf, len, reps));
     }
-    fill_random_bits(buf, len, DB_RANDOM_SEED);
+    fill_random_bits(buf, len, test_seed(5, 0, 0));
     MEASURE(rows[DB_ORDERS].r, count_decisions(buf, len, reps));
     return 1;
 }
@@ -1229,6 +1273,7 @@ static void print_test5_summary(FILE *report, const ReportRow *rows,
 
 static void run_test5(FILE *report)
 {
+    seed_test(5);
     const size_t len = size;
     printf("TEST 5 — Pattern Learnability  (de Bruijn k=%d..%d vs random 50%%, %zu×%u reps)\n",
            DB_MIN_ORDER, DB_MAX_ORDER, len, reps);
@@ -1366,7 +1411,7 @@ static void measure_distances(const u8 *a, u8 *b, size_t len, u64 total,
         const unsigned passes = pt->passes;
         memcpy(b, a, blocks);
         MEASURE(rows[2 * i].r, correlate_distance(a, b, fill, blocks, d, passes));
-        fill_random_bits(b, blocks, D6_SEED_B);
+        fill_random_bits(b, blocks, test_seed(6, 0, 1));
         MEASURE(rows[2 * i + 1].r, correlate_distance(a, b, fill, blocks, d, passes));
     }
 }
@@ -1429,6 +1474,7 @@ static void print_test6_summary(FILE *report, const ReportRow *rows, const D6Poi
 
 static void run_test6(FILE *report)
 {
+    seed_test(6);
     const size_t len = size;
     const unsigned r = reps;
     printf("TEST 6 — Correlation Distance  (d=%d..%d, budget %zu×%u branches per row)\n",
@@ -1446,7 +1492,7 @@ static void run_test6(FILE *report)
     u8 *a = malloc(len);
     u8 *b = malloc(len);
     if (!a || !b) { perror("malloc"); exit(1); }
-    fill_random_bits(a, len, D6_SEED_A);
+    fill_random_bits(a, len, test_seed(6, 0, 0));
     const Result none = {0};
     ReportRow rows[2 * D6_DISTS];
     D6Point pts[D6_DISTS];
@@ -1516,6 +1562,22 @@ static int parse_count(const char *s, const char *what,
     return 1;
 }
 
+/* Parses a 64-bit seed, decimal or 0x hex.  Prints an error and returns 0
+ * if invalid. */
+static int parse_seed(const char *s, u64 *out)
+{
+    char *end;
+    errno = 0;
+    const int has_digits = (*s >= '0' && *s <= '9');  /* strtoull would accept "-1" */
+    unsigned long long v = has_digits ? strtoull(s, &end, 0) : 0;
+    if (!has_digits || *end != '\0' || errno == ERANGE) {
+        fprintf(stderr, "Invalid seed: %s (must be 0–18446744073709551615)\n", s);
+        return 0;
+    }
+    *out = (u64)v;
+    return 1;
+}
+
 static void print_usage(const char *prog)
 {
     printf("Usage: %s [options]\n"
@@ -1535,6 +1597,7 @@ static void print_usage(const char *prog)
            "      --reps <N>       passes over the array per trial, tests 1/2/4/5;\n"
            "                       scales test 6's branch budget with --size\n"
            "                       (default: %u, max: %lu)\n"
+           "      --seed <N>       base seed for all test inputs (default: 16045690984503054900)\n"
            "  -h, --help           show this help\n",
            prog, MAX_TRIALS, NUM_TESTS, DEFAULT_SIZE, MAX_SIZE, DEFAULT_REPS, MAX_REPS);
 }
@@ -1585,6 +1648,12 @@ static int apply_option(int argc, char **argv, int *i, const char **out_path)
     if (is_opt(arg, NULL, "--reps")) {
         if (!option_number(argc, argv, i, "repetition count", 1, MAX_REPS, &v)) return 1;
         reps = (unsigned)v;
+        return -1;
+    }
+    if (is_opt(arg, NULL, "--seed")) {
+        const char *val = option_value(argc, argv, i, arg, "seed");
+        if (!val || !parse_seed(val, &base_seed)) return 1;
+        seed_given = 1;
         return -1;
     }
     fprintf(stderr, "Unknown argument: %s (try --help)\n", arg);
@@ -1642,6 +1711,9 @@ static void print_banner(const char *tests_list)
     printf("  CPU Branch Prediction Benchmark\n");
     printf("  Array size:      %10zu elements\n", size);
     printf("  Repetitions:     %10u per trial\n", reps);
+    printf("  Revision:        %10d\n", BENCH_REVISION);
+    if (seed_given)
+        printf("  Seed:            %20" PRIu64 "\n", base_seed);
     if (trials > 1)
         printf("  Trials:          %10d per variant (median shown, after 1 warm-up run)\n",
                trials);
@@ -1677,6 +1749,9 @@ static void write_report_header(FILE *report, const char *tests_list)
 
     fprintf(report, "## %s\n\n", cpu);
     fprintf(report, "_%s_\n\n", date);
+    fprintf(report, "_Benchmark revision %d._\n\n", BENCH_REVISION);
+    if (seed_given)
+        fprintf(report, "_Seed: %" PRIu64 "._\n\n", base_seed);
     fprintf(report, "| Array size | Repetitions | Perf counters | Compiler |\n");
     fprintf(report, "|---:|---:|---|---|\n");
     fprintf(report, "| %zu elements | %u/trial | %s | %s |\n\n",

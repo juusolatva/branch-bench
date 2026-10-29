@@ -102,6 +102,20 @@ trial makes over the array (for Test 6, it scales the branch budget). Results ar
 [RESULTS.md](RESULTS.md) at the defaults (`--size 4M --reps 64`).
 Run `./branch_bench --help` for all options.
 
+## Seeds and revisions
+
+Every test builds its input from its own seed, derived from a base seed,
+the test number and the input stream. Selecting or reordering tests
+therefore never changes another test's input, and the same command gives
+the same data on every run. `--seed <N>` (decimal or `0x` hex) changes the
+base seed; the banner and report show it when it is given.
+
+The banner and report also show the **benchmark revision**. It goes up
+whenever a change alters what is measured (inputs, warm-up, pairing,
+summaries), even when the test numbers stay the same. Results from
+different revisions are not comparable; the entries in RESULTS.md so far
+are revision 1.
+
 ## Adding results
 
 The current entries in [RESULTS.md](RESULTS.md) are default-size runs

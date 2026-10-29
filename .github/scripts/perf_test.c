@@ -417,7 +417,7 @@ static void measured_data(void)
     assert(measure_patterns(buf, sizeof buf, rows5) == 1);
     for (int i = 0; i < DB_ORDERS; i++)
         assert(rows5[i].r.result == sizeof buf / 2);   /* half ones per period */
-    fill_random_bits(expect, sizeof expect, DB_RANDOM_SEED);
+    fill_random_bits(expect, sizeof expect, test_seed(5, 0, 0));
     assert(rows5[DB_ORDERS].r.result == count_ones(expect, sizeof expect));
 
     static u8 a[1024], b[1024], ref_b[1024];
@@ -429,8 +429,8 @@ static void measured_data(void)
         rows6[i].r = none;
         rows6[i].work = NULL;
     }
-    assert(D6_SEED_A != D6_SEED_B);
-    fill_random_bits(a, sizeof a, D6_SEED_A);
+    assert(test_seed(6, 0, 0) != test_seed(6, 0, 1));
+    fill_random_bits(a, sizeof a, test_seed(6, 0, 0));
     measure_distances(a, b, sizeof a, total, rows6, pts);
     for (int i = 0; i < D6_DISTS; i++) {
         const unsigned d = (unsigned)D6_MIN_DIST << i;
@@ -441,7 +441,7 @@ static void measured_data(void)
         assert(pts[i].work.count == (u64)blocks * passes);
         assert(rows6[2 * i].work == &pts[i].work && rows6[2 * i + 1].work == &pts[i].work);
         /* Per block: A adds 1 and B 3 when set, each filler 2. */
-        fill_random_bits(ref_b, blocks, D6_SEED_B);
+        fill_random_bits(ref_b, blocks, test_seed(6, 0, 1));
         const u64 ones_a = count_ones(a, blocks);
         const u64 fillers = 2ULL * d * blocks;
         assert(rows6[2 * i].r.result == passes * (fillers + 4 * ones_a));
@@ -452,6 +452,41 @@ static void measured_data(void)
     perf_leader = saved_leader;
     reps = saved_reps;
     puts("ok   Test 5 and 6 rows measure the data their labels describe");
+}
+
+static void seeds(void)
+{
+    const u64 saved = base_seed;
+    base_seed = 1;
+    assert(test_seed(3, 0, 0) == test_seed(3, 0, 0));            /* deterministic */
+    for (int a = 1; a <= NUM_TESTS; a++)
+        for (int b = a + 1; b <= NUM_TESTS; b++)
+            assert(test_seed(a, 0, 0) != test_seed(b, 0, 0));    /* per test */
+    assert(test_seed(6, 0, 0) != test_seed(6, 0, 1));            /* per index */
+    assert(test_seed(2, 0, 0) != test_seed(2, 1, 0));            /* per config */
+    const u64 s1 = test_seed(3, 0, 0);
+    base_seed = 2;
+    assert(test_seed(3, 0, 0) != s1);                            /* base matters */
+    base_seed = 0;
+    for (int t = 1; t <= NUM_TESTS; t++) assert(test_seed(t, 0, 0) != 0);
+    seed_test(4); rng64(); rng64();
+    seed_test(4);
+    assert(rng_state == test_seed(4, 0, 0));                     /* prior draws don't leak */
+    for (int i = 0; i < 1000; i++) assert(rng_below(3) < 3);
+    assert(rng_below(1) == 0);
+    u8 a[257]; unsigned before[256] = {0}, after[256] = {0};
+    for (int i = 0; i < 257; i++) before[a[i] = (u8)(i * 7)]++;
+    shuffle_u8(a, 257);
+    for (int i = 0; i < 257; i++) after[a[i]]++;
+    assert(memcmp(before, after, sizeof before) == 0);           /* same multiset */
+    u64 v;
+    assert(parse_seed("0", &v) && v == 0);
+    assert(parse_seed("0x10", &v) && v == 16);
+    assert(parse_seed("18446744073709551615", &v) && v == UINT64_MAX);
+    assert(!parse_seed("18446744073709551616", &v));
+    assert(!parse_seed("-1", &v) && !parse_seed("", &v) && !parse_seed("5x", &v));
+    base_seed = saved;
+    puts("ok   per-test seeds, unbiased draws, seed parsing");
 }
 
 int main(void)
@@ -487,5 +522,6 @@ int main(void)
     test6_summary();
     test5_summary();
     measured_data();
+    seeds();
     return 0;
 }
