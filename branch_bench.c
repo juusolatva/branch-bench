@@ -2300,10 +2300,12 @@ static int t5_family_ok(const T5Cell *c, const u8 *st)
 static int t5_site_stream(const T5Cell *c, const u8 *data, unsigned s, u8 *stream)
 {
     const unsigned n = c->n;
+    const unsigned l = c->l;
+    if (l == 0) return 0;   /* t5_validate() checks too; the analyzer needs it here */
     for (size_t b = 0; b < c->blocks; b++) {
         const u8 v = data[b * n + s];
-        if (b < c->l) stream[b] = v;
-        if (v > 1 || v != data[(b % c->l) * n + s]) return 0;
+        if (b < l) stream[b] = v;
+        if (v > 1 || v != data[(b % l) * n + s]) return 0;
     }
     return 1;
 }
