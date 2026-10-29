@@ -826,6 +826,81 @@ static void pattern_kernels(void)
     puts("ok   pattern kernels count every site of every block, nothing past the end");
 }
 
+/* Fills a Test 5 cell into fresh buffers and validates it. */
+static int t5_check(const T5Cell *c, u8 **data, T5Stats *st)
+{
+    *data = malloc(c->blocks * c->n);
+    u8 *streams = malloc((size_t)c->n * c->l);
+    assert(*data && streams);
+    t5_fill(c, *data, streams);
+    free(streams);
+    return t5_validate(c, *data, st);
+}
+
+static void t5_bad_blocks(void)
+{
+    const T5Cell c = { 4, 8, 12, T5_RANDOM_WORDS };   /* 12 blocks: not whole periods */
+    u8 data[48], streams[32];
+    t5_fill(&c, data, streams);
+}
+
+/* Test 5's inputs: every site's stream is periodic and checked from the
+ * data alone; controls have their exact counts; seeds decide the words. */
+static void t5_inputs(void)
+{
+    T5Stats st;
+    u8 *data;
+    const T5Cell words = { 4, 8, 256, T5_RANDOM_WORDS };
+    assert(t5_check(&words, &data, &st) == 1);
+    assert(st.ones == count_ones(data, 256 * 4));
+    data[17] ^= 1;                                   /* breaks site 1's period */
+    assert(t5_validate(&words, data, &st) == 0);
+    const u64 h1 = fnv1a64(data, 256 * 4);
+    free(data);
+    assert(t5_check(&words, &data, &st) == 1);
+    data[17] ^= 1;
+    assert(fnv1a64(data, 256 * 4) == h1);            /* same seed, same words */
+    data[17] ^= 1;
+    const u64 h_same = fnv1a64(data, 256 * 4);
+    free(data);
+    const u64 saved_seed = base_seed;
+    base_seed ^= 0x5555;
+    assert(t5_check(&words, &data, &st) == 1);
+    assert(fnv1a64(data, 256 * 4) != h_same);        /* another base seed, other words */
+    free(data);
+    base_seed = saved_seed;
+
+    const T5Cell crowded = { 512, 8, 256, T5_RANDOM_WORDS };
+    assert(t5_check(&crowded, &data, &st) == 1);
+    assert(st.distinct <= 256);                      /* only 256 8-bit words exist */
+    free(data);
+
+    const T5Cell db = { 1, 32, 2048, T5_DEBRUIJN };
+    assert(t5_check(&db, &data, &st) == 1);
+    assert(st.ones == 2048 / 2 && st.distinct == 1 && st.short_period == 0);
+    free(data);
+
+    const T5Cell ref = { 1, 65536, 65536, T5_BALANCED_REF };
+    assert(t5_check(&ref, &data, &st) == 1);
+    assert(st.ones == 32768);
+    free(data);
+
+    const T5Cell zero = { 1, 2, 64, T5_CONSTANT0 };
+    assert(t5_check(&zero, &data, &st) == 1);
+    assert(st.ones == 0 && st.short_period == 1);    /* all zeros: period 1 < 2 */
+    free(data);
+    const T5Cell alt = { 1, 2, 64, T5_ALTERNATING };
+    assert(t5_check(&alt, &data, &st) == 1);
+    assert(st.ones == 32 && st.short_period == 0);
+    free(data);
+
+    const T5Cell empty = { 4, 8, 0, T5_RANDOM_WORDS };   /* no period to rebuild */
+    u8 none[1] = {0};
+    assert(t5_validate(&empty, none, &st) == 0);
+    assert(exit_status(t5_bad_blocks) == 1);
+    puts("ok   Test 5 inputs: periodic sites, independent validator, controls, seeds");
+}
+
 int main(void)
 {
     perf_leader = 42;
@@ -870,5 +945,6 @@ int main(void)
     trial_log_grows();
     loop_inputs();
     pattern_kernels();
+    t5_inputs();
     return 0;
 }

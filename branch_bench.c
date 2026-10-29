@@ -2197,6 +2197,143 @@ static int debruijn_valid(const u8 *p, unsigned k)
     return ones == period / 2;
 }
 
+/* Test 5 matrix inputs.  A cell is N sites, each repeating its own L-bit
+ * stream, tiled over `blocks` blocks (block-major: data[b * N + s] is
+ * stream s at b mod L).  The main family is one independent random word
+ * per site; constant-0, alternating, de Bruijn and a balanced random
+ * reference are controls.  Nothing is rejected or redrawn: duplicates and
+ * shorter fundamental periods are counted and exported instead. */
+enum { T5_RANDOM_WORDS, T5_CONSTANT0, T5_ALTERNATING, T5_DEBRUIJN, T5_BALANCED_REF };
+__attribute__((unused))  /* exported from Task 5 (Test 5) on */
+static const char *const t5_family_ids[] = {
+    "random-words", "constant-0", "alternating", "de-bruijn", "balanced-ref",
+};
+#define T5_REF_CONFIG 0x7fffffffu   /* test_seed() config of the balanced reference */
+
+typedef struct {
+    unsigned n;        /* static sites per block */
+    unsigned l;        /* stream length (period) */
+    size_t   blocks;   /* blocks per pass, a multiple of l */
+    int      family;
+} T5Cell;
+
+typedef struct {
+    u64      ones;           /* ones per pass, all sites */
+    unsigned distinct;       /* distinct streams among the n sites */
+    unsigned short_period;   /* sites whose fundamental period is below l */
+} T5Stats;
+
+static unsigned log2_exact(unsigned v)
+{
+    unsigned k = 0;
+    while ((1u << k) < v) k++;
+    return k;
+}
+
+/* Site s's random word: l bits from test_seed(5, (n << 20) | l, s), 64 per
+ * draw, so other sites, cells and tests keep their own streams. */
+static void t5_random_word(const T5Cell *c, unsigned s, u8 *out)
+{
+    const u64 saved = rng_state;
+    rng_state = test_seed(5, (c->n << 20) | c->l, s);
+    u64 w = 0;
+    for (unsigned j = 0; j < c->l; j++) {
+        if (j % 64 == 0) w = rng64();
+        out[j] = (u8)((w >> (63 - j % 64)) & 1u);
+    }
+    rng_state = saved;
+}
+
+/* Site s of the balanced reference: exactly l / 2 ones, shuffled. */
+static void t5_balanced(const T5Cell *c, unsigned s, u8 *out)
+{
+    const u64 saved = rng_state;
+    rng_state = test_seed(5, T5_REF_CONFIG, s);
+    for (unsigned j = 0; j < c->l; j++) out[j] = (u8)(j < c->l / 2);
+    shuffle_u8(out, c->l);
+    rng_state = saved;
+}
+
+/* Writes each site's stream into streams[s * l ...] and tiles them into
+ * data (blocks * n bytes).  blocks must be a multiple of l. */
+__attribute__((unused))  /* called from Task 5 (Test 5) on */
+static void t5_fill(const T5Cell *c, u8 *data, u8 *streams)
+{
+    if (c->l == 0 || c->blocks % c->l != 0) {
+        fprintf(stderr, "Internal error: Test 5 cell N=%u L=%u has %zu blocks, not whole periods\n",
+                c->n, c->l, c->blocks);
+        exit(1);
+    }
+    for (unsigned s = 0; s < c->n; s++) {
+        u8 *st = streams + (size_t)s * c->l;
+        switch (c->family) {
+        case T5_RANDOM_WORDS: t5_random_word(c, s, st); break;
+        case T5_BALANCED_REF: t5_balanced(c, s, st); break;
+        case T5_DEBRUIJN:
+            if (!debruijn_prefer_one(log2_exact(c->l), st)) memset(st, 0, c->l);
+            break;   /* an invalid sequence fails t5_validate() */
+        case T5_ALTERNATING:
+            for (unsigned j = 0; j < c->l; j++) st[j] = (u8)(j & 1u);
+            break;
+        default:
+            memset(st, 0, c->l);
+            break;
+        }
+    }
+    for (size_t b = 0; b < c->blocks; b++)
+        for (unsigned s = 0; s < c->n; s++)
+            data[b * c->n + s] = streams[(size_t)s * c->l + b % c->l];
+}
+
+/* 1 if stream st (l bytes) is what its family promises. */
+static int t5_family_ok(const T5Cell *c, const u8 *st)
+{
+    const size_t ones = count_ones(st, c->l);
+    switch (c->family) {
+    case T5_DEBRUIJN:     return debruijn_valid(st, log2_exact(c->l));
+    case T5_BALANCED_REF: return ones == c->l / 2;
+    case T5_CONSTANT0:    return ones == 0;
+    case T5_ALTERNATING:
+        for (unsigned j = 0; j < c->l; j++)
+            if (st[j] != (u8)(j & 1u)) return 0;
+        return 1;
+    default:              return 1;
+    }
+}
+
+/* Rebuilds every site's stream from data alone (the first l blocks), checks
+ * that each byte is 0 or 1, that each site repeats with period l over all
+ * blocks and that each stream fits its family, and counts the statistics.
+ * Returns 0 on any mismatch. */
+__attribute__((unused))  /* called from Task 5 (Test 5) on */
+static int t5_validate(const T5Cell *c, const u8 *data, T5Stats *st)
+{
+    const unsigned n = c->n;
+    const unsigned l = c->l;
+    u8 *streams = calloc((size_t)n * l, 1);
+    if (!streams) { perror("calloc"); exit(1); }
+    int ok = l > 0 && c->blocks >= l && c->blocks % l == 0;   /* at least one period */
+    for (size_t b = 0; ok && b < c->blocks; b++)
+        for (unsigned s = 0; ok && s < n; s++) {
+            const u8 v = data[b * n + s];
+            if (b < l) streams[(size_t)s * l + b] = v;
+            ok = v <= 1 && v == data[(b % l) * n + s];
+        }
+    memset(st, 0, sizeof *st);
+    for (unsigned s = 0; ok && s < n; s++) {
+        const u8 *ss = streams + (size_t)s * l;
+        ok = t5_family_ok(c, ss);
+        st->ones += count_ones(ss, l) * (c->blocks / l);
+        st->short_period += fundamental_period(ss, l) < l;
+        int seen = 0;
+        for (unsigned t = 0; t < s && !seen; t++)
+            seen = memcmp(ss, streams + (size_t)t * l, l) == 0;
+        st->distinct += !seen;
+    }
+    free(streams);
+    return ok;
+}
+
 /* Whole periods of the longest pattern; with --size >= 1 this also means
  * at least one period. */
 static int test5_size_ok(size_t len)
