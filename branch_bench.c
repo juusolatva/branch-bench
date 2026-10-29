@@ -2327,7 +2327,8 @@ static int t5_validate(const T5Cell *c, const u8 *data, T5Stats *st)
  * of every L in the group, so each N has the same data footprint across
  * its periods), the training exposures, the minimum measured executions
  * and the point budget (training plus measured executions per trial).
- * The standard values are provisional until the hardware pilots. */
+ * The standard exposure was frozen from the i5-8350U and Raspberry Pi 4
+ * pilots (README, Profile choices): some Pi cells still learn after 64. */
 #define T5_TITLE "Test 5 — Pattern Learnability Matrix"
 #define T5_DESC  "N static data branches per block, each reading its own repeating L-bit random word (block-major); constant, alternating, de Bruijn and balanced-reference controls at N = 1."
 #define T5_MAX_ROWS            200
@@ -2347,7 +2348,7 @@ static const unsigned t5_l_res_long[] = { 512, 1024, 4096, 16384, 65536 };
 static const unsigned t5_db_all[]   = { 32, 64, 128, 256, 512, 1024, 2048 };
 static const unsigned t5_db_quick[] = { 32, 2048 };
 static const unsigned t5_exp_quick[] = { 8 };
-static const unsigned t5_exp_std[]   = { 64 };
+static const unsigned t5_exp_std[]   = { 512 };
 static const unsigned t5_exp_res[]   = { 8, 64, 512 };
 
 #define T5_LEN(a) ((int)(sizeof a / sizeof a[0]))
@@ -3028,11 +3029,13 @@ static u64 loop_exit_body2(unsigned c, u64 loops)
     return acc;
 }
 
-/* Trip counts per profile.  The standard list is provisional until the
- * hardware pilots; research adds every count 1–160. */
+/* Trip counts per profile.  The standard list was frozen from the
+ * i5-8350U and Raspberry Pi 4 pilots (README, Profile choices): dense
+ * where either machine's misses per loop change; research adds every
+ * count 1–160. */
 static const unsigned t6_counts_quick[] = { 1, 2, 4, 16, 64, 256 };
 static const unsigned t6_counts_standard[] = {
-    1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 160, 192, 256, 384, 512,
+    1, 2, 3, 4, 8, 16, 32, 34, 35, 36, 40, 44, 48, 64, 74, 75, 92, 94, 96, 256,
 };
 static const unsigned t6_counts_research_tail[] = { 192, 256, 384, 512 };
 #define T6_RESEARCH_DENSE 160

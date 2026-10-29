@@ -163,11 +163,10 @@ the export (`params`), and the banner and report name the profile.
 | Profile | Test 5 cells (N × L, blocks per pass) | Test 5 training | Test 6 counts C |
 |---|---|---|---|
 | `quick` | {1, 4, 16, 64} × {8, 32} over 256 blocks; {256, 512} × {16} over 96 | 8 periods | 1, 2, 4, 16, 64, 256 (2¹⁸ inner iterations per row) |
-| `standard` | {1, 4, 16, 64} × {8, 16, 32, 64, 128, 256} over 256 blocks; {256, 512} × {16, 32, 48} over 96 | 64 periods | 1–4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 160, 192, 256, 384, 512 (2²⁴ per row) |
+| `standard` | {1, 4, 16, 64} × {8, 16, 32, 64, 128, 256} over 256 blocks; {256, 512} × {16, 32, 48} over 96 | 512 periods | 1–4, 8, 16, 32, 34, 35, 36, 40, 44, 48, 64, 74, 75, 92, 94, 96, 256 (2²⁴ per row) |
 | `research` | {1, 4, 16, 64} × {8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256} over 768 blocks; {256, 512} × {16, 32, 48} over 96; {1} × {512 … 65536} over 65536 | 8, 64 and 512 periods, each a separate table | every C from 1 to 160, then 192, 256, 384, 512, plus a second loop body at the standard counts (2²⁴ per row) |
 
-The standard values are provisional until the hardware pilots of the
-first six-test release fix them. Test 5's controls (constant 0,
+The standard values were fixed from pilot runs (see [Profile choices](#profile-choices)). Test 5's controls (constant 0,
 alternating, de Bruijn periods 32–2048 (only 32 and 2048 in `quick`), and a balanced random reference
 of 65536 outcomes) run at N = 1 over 65536 blocks in every profile.
 
@@ -179,6 +178,47 @@ periods per branch and 2²² data-branch executions (2¹⁶ in `quick`).
 A cell whose training and measurement would exceed the profile's
 execution budget is skipped with a note, never shrunk; builds without the
 assembly kernels skip every N > 1 cell.
+
+### Profile choices
+
+The standard profile was frozen from research-profile pilots (`-n 6`,
+default seed and `--seed 1`/`2`, pinned) on an i5-8350U laptop and a
+Raspberry Pi 4 (Cortex-A72):
+
+- **Training: 512 periods.** On the i5-8350U only 1 of 55 matrix cells
+  moved by more than 0.01 misses per data branch between 64 and 512
+  periods, and not monotonically. On the Pi 12 did, most within the
+  0.01–0.03 spread between seeds, but some kept falling well beyond it
+  (N = 256, L = 16: 0.059, 0.045, 0.033 after 8, 64 and 512 periods;
+  N = 16, L = 48: 0.028, 0.008, 0.000), so 64 periods is not steady on
+  every machine.
+- **Test 6 counts: dense where either machine changes.** The i5-8350U's
+  misses per loop are about 0 up to C = 74 except at C = 35, 40, 42
+  and 44 (1–2 per loop), 1.33 for C = 75–92, near 0 at 93–94 and 1.0
+  from 95. The Pi's are about 0 except at C = 3 (0.87), and 1.0 from
+  C = 35 (2.0 at 36). The second body shape changes between C = 64 and 96
+  on the i5-8350U and between 32 and 48 on the Pi, so the shape matters.
+- **Measurement lengths unchanged.** Tests 5 and 6 at the standard
+  profile take about 0.7 s on the i5-8350U at `-n 1`, and about four
+  times as long on the Pi.
+
+These are observations on two machines that set the grid; they are not
+expected values for other CPUs.
+
+### Known limitations
+
+- Code placement is not replicated: each kernel has one layout, so an
+  alignment effect cannot be told apart from a predictor effect (planned
+  for Stage 4's layout tools).
+- Cache residency is not measured. Test 5's footprint per cell is fixed
+  and reported, but larger N also means more code.
+- In Test 5 the block and pass loop branches are counted with the data
+  branches; there is no per-branch attribution.
+- Test 5's seed spread (up to about 0.03 misses per data branch on the
+  Pi) limits how small a difference between cells means anything.
+- Only the i5-8350U and the Raspberry Pi 4 have been validated. On the
+  Pi the branch counter uses the speculative raw event 0x12 (the generic
+  event fails) while misses and cycles use generic events.
 
 ## Seeds and revisions
 
