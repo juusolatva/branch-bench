@@ -57,6 +57,18 @@ expect 0 -t 6 --size 1000 --reps 1 -o "$dir/skip6.md"
 grep -q 'Skipped:' "$dir/skip6.md" || { echo "FAIL skip6.md lacks the skip reason"; fail=1; }
 expect 0 -t 6 --size 32 --reps 100000 -o "$dir/skip6b.md"
 grep -q 'Skipped:' "$dir/skip6b.md" || { echo "FAIL skip6b.md lacks the skip reason"; fail=1; }
+# --hard runs all six tests, also next to -t, and says so.
+# shellcheck disable=SC2086
+expect 0 --hard $small -o "$dir/hard.md"
+grep -q '(all, with --hard)' "$dir/stdout" || { echo "FAIL --hard banner lacks its tests line"; fail=1; }
+expect 0 --hard -t 2 --size 4K --reps 1 -o "$dir/hard2.md"
+for f in hard.md hard2.md; do
+    for t in 1 2 3 4 5 6; do
+        grep -q "^### Test $t " "$dir/$f" || { echo "FAIL $f lacks Test $t"; fail=1; }
+    done
+    grep -q 'All tests were run (--hard)' "$dir/$f" || { echo "FAIL $f lacks the --hard note"; fail=1; }
+    if grep -q 'Only test(s)' "$dir/$f"; then echo "FAIL $f says only some tests ran"; fail=1; fi
+done
 
 # The report must contain every test that ran.
 for t in 1 2 3 4; do

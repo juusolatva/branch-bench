@@ -62,6 +62,7 @@
 #define NUM_FUNCS     32           /* distinct indirect call targets (test 3) */
 #define NUM_TESTS     6
 #define DEFAULT_TESTS 0xFu         /* tests run without -t: 1–4 (5 and 6 are opt-in) */
+#define HARD_TESTS    0x3Fu        /* tests run with --hard: all six              */
 #define MAX_TRIALS    99           /* upper limit for -n/--trials             */
 #define MAX_SIZE      (1UL << 30)  /* upper limit for --size                  */
 #define MAX_REPS      100000UL     /* upper limit for --reps                  */
@@ -105,6 +106,7 @@ static unsigned reps  = DEFAULT_REPS;  /* --reps: passes over the array per tria
 static int      trials = 1;            /* -n/--trials: 1 = single measurement, no warm-up */
 static unsigned tests_selected = 0;    /* -t/--test bitmask (bit n-1 = test n);
                                           0 = DEFAULT_TESTS (1–4) */
+static int      hard_selected = 0;     /* --hard: all tests, including 5 and 6 */
 
 /* ── Types ───────────────────────────────────────────────────────────────── */
 typedef uint64_t        u64;
@@ -1446,6 +1448,7 @@ static void print_usage(const char *prog)
            "                       (default: 1, a single measurement, no warm-up)\n"
            "  -t, --test <N>       run only test N (1–%d); repeat to run several\n"
            "                       (default: tests 1–4; tests 5–6 run only when selected)\n"
+           "      --hard           run all tests, including the hard tests 5 and 6\n"
            "      --size <N>       elements per array (tests 1/2/4/5/6) and calls\n"
            "                       per trial (test 3); K/M suffixes allowed\n"
            "                       (default: %u = 4M, max: %lu = 1024M;\n"
@@ -1488,6 +1491,11 @@ static int apply_option(int argc, char **argv, int *i, const char **out_path)
     if (is_opt(arg, "-t", "--test")) {
         if (!option_number(argc, argv, i, "test number", 1, NUM_TESTS, &v)) return 1;
         tests_selected |= 1u << (v - 1);
+        return -1;
+    }
+    if (is_opt(arg, NULL, "--hard")) {
+        tests_selected |= HARD_TESTS;
+        hard_selected = 1;
         return -1;
     }
     if (is_opt(arg, NULL, "--size")) {
@@ -1558,7 +1566,9 @@ static void print_banner(const char *tests_list)
     if (trials > 1)
         printf("  Trials:          %10d per variant (median shown, after 1 warm-up run)\n",
                trials);
-    if (tests_selected)
+    if (hard_selected)
+        printf("  Tests:           %10s (all, with --hard)\n", tests_list);
+    else if (tests_selected)
         printf("  Tests:           %10s (selected with -t)\n", tests_list);
     printf("  Perf counters:   %s\n",
            perf_available() ? "AVAILABLE (hardware branch-miss counts shown)"
@@ -1606,7 +1616,9 @@ static void write_report_header(FILE *report, const char *tests_list)
     if (trials > 1)
         fprintf(report, "_Median of %d trials per variant, after one warm-up run. "
                         "Range is the fastest–slowest trial._\n\n", trials);
-    if (tests_selected)
+    if (hard_selected)
+        fprintf(report, "_All tests were run (--hard), including the hard tests 5 and 6._\n\n");
+    else if (tests_selected)
         fprintf(report, "_Only test(s) %s were run._\n\n", tests_list);
 }
 

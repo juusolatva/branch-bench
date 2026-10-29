@@ -55,6 +55,9 @@ jobs:
       - name: Run (small size)
         run: ./branch_bench $SMALL_RUN
 
+      - name: Run all tests (small size, --hard)
+        run: ./branch_bench --hard $SMALL_RUN
+
       - name: Perf regression tests (no PMU required)
         run: |
           gcc $BENCH_FLAGS $WARN_FLAGS -o "$RUNNER_TEMP/perf_test" .github/scripts/perf_test.c
@@ -102,6 +105,7 @@ jobs:
               gcc --version
               gcc $BENCH_FLAGS $JCC_FLAGS $WARN_FLAGS -o /tmp/branch_bench branch_bench.c
               /tmp/branch_bench $SMALL_RUN > /dev/null
+              /tmp/branch_bench --hard $SMALL_RUN > /dev/null
               .github/scripts/check_kernels.sh /tmp/branch_bench
               hits=$(.github/scripts/check_jcc.sh /tmp/branch_bench)
               if [ -n "$hits" ]; then
@@ -127,6 +131,9 @@ jobs:
 
       - name: Run (small size)
         run: ./branch_bench $SMALL_RUN
+
+      - name: Run all tests (small size, --hard)
+        run: ./branch_bench --hard $SMALL_RUN
 
       # Clang makes Tests 1-2 and 6 branchless (cmov in sum_threshold, sbb in
       # count_decisions, sbb/cmov in correlate_distance), so check_kernels.sh
