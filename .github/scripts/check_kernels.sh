@@ -1,10 +1,11 @@
 #!/bin/sh
 # Checks that the benchmark kernels in a GCC build still contain the code
 # the benchmark measures.  Whether it survives depends on the compiler
-# version, and losing it silently invalidates results.  x86-64 and aarch64
-# only.
+# version (for the C kernels) or on the asm block staying single (for the
+# assembly kernels), and losing it silently invalidates results.  x86-64
+# and aarch64 only.
 #
-#   Test 1/4 sum_threshold/sum_branch, Test 2/5 count_decisions:
+#   Test 1/4 sum_threshold, Test 2/5 count_decisions:
 #       exactly one data branch, no branchless instruction (conditional
 #       move/select, flag arithmetic such as setcc/sbb/adc), no SIMD.
 #   Test 4 sum_branchless: no data branch (cmov/setcc allowed), no SIMD.
@@ -14,8 +15,7 @@
 #       its loops (A, filler and B; mode loop-branch3).
 #   Every kernel except sum_branchless: no branchless instruction; every
 #       kernel: no SIMD.
-#   Every kernel: exactly one function body (no clone or duplicate; GCC
-#       folds sum_branch and sum_threshold into one, so they count as one).
+#   Every kernel: exactly one function body (no clone or duplicate).
 #
 # A data branch is a forward conditional branch that starts and lands inside
 # a loop (between a backward branch and its target) and whose condition
@@ -254,15 +254,8 @@ leaves() {
 
 if [ "$counts" -eq 1 ]; then
     missing=0
-    for k in sum_threshold sum_branch sum_branchless count_decisions dispatch_sequential dispatch_random correlate_distance; do
-        re=$k
-        case $k in sum_threshold|sum_branch) re='sum_threshold|sum_branch' ;; esac
-        # Its own body, else the folded one listed under the other name.
-        line=$(analyze "$re" | awk -v k="$k" '
-            { base = $1; sub(/\..*/, "", base) }
-            base == k && !own { own = $0 }
-            !any { any = $0 }
-            END { print own ? own : any }')
+    for k in sum_threshold sum_branchless count_decisions dispatch_sequential dispatch_random correlate_distance; do
+        line=$(analyze "$k" | awk 'NR == 1')
         if [ -z "$line" ]; then
             echo "check_kernels.sh: kernel $k not found" >&2; missing=1; continue
         fi
@@ -325,7 +318,7 @@ check() {
     if [ "$bad" -eq 0 ]; then echo "ok   $label"; else fail=1; fi
 }
 
-check "Test 1/4 sum_threshold/sum_branch" 'sum_threshold|sum_branch' data-branch 1
+check "Test 1/4 sum_threshold"            'sum_threshold'             data-branch 1
 check "Test 2/5 count_decisions"          'count_decisions'           data-branch 1
 check "Test 4 sum_branchless"             'sum_branchless'            no-data-branch
 check "Test 3 dispatch_sequential"        'dispatch_sequential'       indirect-call 1

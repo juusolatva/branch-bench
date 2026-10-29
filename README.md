@@ -20,7 +20,7 @@ A run without `-t` runs Tests 1–4. Tests 5 and 6 run only when selected with `
 
 ## Notes
 
-You **MUST** run this with ./run.sh, use a [prebuilt binary](#prebuilt-binaries), or build it with exactly `gcc -std=c99 -O2 -fno-tree-vectorize -fno-if-conversion -o branch_bench branch_bench.c`, adding `-Wa,-mbranches-within-32B-boundaries,-malign-branch=jcc+fused+jmp+call+ret+indirect` on x86-64 as `./run.sh` does. Without *-fno-tree-vectorize* and *-fno-if-conversion* the compiler optimizes the mispredictions away, and other optimization levels give results that cannot be compared with [RESULTS.md](RESULTS.md). The x86-64 assembler flags keep every jump in the kernels off 32-byte boundaries, which Intel's JCC-erratum fix slows on Skylake-derived CPUs. `./run.sh` builds and then runs the benchmark with any options you give it (e.g. `./run.sh -n 5 -o report.md`); after that, `./branch_bench` runs it directly. Build with GCC: Clang has no equivalent of *-fno-if-conversion* and makes Tests 1, 2, 5, 6 and Test 4's branch variant branchless, so its timings show no misprediction cost (see [AGENTS.md](AGENTS.md)).
+You **MUST** run this with ./run.sh, use a [prebuilt binary](#prebuilt-binaries), or build it with exactly `gcc -std=c99 -O2 -fno-tree-vectorize -fno-if-conversion -o branch_bench branch_bench.c`, adding `-Wa,-mbranches-within-32B-boundaries,-malign-branch=jcc+fused+jmp+call+ret+indirect` on x86-64 as `./run.sh` does. Without *-fno-tree-vectorize* and *-fno-if-conversion* the compiler optimizes the mispredictions away, and other optimization levels give results that cannot be compared with [RESULTS.md](RESULTS.md). The x86-64 assembler flags keep every jump in the kernels off 32-byte boundaries, which Intel's JCC-erratum fix slows on Skylake-derived CPUs. `./run.sh` builds and then runs the benchmark with any options you give it (e.g. `./run.sh -n 5 -o report.md`); after that, `./branch_bench` runs it directly. Build with GCC. On x86-64 and AArch64 the kernels of Tests 1, 2, 4 and 5 are written in assembly, so they keep their branch with any compiler, Clang included; Test 6's kernel is C, and Clang (which has no equivalent of *-fno-if-conversion*) makes it branchless, so its Clang timings show no misprediction cost. Other architectures use C versions of all kernels, whose branches depend on the compiler; the banner and report say which kernels ran (`Kernels:`). See [AGENTS.md](AGENTS.md).
 
 The benchmark builds on Linux with GCC; on Windows, use WSL2. Other POSIX systems build with GCC too but show times only. On macOS `gcc` is Clang, so install GCC (e.g. from Homebrew) and build with the command above using its versioned `gcc-<N>` (`./run.sh` calls plain `gcc`), without the `-Wa,...` flags: they need the GNU assembler (binutils 2.34 or later), which macOS does not use.
 
@@ -159,7 +159,7 @@ The banner and report also show the **benchmark revision**. It goes up
 whenever a change alters what is measured (inputs, warm-up, pairing,
 summaries), even when the test numbers stay the same. Results from
 different revisions are not comparable; the entries in RESULTS.md so far
-are revision 1.
+are revision 1, and this version is revision 3.
 
 ## Adding results
 

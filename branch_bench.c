@@ -74,7 +74,7 @@
 #define MAX_SIZE      (1UL << 30)  /* upper limit for --size                  */
 #define MAX_REPS      100000UL     /* upper limit for --reps                  */
 #define MAX_CPU       1023         /* highest CPU number for --cpu            */
-#define BENCH_REVISION 2           /* bumped whenever measurements change     */
+#define BENCH_REVISION 3           /* bumped whenever measurements change     */
 #define DEFAULT_SEED  0xdeadbeefcafe1234ULL  /* --seed default */
 
 /* Test 5: de Bruijn pattern orders k (periods 2^k) and the random reference */
@@ -90,6 +90,35 @@
 #define D6_DISTS       9
 #define D6_MIN_BLOCKS  64     /* blocks per pass at d = D6_MAX_DIST */
 #define D6_MIN_SAMPLE  65536  /* blocks per pass for a "Correlation used" figure */
+
+/* ── Kernel backend ───────────────────────────────────────────────────────
+ * The data-branch kernels (sum_threshold, count_decisions) are one asm
+ * block each on x86-64 and AArch64, so no compiler can turn their branch
+ * into a conditional move or duplicate it.  Elsewhere, or when built with
+ * -DBRANCH_BENCH_C_KERNELS, they are plain C, whose branches depend on the
+ * compiler (check them with .github/scripts/check_kernels.sh). */
+#if defined(BRANCH_BENCH_C_KERNELS)
+#  define KERNEL_ASM 0
+#  define KERNEL_BACKEND "c"
+#elif defined(__x86_64__)
+#  define KERNEL_ASM 1
+#  define KERNEL_BACKEND "asm-x86_64"
+#elif defined(__aarch64__)
+#  define KERNEL_ASM 1
+#  define KERNEL_BACKEND "asm-aarch64"
+#else
+#  define KERNEL_ASM 0
+#  define KERNEL_BACKEND "c"
+#endif
+/* How the asm data branches jump: they skip the update when the source
+ * condition is false.  Unknown for C kernels. */
+#if KERNEL_ASM
+#  define ASM_TAKEN_WHEN "false"
+#else
+#  define ASM_TAKEN_WHEN NULL
+#endif
+#define BB_STR_(x) #x
+#define BB_STR(x)  BB_STR_(x)
 
 /* ── Build provenance (printed in the banner and report) ────────────────── */
 /* Clang's __VERSION__ already names the compiler; GCC's is only the number. */
@@ -1207,14 +1236,68 @@ static void shuffle_u8(u8 *arr, size_t n)
  *            can do no better than chance, yielding ~50% misprediction rate.
  *
  * ═══════════════════════════════════════════════════════════════════════════ */
+/* Where KERNEL_ASM is set, the whole function body is one asm block: the
+ * n == 0 / n_reps == 0 exits, the pass loop at 1: and the element loop at
+ * 2: (a C guard would let Clang add setcc code around it).  The data
+ * branch (jbe / b.ls) skips the add unless arr[i] > THRESHOLD. */
 __attribute__((noinline))
 static u64 sum_threshold(const u8 *arr, size_t n, unsigned n_reps)
 {
     u64 acc = 0;
+#if KERNEL_ASM
+    const u8 *p;
+    u64 v;
+    unsigned r = n_reps;
+#  if defined(__x86_64__)
+    __asm__ __volatile__(
+        "test %[n], %[n]\n\t"
+        "jz 4f\n\t"
+        "test %k[r], %k[r]\n\t"
+        "jz 4f\n"
+        "1:\n\t"
+        "mov %[arr], %[p]\n"
+        "2:\n\t"
+        "movzbl (%[p]), %k[v]\n\t"
+        "cmp $" BB_STR(THRESHOLD) ", %k[v]\n\t"
+        "jbe 3f\n\t"                 /* <── THE branch being predicted */
+        "add %[v], %[acc]\n"
+        "3:\n\t"
+        "inc %[p]\n\t"
+        "cmp %[end], %[p]\n\t"
+        "jne 2b\n\t"
+        "dec %k[r]\n\t"
+        "jnz 1b\n"
+        "4:"
+        : [acc] "+r"(acc), [p] "=&r"(p), [v] "=&r"(v), [r] "+r"(r)
+        : [arr] "r"(arr), [end] "r"(arr + n), [n] "r"(n)
+        : "cc", "memory");
+#  else
+    __asm__ __volatile__(
+        "cbz %[n], 4f\n\t"
+        "cbz %w[r], 4f\n"
+        "1:\n\t"
+        "mov %[p], %[arr]\n"
+        "2:\n\t"
+        "ldrb %w[v], [%[p]], #1\n\t"
+        "cmp %w[v], #" BB_STR(THRESHOLD) "\n\t"
+        "b.ls 3f\n\t"                /* <── THE branch being predicted */
+        "add %[acc], %[acc], %[v]\n"
+        "3:\n\t"
+        "cmp %[p], %[end]\n\t"
+        "b.ne 2b\n\t"
+        "subs %w[r], %w[r], #1\n\t"
+        "b.ne 1b\n"
+        "4:"
+        : [acc] "+r"(acc), [p] "=&r"(p), [v] "=&r"(v), [r] "+r"(r)
+        : [arr] "r"(arr), [end] "r"(arr + n), [n] "r"(n)
+        : "cc", "memory");
+#  endif
+#else
     for (unsigned rep = 0; rep < n_reps; rep++)
         for (size_t i = 0; i < n; i++)
             if (arr[i] > THRESHOLD)   /* <── THE branch being predicted */
                 acc += arr[i];
+#endif
     return acc;
 }
 
@@ -1275,14 +1358,64 @@ static void run_test1(FILE *report)
  *
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+/* Same loop frame as sum_threshold; the data branch (je / cbz) skips the
+ * increment when decisions[i] is 0. */
 __attribute__((noinline))
 static u64 count_decisions(const u8 *decisions, size_t n, unsigned n_reps)
 {
     u64 acc = 0;
+#if KERNEL_ASM
+    const u8 *p;
+    unsigned r = n_reps;
+#  if defined(__x86_64__)
+    __asm__ __volatile__(
+        "test %[n], %[n]\n\t"
+        "jz 4f\n\t"
+        "test %k[r], %k[r]\n\t"
+        "jz 4f\n"
+        "1:\n\t"
+        "mov %[arr], %[p]\n"
+        "2:\n\t"
+        "cmpb $0, (%[p])\n\t"
+        "je 3f\n\t"                  /* branch outcome determined by table */
+        "inc %[acc]\n"
+        "3:\n\t"
+        "inc %[p]\n\t"
+        "cmp %[end], %[p]\n\t"
+        "jne 2b\n\t"
+        "dec %k[r]\n\t"
+        "jnz 1b\n"
+        "4:"
+        : [acc] "+r"(acc), [p] "=&r"(p), [r] "+r"(r)
+        : [arr] "r"(decisions), [end] "r"(decisions + n), [n] "r"(n)
+        : "cc", "memory");
+#  else
+    u64 v;
+    __asm__ __volatile__(
+        "cbz %[n], 4f\n\t"
+        "cbz %w[r], 4f\n"
+        "1:\n\t"
+        "mov %[p], %[arr]\n"
+        "2:\n\t"
+        "ldrb %w[v], [%[p]], #1\n\t"
+        "cbz %w[v], 3f\n\t"          /* branch outcome determined by table */
+        "add %[acc], %[acc], #1\n"
+        "3:\n\t"
+        "cmp %[p], %[end]\n\t"
+        "b.ne 2b\n\t"
+        "subs %w[r], %w[r], #1\n\t"
+        "b.ne 1b\n"
+        "4:"
+        : [acc] "+r"(acc), [p] "=&r"(p), [v] "=&r"(v), [r] "+r"(r)
+        : [arr] "r"(decisions), [end] "r"(decisions + n), [n] "r"(n)
+        : "cc", "memory");
+#  endif
+#else
     for (unsigned rep = 0; rep < n_reps; rep++)
         for (size_t i = 0; i < n; i++)
             if (decisions[i])   /* branch outcome determined by table */
                 acc++;
+#endif
     return acc;
 }
 
@@ -1458,18 +1591,6 @@ static void run_test3(FILE *report)
 /* Set when Test 4's branch and branchless sums differ; main() then exits 1. */
 static int sanity_failed = 0;
 
-/* Branch version — kept as a branch by -fno-if-conversion build flag */
-__attribute__((noinline))
-static u64 sum_branch(const u8 *arr, size_t n, unsigned n_reps)
-{
-    u64 acc = 0;
-    for (unsigned rep = 0; rep < n_reps; rep++)
-        for (size_t i = 0; i < n; i++)
-            if (arr[i] > THRESHOLD)
-                acc += arr[i];
-    return acc;
-}
-
 /* Branchless version — arithmetic mask, no conditional jump possible */
 __attribute__((noinline))
 static u64 sum_branchless(const u8 *arr, size_t n, unsigned n_reps)
@@ -1505,8 +1626,8 @@ static void run_test4(FILE *report)
     Result r_rl = {0};
     int pair_branch;
     int pair_branchless;
-    MEASURE_PAIR(r_sb, 0, sum_branch(sorted, len, reps),
-                 r_rb, 2, sum_branch(random_d, len, reps), pair_branch);
+    MEASURE_PAIR(r_sb, 0, sum_threshold(sorted, len, reps),
+                 r_rb, 2, sum_threshold(random_d, len, reps), pair_branch);
     MEASURE_PAIR(r_sl, 1, sum_branchless(sorted, len, reps),
                  r_rl, 3, sum_branchless(random_d, len, reps), pair_branchless);
 
@@ -1977,10 +2098,12 @@ static int test_selected(int n)
 
 /* What each kernel's code is declared to contain.  check_kernels.sh
  * --counts measures the same fields from the binary; -1 is "not declared".
- * No function pointers here: taking a kernel's address stops GCC folding
- * sum_branch into sum_threshold, which moves the kernels.  Entry
- * addresses therefore come from the binary (check_kernels.sh), and the
- * export's "entry" is null. */
+ * taken_when says when the data branch jumps relative to its source
+ * condition ("false": it skips the update), as written in the asm; NULL
+ * when the compiler decides.  No function pointers here: taking a
+ * kernel's address can change how GCC compiles and places the kernels.
+ * Entry addresses therefore come from the binary (check_kernels.sh), and
+ * the export's "entry" is null. */
 typedef struct {
     const char *id;
     int         revision;
@@ -1989,18 +2112,18 @@ typedef struct {
     int         data_branches;
     int         indirect_calls;
     int         inner_loop_branches;
+    const char *taken_when;
     const char *tests;
 } KernelDesc;
 
-#define KERNEL(fn) #fn, 1, "c"
+#define KERNEL(fn, rev, backend) #fn, rev, backend
 static const KernelDesc kernel_descs[] = {
-    { KERNEL(sum_threshold),       "elem",  1, 0,  2, "1"   },
-    { KERNEL(sum_branch),          "elem",  1, 0,  2, "4"   },
-    { KERNEL(sum_branchless),      "elem",  0, 0,  1, "4"   },
-    { KERNEL(count_decisions),     "elem",  1, 0,  2, "2,5" },
-    { KERNEL(dispatch_sequential), "call",  0, 1,  2, "3"   },
-    { KERNEL(dispatch_random),     "call",  0, 1,  2, "3"   },
-    { KERNEL(correlate_distance),  "block", 3, 0,  2, "6"   },
+    { KERNEL(sum_threshold, 2, KERNEL_BACKEND),   "elem",  1, 0, 2, ASM_TAKEN_WHEN, "1,4" },
+    { KERNEL(sum_branchless, 1, "c"),             "elem",  0, 0, 1, NULL,           "4"   },
+    { KERNEL(count_decisions, 2, KERNEL_BACKEND), "elem",  1, 0, 2, ASM_TAKEN_WHEN, "2,5" },
+    { KERNEL(dispatch_sequential, 1, "c"),        "call",  0, 1, 2, NULL,           "3"   },
+    { KERNEL(dispatch_random, 1, "c"),            "call",  0, 1, 2, NULL,           "3"   },
+    { KERNEL(correlate_distance, 1, "c"),         "block", 3, 0, 2, NULL,           "6"   },
 };
 #undef KERNEL
 
@@ -2206,6 +2329,8 @@ static void write_meta(FILE *f)
     json_string_or_null(f, have_uname ? kernel : NULL);
     fputs(",\"compiler\":", f);
     json_string(f, COMPILER_VERSION);
+    fputs(",\"kernel_backend\":", f);
+    json_string(f, KERNEL_BACKEND);
     fputs(",\"build_flags\":", f);
     json_string_or_null(f, BUILD_FLAGS);
     fputs(",\"commit\":", f);
@@ -2238,6 +2363,8 @@ static void write_kernels(FILE *f)
         json_int(f, k->indirect_calls >= 0, k->indirect_calls);
         fputs(",\"inner_loop_branches\":", f);
         json_int(f, k->inner_loop_branches >= 0, k->inner_loop_branches);
+        fputs(",\"taken_when\":", f);
+        json_string_or_null(f, k->taken_when);
         fputs(",\"tests\":", f);
         json_string(f, k->tests);
         fputs("}\n", f);
@@ -2602,6 +2729,9 @@ static void print_banner(const char *tests_list)
         printf("  Raw PMU events:  %s (generic events failed)\n", raw);
     }
     printf("  Compiler:        %s\n", COMPILER_VERSION);
+    printf("  Kernels:         %s\n", KERNEL_ASM
+           ? KERNEL_BACKEND " (Tests 1, 2, 4 and 5 branch kernels)"
+           : "C only (branches depend on the compiler)");
     if (BUILD_FLAGS[0])
         printf("  Build flags:     %s\n", BUILD_FLAGS);
     if (BUILD_COMMIT[0])
@@ -2622,6 +2752,11 @@ static void write_report_header(FILE *report, const char *tests_list)
     fprintf(report, "## %s\n\n", cpu);
     fprintf(report, "_%s_\n\n", date);
     fprintf(report, "_Benchmark revision %d._\n\n", BENCH_REVISION);
+    fprintf(report, "%s\n\n", KERNEL_ASM
+            ? "_Kernels: " KERNEL_BACKEND " for the data-branch kernels of Tests 1, 2, 4 "
+              "and 5; the other kernels are C._"
+            : "_Kernels: C only; their branches depend on the compiler (check with "
+              "check_kernels.sh)._");
     if (seed_given)
         fprintf(report, "_Seed: %" PRIu64 "._\n\n", base_seed);
     fprintf(report, "| Array size | Repetitions | Perf counters | Compiler |\n");

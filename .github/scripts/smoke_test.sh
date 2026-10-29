@@ -58,7 +58,7 @@ expect 0 -t 3 --seed 7 --size 4K --reps 1
 expect 0 -t 3 --seed 0x1f --size 4K --reps 1
 expect 0 -t 3 --seed 010 --size 4K --reps 1
 expect 0 -t 1 --size 4K --reps 1 -o "$dir/rev.md"
-grep -q '^_Benchmark revision 2._$' "$dir/rev.md" || { echo "FAIL rev.md lacks the revision line"; fail=1; }
+grep -q '^_Benchmark revision 3._$' "$dir/rev.md" || { echo "FAIL rev.md lacks the revision line"; fail=1; }
 # Test 5 is opt-in; it skips (exit 0) when --size is not a multiple of 2048,
 # while other selected tests still run.
 # Test 4 first: fake_perf.so fails the first and third counter reads, and its

@@ -750,6 +750,26 @@ static void seeds(void)
     puts("ok   per-test seeds, unbiased draws, seed parsing");
 }
 
+/* The data-branch kernels (assembly where available) on edge cases: the
+ * threshold boundary, one element, no elements and no passes. */
+static void kernels(void)
+{
+    static const u8 edge[] = { 0, 128, 129, 255, 1, 127 };
+    assert(sum_threshold(edge, sizeof edge, 1) == 129 + 255);
+    assert(sum_threshold(edge, sizeof edge, 3) == 3 * (129 + 255));
+    assert(sum_threshold(edge + 3, 1, 2) == 2 * 255);
+    assert(sum_threshold(edge + 1, 1, 5) == 0);    /* 128 is not > 128 */
+    assert(sum_threshold(edge, 0, 4) == 0);
+    assert(sum_threshold(edge, sizeof edge, 0) == 0);
+    static const u8 dec[] = { 0, 1, 1, 0, 1 };
+    assert(count_decisions(dec, sizeof dec, 1) == 3);
+    assert(count_decisions(dec, sizeof dec, 4) == 12);
+    assert(count_decisions(dec + 1, 1, 7) == 7);
+    assert(count_decisions(dec, 0, 7) == 0);
+    assert(count_decisions(dec, sizeof dec, 0) == 0);
+    assert(KERNEL_ASM == (strcmp(KERNEL_BACKEND, "c") != 0));
+}
+
 int main(void)
 {
     perf_leader = 42;
@@ -788,5 +808,6 @@ int main(void)
     pair_schedule();
     paired_cost();
     json_escaping();
+    kernels();
     return 0;
 }

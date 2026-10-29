@@ -68,7 +68,7 @@ def check_structure(records):
     meta = records[0]
     check(meta.get("type") == "meta", "first record is not meta")
     check(meta.get("schema") == 1, f"schema {meta.get('schema')}, want 1")
-    check(meta.get("revision") == 2, f"revision {meta.get('revision')}, want 2")
+    check(meta.get("revision") == 3, f"revision {meta.get('revision')}, want 3")
     kernels = {k["id"] for k in by_type(records, "kernel")}
     variants = {(v["test"], v["variant"]): v for v in by_type(records, "variant")}
     for v in variants.values():
@@ -81,7 +81,7 @@ def check_structure(records):
     used = {t["pair"] for t in trials if t["pair"] is not None}
     recorded = {p["pair"] for p in by_type(records, "pair")}
     check(used == recorded, f"trial pairs {sorted(used)} differ from pair records {sorted(recorded)}")
-    ok("structure: meta first, schema 1, revision 2, every trial has a variant and kernel, "
+    ok("structure: meta first, schema 1, revision 3, every trial has a variant and kernel, "
        "every pair has a record")
     return variants
 
