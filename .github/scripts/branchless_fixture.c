@@ -2,7 +2,7 @@
  * with a shift mask, which uses no blacklisted instruction (cmov, setcc,
  * sbb, ...), so only the data-branch check can reject it.  CI builds this
  * with the benchmark's flags and requires check_kernels.sh to report
- * "FAIL Test 1/4 ... no conditional branch inside the loop". */
+ * "FAIL Test 1/4 ...: expected 1 data branch(es), found 0". */
 #include <stddef.h>
 
 typedef unsigned long long u64;

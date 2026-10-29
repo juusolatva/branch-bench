@@ -63,8 +63,16 @@ jobs:
           gcc $BENCH_FLAGS $WARN_FLAGS -o "$RUNNER_TEMP/perf_test" .github/scripts/perf_test.c
           "$RUNNER_TEMP/perf_test"
 
-      - name: Check Test 1-3 and 6 kernels keep real branches
+      - name: Check the kernels keep their data branches and indirect calls
         run: .github/scripts/check_kernels.sh ./branch_bench
+
+      # The export's kernel records declare each kernel's branch sites; the
+      # binary must have exactly those.
+      - name: Kernel descriptors match the binary
+        run: |
+          .github/scripts/check_kernels.sh --counts ./branch_bench > "$RUNNER_TEMP/counts.txt"
+          ./branch_bench -t 1 --size 1K --reps 1 --json "$RUNNER_TEMP/k.jsonl" > /dev/null
+          python3 .github/scripts/check_export.py "$RUNNER_TEMP/k.jsonl" --kernel-counts "$RUNNER_TEMP/counts.txt"
 
       # The fixture's kernel is branchless without any blacklisted
       # instruction, so this proves the data-branch check itself still fails.
@@ -74,7 +82,33 @@ jobs:
           out="$RUNNER_TEMP/check_fixture.txt"
           .github/scripts/check_kernels.sh "$RUNNER_TEMP/fixture" > "$out" || true
           cat "$out"
-          grep -q '^FAIL Test 1/4 .*no conditional branch inside the loop' "$out"
+          grep -q '^FAIL Test 1/4 .*expected 1 data branch(es), found 0' "$out"
+
+      # Each fixture breaks the kernels in a way an older check accepted or
+      # never looked for; the check must reject each with its own message.
+      - name: Kernel check rejects a loop guard, an unrolled loop and merged leaves
+        run: |
+          out="$RUNNER_TEMP/check_fixture.txt"
+          for f in loop_guard unrolled merged_leaves; do
+            gcc $BENCH_FLAGS $WARN_FLAGS -o "$RUNNER_TEMP/$f" ".github/scripts/${f}_fixture.c"
+            .github/scripts/check_kernels.sh "$RUNNER_TEMP/$f" > "$out" || true
+            cat "$out"
+            case $f in
+              loop_guard)    grep -q '^FAIL Test 1/4 .*expected 1 data branch(es), found 0' "$out" ;;
+              unrolled)      grep -q '^FAIL Test 1/4 .*expected 1 data branch(es), found [2-9]' "$out" ;;
+              merged_leaves) grep -q '^FAIL Test 3 leaves: 31 distinct addresses for 32 leaves' "$out" ;;
+            esac
+          done
+
+      # Built without $JCC_FLAGS, so its deliberately misplaced jump stays.
+      - name: JCC check finds a jump ending on a 32-byte boundary
+        if: runner.arch == 'X64'
+        run: |
+          gcc -o "$RUNNER_TEMP/jcc_fixture" .github/scripts/jcc_fixture.S
+          hits=$(.github/scripts/check_jcc.sh "$RUNNER_TEMP/jcc_fixture")
+          printf '%s\n' "$hits"
+          [ "$(printf '%s\n' "$hits" | grep -c '^<sum_threshold> ')" -eq 1 ]
+          [ "$(printf '%s\n' "$hits" | wc -l)" -eq 1 ]
 
       - name: Check no kernel jump crosses a 32-byte boundary
         if: runner.arch == 'X64'
@@ -107,6 +141,9 @@ jobs:
               /tmp/branch_bench $SMALL_RUN > /dev/null
               /tmp/branch_bench --hard $SMALL_RUN > /dev/null
               .github/scripts/check_kernels.sh /tmp/branch_bench
+              .github/scripts/check_kernels.sh --counts /tmp/branch_bench > /tmp/counts.txt
+              /tmp/branch_bench -t 1 --size 1K --reps 1 --json /tmp/k.jsonl > /dev/null
+              python3 .github/scripts/check_export.py /tmp/k.jsonl --kernel-counts /tmp/counts.txt
               hits=$(.github/scripts/check_jcc.sh /tmp/branch_bench)
               if [ -n "$hits" ]; then
                 printf "%s\n" "$hits"
@@ -148,8 +185,8 @@ jobs:
             exit 1
           fi
           cat "$out"
-          grep -q '^FAIL Test 1/4' "$out"
-          grep -q '^FAIL Test 2' "$out"
+          grep -q '^FAIL Test 1/4 .*data branch' "$out"
+          grep -q '^FAIL Test 2/5 .*data branch' "$out"
           grep -q '^FAIL Test 6' "$out"
 
       - name: clang --analyze
@@ -258,9 +295,11 @@ jobs:
           dir="$RUNNER_TEMP/smoke-fake"
           .github/scripts/smoke_test.sh ./branch_bench_cov "$dir"
           # Fails if the shim was not used: these lines need the counters.
-          grep -q '^\*\*Cost per miss:\*\*' "$dir/report.md"
-          grep -q '^\*\*Average clock during measurements:\*\*' "$dir/report.md"
+          grep -q '^\*\*Effective extra cycles per additional miss:\*\* -\{0,1\}[0-9]' "$dir/report.md"
+          grep -q '^\*\*Effective user-cycle rate during measurements:\*\*' "$dir/report.md"
           grep -q '^\*\*Periods at' "$dir/t5.md"
+          grep -q '"governor":"performance"' "$dir/run.jsonl"
+          grep -q '"hypervisor":true' "$dir/run.jsonl"
           grep -q '^\*\*Correlation used:\*\* d=4 [0-9][0-9]*%, d=8 n/a' "$dir/t6.md"
           grep -q '^_n/a: ' "$dir/t6.md"
           # Only some counters open.  Tests 1-2 come first: the shim fails the

@@ -28,7 +28,7 @@ Branch, miss and cycle counts need Linux hardware performance counters, which re
 
 If a trial's counter read fails or its group never gets scheduled, that
 trial still reports its wall-clock time. Its hardware counts show as –
-in the report and are excluded from the cost per miss and average clock.
+in the report and are excluded from the effective cost per miss and the cycle rate.
 
 ## Prebuilt binaries
 
@@ -62,10 +62,41 @@ The report heading shows the CPU's maximum (turbo/boost) clock where
 Linux reports it. Where it does not (WSL2, most VMs), the heading is the
 model name as is, which on Intel CPUs may end in the base clock
 (e.g. `@ 2.90GHz`). The CPU rarely holds its maximum clock under sustained load,
-so the report also ends with the **average clock during measurements**,
-calculated from the cycle counter. That is the clock the results were
-actually produced at, and it often explains why timings differ between
-runs on the same machine.
+so the report also ends with the **effective user-cycle rate during
+measurements**: user-mode cycles divided by wall time over all measured
+trials. It is close to the clock the results were actually produced at,
+and often explains why timings differ between runs on the same machine.
+Time spent in the kernel or preempted lowers it, so it is not the core's
+instantaneous clock.
+
+## Machine-readable export
+
+`--json <file>` writes every measured trial and every summary as JSON
+Lines (one JSON object per line, schema 1), next to the console output
+and any `-o` report. The two must be different files; naming the same
+file (also via a hard link or `./`) is an error, and neither file is
+emptied until both have opened:
+
+```sh
+./branch_bench -n 5 -o report.md --json run.jsonl
+```
+
+| `type` | One record per | Main fields |
+|---|---|---|
+| `meta` (first line) | run | `schema` 1, `revision`, CPU, microcode, arch, kernel, compiler, build flags, commit, `alignment_policy`, `seed` and `test_seeds`, size/reps/trials, `training_runs`, `schedule` (`AB/BA`), `affinity`, `hypervisor`, `smt_siblings`, `governor`, `max_ghz`, `effective_user_cycle_ghz`, and per counter its event type, config and `semantics` (`retired`, `speculative`, `cycles`, `unknown`) |
+| `kernel` | kernel | declared `data_branches`, `indirect_calls`, `inner_loop_branches`, unit, tests |
+| `variant` | report row | `test`, `variant` (row index), `label`, `kernel`, `work` and `unit` per trial |
+| `trial` | measured trial | `test`, `variant`, `pair`, run-wide `seq`, `trial`, `train_runs`, `time_ms`, `result` (the kernel's checksum), `perf_status`, `enabled_ns`/`running_ns`, `counts` (scaled) and `raw_counts` |
+| `pair` | compared pair | `a`/`b` variants, `pairs`, `valid`, summed times, `slowdown`, signed `delta` per counter, `effective_cost` and `cost_status` (`resolved`, `inconclusive`, `unavailable`), and `cost_shown` (the cost line was printed) |
+
+Counters print as exact integers; a value that does not exist (a counter
+that is not open, a trial whose read failed, a ratio without data) is
+`null`, never 0. `.github/scripts/check_export.py run.jsonl --report
+report.md` rebuilds every pair summary from the trials and checks the
+report's medians, ranges, counter columns, ratios and cost lines against
+them. Seeds and counts are 64-bit integers, which exceed the 2⁵³ that
+JavaScript numbers (and `jq`) hold exactly; read them with a parser that
+keeps integers, such as Python's `json`.
 
 ## Repeated measurements
 
@@ -76,10 +107,19 @@ By default each variant is measured once. For steadier numbers use
 ./branch_bench -n 5 -o report.md
 ```
 
-Each variant then gets one untimed warm-up run followed by 5 measured
-trials. The trial with the median time is reported, together with the
-fastest–slowest range, so you can see how noisy the run was. Expect the
-run to take about N+1 times as long.
+Each variant is then measured 5 times. The trial with the median time is
+reported, together with the fastest–slowest range, so you can see how
+noisy the run was.
+
+Every measured trial, also with the default `-n 1`, follows one untimed
+training run of the same variant, so the predictor has seen that
+variant's pattern just before it is timed. This does not reset predictor
+state left by other variants; it only makes the exposure the same for
+every trial. A run takes about twice as long per trial as the measured
+time alone. The two variants of a comparison (e.g. sorted and shuffled)
+are measured in alternating order, AB, BA, AB, ..., so slow drift such as
+clock changes affects both alike, and each **Slowdown** is the summed
+time of one variant's trials over the other's.
 
 ## Choosing tests and sizes
 
@@ -100,7 +140,26 @@ and `--size` × `--reps` ≥ 65664.
 Test 3); `K`/`M` suffixes are allowed. `--reps` sets how many passes each
 trial makes over the array (for Test 6, it scales the branch budget). Results are only comparable with
 [RESULTS.md](RESULTS.md) at the defaults (`--size 4M --reps 64`).
+`--cpu <N>` pins the whole run to CPU N before the counters open, which
+keeps the scheduler from moving it between cores (e.g. P- and E-cores).
+If the CPU cannot be used, a warning says so, the banner and report say
+the pin failed, and the run continues unpinned.
+
 Run `./branch_bench --help` for all options.
+
+## Seeds and revisions
+
+Every test builds its input from its own seed, derived from a base seed,
+the test number and the input stream. Selecting or reordering tests
+therefore never changes another test's input, and the same command gives
+the same data on every run. `--seed <N>` (decimal, or hex after `0x`; `010` is ten) changes the
+base seed; the banner and report show it when it is given.
+
+The banner and report also show the **benchmark revision**. It goes up
+whenever a change alters what is measured (inputs, warm-up, pairing,
+summaries), even when the test numbers stay the same. Results from
+different revisions are not comparable; the entries in RESULTS.md so far
+are revision 1.
 
 ## Adding results
 
@@ -116,25 +175,35 @@ Linux reports none, were added by hand.
 
 ## Interpreting the results
 
+**Miss %** is misses ÷ branches, shown only when both counters count the same population. On x86 both are retired branches. On ARM, Linux counts generic branches as retired but generic misses speculatively, so the column shows "–" there unless both counters fell back to their raw (speculative) ARM events; misses per element are shown either way.
+
 A branch misprediction costs a pipeline flush: the work fetched down the
 wrong path is thrown away and the front end restarts at the correct
 target. The minimum penalty is roughly the pipeline depth, typically
 ~15–20 cycles on modern out-of-order x86 cores.
 
-When the cycle and miss counters are available, each test prints a
-**Cost per miss**: the extra cycles divided by the extra mispredictions
-between its predictable and unpredictable variant (for Test 4, its two
-branch variants). It is left out when the unpredictable variant adds
-fewer than 1000 misses or no cycles. Being measured in cycles, it is
+When the cycle and miss counters are available, each test prints the
+**Effective extra cycles per additional miss**: the extra cycles divided
+by the extra mispredictions between its predictable and unpredictable
+variant (for Test 4, its two branch variants), summed over the paired
+trials whose counters both read correctly. Differences keep their sign,
+so a pair where the unpredictable variant happened to be faster pulls
+the figure down instead of being dropped. When the unpredictable variant
+adds fewer than 1000 misses per valid pair, the figure would be noise, so
+the line says "inconclusive" and shows the raw differences instead; with
+some pairs invalid it says how many were used. The figure depends on the
+workload around the branch, so it is not the pipeline's recovery latency.
+Being measured in cycles, it is
 far less affected by the clock speed the CPU happened to run at than the
 times are, though not entirely: part of a miss's cost can be waiting on
 memory, which takes a fixed time rather than a fixed number of cycles.
-In [RESULTS.md](RESULTS.md) it is ~22 cycles for Test 1 on the Intel
+In [RESULTS.md](RESULTS.md) (revision 1, where it was called cost per
+miss and came from the median trials) it is ~22 cycles for Test 1 on the Intel
 machines and ~20 on the Raspberry Pi 4's Cortex-A72. For the older
 results, which predate the cycle counter, estimates from the times and
 listed clock speeds put it at ~20–25 cycles for Test 1.
 
-The cost per miss is only meaningful when the unpredictable variant adds
+The effective cost is only meaningful when the unpredictable variant adds
 many misses. When the two variants miss almost equally often, as in
 Test 3 on cores that cannot learn the sequential cycle, the small
 difference in work between the variants dominates and the figure is

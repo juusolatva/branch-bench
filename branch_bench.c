@@ -47,6 +47,10 @@
 #include <inttypes.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <errno.h>
+#include <math.h>
+#include <sys/stat.h>
+#include <sys/utsname.h>
 
 /* ── Linux perf_event support (optional) ────────────────────────────────── */
 #ifdef __linux__
@@ -69,13 +73,15 @@
 #define MAX_TRIALS    99           /* upper limit for -n/--trials             */
 #define MAX_SIZE      (1UL << 30)  /* upper limit for --size                  */
 #define MAX_REPS      100000UL     /* upper limit for --reps                  */
+#define MAX_CPU       1023         /* highest CPU number for --cpu            */
+#define BENCH_REVISION 2           /* bumped whenever measurements change     */
+#define DEFAULT_SEED  0xdeadbeefcafe1234ULL  /* --seed default */
 
 /* Test 5: de Bruijn pattern orders k (periods 2^k) and the random reference */
 #define DB_MIN_ORDER   5
 #define DB_MAX_ORDER   11
 #define DB_MAX_PERIOD  (1u << DB_MAX_ORDER)
 #define DB_ORDERS      (DB_MAX_ORDER - DB_MIN_ORDER + 1)
-#define DB_RANDOM_SEED 0x2545f4914f6cdd1dULL  /* nonzero: xorshift64 sticks at 0 */
 #define DB_MIN_SAMPLE  65536  /* elements for test 5's summary lines */
 
 /* Test 6: distances d (filler branches between A and B), powers of two */
@@ -84,8 +90,6 @@
 #define D6_DISTS       9
 #define D6_MIN_BLOCKS  64     /* blocks per pass at d = D6_MAX_DIST */
 #define D6_MIN_SAMPLE  65536  /* blocks per pass for a "Correlation used" figure */
-#define D6_SEED_A      0x6a09e667f3bcc908ULL  /* nonzero, distinct seeds */
-#define D6_SEED_B      0xbb67ae8584caa73bULL
 
 /* ── Build provenance (printed in the banner and report) ────────────────── */
 /* Clang's __VERSION__ already names the compiler; GCC's is only the number. */
@@ -104,19 +108,25 @@
 #  define BUILD_COMMIT ""
 #endif
 
+typedef uint64_t        u64;
+typedef unsigned char   u8;
+
 /* Run-time settings, changed only by command-line options. */
 static size_t   size  = DEFAULT_SIZE;  /* --size: elements per array (tests 1/2/4/5/6),
                                           calls per trial (test 3) */
 static unsigned reps  = DEFAULT_REPS;  /* --reps: passes over the array per trial;
                                           test 6: scales its branch budget */
-static int      trials = 1;            /* -n/--trials: 1 = single measurement, no warm-up */
+static int      trials = 1;            /* -n/--trials: measured trials per variant, each
+                                          after TRAIN_RUNS untimed runs */
 static unsigned tests_selected = 0;    /* -t/--test bitmask (bit n-1 = test n);
                                           0 = DEFAULT_TESTS (1–4) */
 static int      hard_selected = 0;     /* --hard: all tests, including 5 and 6 */
+static u64      base_seed = DEFAULT_SEED;  /* --seed: every test's input derives from it */
+static int      seed_given = 0;        /* --seed was on the command line */
+static int      cpu_requested = -1;    /* --cpu: CPU to pin to, -1 = none */
+static const char *json_path = NULL;   /* --json: JSON Lines export file */
 
 /* ── Types ───────────────────────────────────────────────────────────────── */
-typedef uint64_t        u64;
-typedef unsigned char   u8;
 
 /* Perf counters, one row each in opening order: X(slot, generic event, ARM raw
  * code, Markdown header, console label, console width).  The CTR_* enum and
@@ -132,12 +142,38 @@ typedef unsigned char   u8;
 #define CTR_ENUM(slot, ev, raw, md, label, width) CTR_##slot,
 enum { FOR_EACH_COUNTER(CTR_ENUM) CTR_COUNT };
 
+/* Why a trial's counts are, or are not, usable.  PERF_NONE is 0, so a
+ * zero-initialized Result never claims valid counts. */
+enum {
+    PERF_NONE,            /* no counter open                          */
+    PERF_OK,              /* counts read for the whole trial          */
+    PERF_START_FAILED,    /* reset, baseline read or enable failed    */
+    PERF_STOP_FAILED,     /* disable failed                           */
+    PERF_READ_FAILED,     /* short read or wrong group size           */
+    PERF_TIMES_INVALID,   /* scheduling times went backwards          */
+    PERF_NOT_SCHEDULED    /* the group never ran during the trial     */
+};
+
+static const char *perf_status_name(int s)
+{
+    static const char *const names[] = {
+        "none", "ok", "start_failed", "stop_failed", "read_failed",
+        "times_invalid", "not_scheduled"
+    };
+    return s >= 0 && s <= PERF_NOT_SCHEDULED ? names[s] : "unknown";
+}
+
 typedef struct {
     double time_ms;
     double time_min_ms;    /* fastest/slowest trial; equal to time_ms */
     double time_max_ms;    /* when trials == 1                        */
-    u64    counts[CTR_COUNT]; /* 0 for any counter not opened         */
-    int    counts_valid;   /* successful counter measurement for this trial */
+    u64    counts[CTR_COUNT];     /* scaled estimate; 0 for any counter not read */
+    u64    raw_counts[CTR_COUNT]; /* as read, before scaling for time-sharing   */
+    u64    enabled_ns;     /* this trial's group scheduling times     */
+    u64    running_ns;
+    unsigned open_mask;    /* counters open for this trial (perf_open_mask) */
+    unsigned raw_mask;     /* ... and those opened as ARM raw events   */
+    int    perf_status;    /* PERF_*: whether counts[] can be used    */
     u64    result;         /* anti-dead-code-elimination sink         */
 } Result;
 
@@ -207,6 +243,48 @@ static const int counter_display_order[] = {
     CTR_CYCLES, CTR_BRANCHES, CTR_MISSES
 };
 CHECK_LEN(counter_display_order_len_check, counter_display_order, CTR_COUNT);
+
+/* What population a counter counts.  A miss rate is only meaningful when
+ * branches and misses count the same one. */
+enum { SEM_UNKNOWN, SEM_RETIRED, SEM_SPECULATIVE, SEM_CYCLES };
+enum { ARCH_X86, ARCH_ARM, ARCH_OTHER };
+
+static const char *semantics_name(int sem)
+{
+    static const char *const names[] = { "unknown", "retired", "speculative", "cycles" };
+    return names[sem];
+}
+
+static int host_arch(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    return ARCH_X86;
+#elif defined(__aarch64__) || defined(__arm__)
+    return ARCH_ARM;
+#else
+    return ARCH_OTHER;
+#endif
+}
+
+/* x86: the generic branch and miss events are retired-branch events on
+ * Intel and AMD.  ARM: Linux v6.12 drivers/perf/arm_pmuv3.c maps generic
+ * branches to BR_RETIRED (0x21) or PC_WRITE_RETIRED (0x0C), both retired,
+ * but generic misses to BR_MIS_PRED (0x10), which is speculative; the raw
+ * fallbacks 0x12 and 0x10 are both speculative.  Other architectures are
+ * unknown. */
+static int counter_semantics(int ctr, int is_raw, int arch)
+{
+    if (ctr == CTR_CYCLES) return SEM_CYCLES;
+    if (arch == ARCH_ARM)
+        return is_raw || ctr == CTR_MISSES ? SEM_SPECULATIVE : SEM_RETIRED;
+    if (arch == ARCH_X86 && !is_raw) return SEM_RETIRED;
+    return SEM_UNKNOWN;
+}
+
+static int result_sem(const Result *r, int ctr)
+{
+    return counter_semantics(ctr, (int)((r->raw_mask >> ctr) & 1u), host_arch());
+}
 
 /* Bit c set when counter c opened only as its ARM raw event because the
  * generic one failed; stays 0 on other architectures and without HAVE_PERF. */
@@ -300,24 +378,34 @@ static void perf_start(void)
                          PERF_IOC_FLAG_GROUP) == 0;
 }
 
+/* Stores the trial's counts and sets r->perf_status to exactly one PERF_*
+ * reason on every path. */
 static void perf_stop(Result *r)
 {
-    r->counts_valid = 0;
+    r->perf_status = PERF_NONE;
+    r->open_mask   = perf_open_mask;
+    r->raw_mask    = perf_raw_mask;
     if (perf_leader < 0) return;
     int stopped = ioctl(perf_leader, PERF_EVENT_IOC_DISABLE,
                         PERF_IOC_FLAG_GROUP) == 0;
     int started = perf_started;
     perf_started = 0;
-    if (!started || !stopped) return;
+    r->perf_status = PERF_START_FAILED;
+    if (!started) return;
+    r->perf_status = PERF_STOP_FAILED;
+    if (!stopped) return;
 
     /* nr, time_enabled, time_running, then one value per member */
     u64 buf[3 + CTR_COUNT];
-    if (!perf_read_group(buf) || buf[1] < perf_enabled_start ||
-        buf[2] < perf_running_start)
-        return;
+    r->perf_status = PERF_READ_FAILED;
+    if (!perf_read_group(buf)) return;
+    r->perf_status = PERF_TIMES_INVALID;
+    if (buf[1] < perf_enabled_start || buf[2] < perf_running_start) return;
     u64 enabled = buf[1] - perf_enabled_start;
     u64 running = buf[2] - perf_running_start;
-    if (!running || running > enabled) return;
+    if (running > enabled) return;
+    r->perf_status = PERF_NOT_SCHEDULED;
+    if (!running) return;
 
     double scale = 1.0;
     if (running < enabled) {       /* counters were time-shared this trial */
@@ -329,27 +417,43 @@ static void perf_stop(Result *r)
             warned = 1;
         }
     }
-    for (int c = 0; c < CTR_COUNT; c++)
-        if (perf_has(c))
-            r->counts[c] = (u64)((double)buf[3 + perf_slot[c]] * scale);
-    r->counts_valid = 1;
+    for (int c = 0; c < CTR_COUNT; c++) {
+        if (!perf_has(c)) continue;
+        r->raw_counts[c] = buf[3 + perf_slot[c]];
+        r->counts[c] = (u64)((double)r->raw_counts[c] * scale);
+    }
+    r->enabled_ns  = enabled;
+    r->running_ns  = running;
+    r->perf_status = PERF_OK;
 }
 
 static int perf_available(void)  { return perf_leader >= 0; }
+static unsigned perf_mask(void)  { return perf_open_mask; }
 
 #else
 static void perf_init(void)       {}
 static void perf_close(void)      {}
 static void perf_start(void)      {}
-static void perf_stop(Result *r)  { (void)r; }
+static void perf_stop(Result *r)  { r->perf_status = PERF_NONE; r->raw_mask = perf_raw_mask; }
 static int  perf_available(void)  { return 0; }
-static int  perf_has(int ctr)     { (void)ctr; return 0; }
+static unsigned perf_mask(void)   { return 0; }
 #endif
 
 /* Opening a counter doesn't guarantee that a particular trial could read it. */
 static int result_has(const Result *r, int ctr)
 {
-    return r->counts_valid && perf_has(ctr);
+    return r->perf_status == PERF_OK && ((r->open_mask >> ctr) & 1u);
+}
+
+/* Miss % only for a trial whose branch and miss counters count the same,
+ * known population (e.g. not retired branches vs speculative misses). */
+static int miss_rate_valid(const Result *r)
+{
+    if (!result_has(r, CTR_BRANCHES) || !result_has(r, CTR_MISSES) ||
+        !r->counts[CTR_BRANCHES])
+        return 0;
+    const int sem = result_sem(r, CTR_BRANCHES);
+    return sem != SEM_UNKNOWN && sem == result_sem(r, CTR_MISSES);
 }
 
 /* Sorts trials by time and returns the median one (the lower of the two
@@ -372,10 +476,9 @@ static Result median_trial(Result *t, int n)
     return m;
 }
 
-/* Cycles and time summed over every measured trial (warm-ups excluded), for
- * the average clock the results were actually produced at.  Cycles are
- * user-mode only, so time spent in the kernel or preempted slightly lowers
- * the figure; on an otherwise idle system that is well under 1%. */
+/* User-mode cycles and wall time summed over every measured trial (training
+ * runs excluded).  Their ratio is an effective rate, not the core clock:
+ * time spent in the kernel or preempted lowers it. */
 static double clock_cycles_sum = 0;
 static double clock_ms_sum     = 0;
 
@@ -386,24 +489,12 @@ static void account_clock(const Result *r)
     clock_ms_sum     += r->time_ms;
 }
 
-/* Average clock in GHz over all measured trials, or 0 if unknown. */
+/* Effective user-cycle rate in GHz over all measured trials, or 0 if unknown. */
 static double measured_ghz(void)
 {
     return clock_ms_sum > 0 ? clock_cycles_sum / (clock_ms_sum * 1e6) : 0;
 }
 
-/* Runs one measured kernel call: counters wrap the timer, never the other
- * way round (see the call convention above).  A macro rather than a function
- * so the kernel is still called directly, keeping its codegen unchanged. */
-#define MEASURE_ONCE(res, call)             \
-    do {                                    \
-        perf_start();                       \
-        double t0_ = now_ms();              \
-        (res).result = (call);              \
-        (res).time_ms = now_ms() - t0_;     \
-        perf_stop(&(res));                  \
-        account_clock(&(res));              \
-    } while (0)
 
 /* `trials` limited to 1..MAX_TRIALS, so MEASURE always has at least one
  * trial to report and never overruns its trial array. */
@@ -414,21 +505,252 @@ static int trial_count(void)
     return trials;
 }
 
-/* Measures `call` `trials` times and keeps the median trial.  With more than
- * one trial, an untimed warm-up run comes first so the first trial doesn't
- * pay for cold caches, an untrained predictor or a CPU still ramping up. */
-#define MEASURE(res, call)                                  \
-    do {                                                    \
-        Result trial_[MAX_TRIALS];                          \
-        const int n_trials_ = trial_count();                \
-        if (n_trials_ > 1)                                  \
-            anti_dce_sink(call);                            \
-        for (int k_ = 0; k_ < n_trials_; k_++) {            \
-            memset(&trial_[k_], 0, sizeof(trial_[k_]));     \
-            MEASURE_ONCE(trial_[k_], call);                 \
-        }                                                   \
-        (res) = median_trial(trial_, n_trials_);            \
+/* Work done per trial, for the misses-per-item column: elements processed
+ * (tests 1/2/4/5, all passes), indirect calls made (test 3) or blocks run
+ * (test 6, all passes). */
+typedef struct {
+    u64         count;
+    const char *unit;      /* "elem", "call" or "block" */
+} Work;
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Measurement log
+ *
+ * Every measured trial is kept, with its test, variant (the row index in
+ * that test's rows[]), pair and run-wide order, so every reported summary
+ * can be rebuilt from the trials.  Static arrays: nothing is allocated
+ * while measuring.  Up to 37 variant streams × 99 trials fit (--hard -n 99).
+ * ───────────────────────────────────────────────────────────────────────── */
+#define MAX_TRIAL_RECORDS 4096
+#define MAX_PAIRS         64
+#define TRAIN_RUNS        1         /* untimed runs before every measured trial */
+#define COST_MIN_MISSES_PER_PAIR 1000.0
+
+typedef struct {
+    int         test;
+    int         variant;   /* row index in the test's rows[] */
+    int         pair;      /* pair_info[] index, or -1 when unpaired */
+    int         seq;       /* run-wide measurement order */
+    int         trial;     /* 0-based trial of this variant in this pair */
+    const char *call;      /* the kernel call, as written */
+    Result      r;
+} TrialRecord;
+
+static TrialRecord trial_log[MAX_TRIAL_RECORDS];
+static int         trial_log_len = 0;
+
+/* Two variants of one test measured in alternating order. */
+typedef struct {
+    int         test;
+    int         a;
+    int         b;
+    const char *ratio_label;   /* Markdown label of its printed ratio, if any */
+    int         cost_shown;    /* its effective-cost line (value or inconclusive) was printed */
+} PairInfo;
+
+static PairInfo pair_info[MAX_PAIRS];
+static int      pair_count = 0;
+static int      current_test = 0;
+
+static void begin_test(int n)
+{
+    current_test = n;
+}
+
+static void log_full(const char *what)
+{
+    fprintf(stderr, "Internal error: %s full\n", what);
+    exit(1);
+}
+
+static void log_trial(int variant, int pair, int trial, const char *call, const Result *r)
+{
+    if (trial_log_len >= MAX_TRIAL_RECORDS) log_full("trial log");
+    TrialRecord *t = &trial_log[trial_log_len];
+    t->test    = current_test;
+    t->variant = variant;
+    t->pair    = pair;
+    t->seq     = trial_log_len;
+    t->trial   = trial;
+    t->call    = call;
+    t->r       = *r;
+    trial_log_len++;
+}
+
+static int new_pair(int a, int b)
+{
+    if (pair_count >= MAX_PAIRS) log_full("pair table");
+    PairInfo *p = &pair_info[pair_count];
+    p->test = current_test;
+    p->a = a;
+    p->b = b;
+    p->ratio_label = NULL;
+    p->cost_shown = 0;
+    return pair_count++;
+}
+
+/* What each variant's rows describe, for the export: registered by
+ * emit_rows(), once per (test, variant). */
+#define MAX_VARIANTS 64
+
+typedef struct {
+    int         test;
+    int         variant;
+    const char *label;
+    Work        work;
+} VariantInfo;
+
+static VariantInfo variant_info[MAX_VARIANTS];
+static int         variant_count = 0;
+
+static void log_variant(int variant, const char *label, const Work *w)
+{
+    for (int i = 0; i < variant_count; i++)
+        if (variant_info[i].test == current_test && variant_info[i].variant == variant)
+            return;
+    if (variant_count >= MAX_VARIANTS) log_full("variant table");
+    VariantInfo *v = &variant_info[variant_count++];
+    v->test = current_test;
+    v->variant = variant;
+    v->label = label;
+    v->work = *w;
+}
+
+/* The reported row for a variant: its median trial by time over all its
+ * logged trials (in any pair), with the fastest and slowest time. */
+static Result representative(int test, int variant)
+{
+    Result t[2 * MAX_TRIALS];
+    int n = 0;
+    for (int i = 0; i < trial_log_len; i++) {
+        if (trial_log[i].test != test || trial_log[i].variant != variant) continue;
+        if (n == 2 * MAX_TRIALS) log_full("representative buffer");
+        t[n++] = trial_log[i].r;
+    }
+    if (!n) {
+        const Result none = {0};
+        return none;
+    }
+    return median_trial(t, n);
+}
+
+/* Pairs run AB, BA, AB, ... so drift affects both variants alike. */
+static int pair_a_first(int k)
+{
+    return (k & 1) == 0;
+}
+
+/* One measured trial: TRAIN_RUNS untimed calls, then one timed call, which
+ * is logged.  Counters wrap the timer, never the other way round (see the
+ * call convention above).  Macros rather than functions so the kernel is
+ * still called directly, keeping its codegen unchanged. */
+#define MEASURE_ONCE(res, call)             \
+    do {                                    \
+        perf_start();                       \
+        double t0_ = now_ms();              \
+        (res).result = (call);              \
+        (res).time_ms = now_ms() - t0_;     \
+        perf_stop(&(res));                  \
+        account_clock(&(res));              \
     } while (0)
+
+#define MEASURE_TRAINED(variant, pair, k, call)                 \
+    do {                                                        \
+        Result t_;                                              \
+        memset(&t_, 0, sizeof t_);                              \
+        for (int r_ = 0; r_ < TRAIN_RUNS; r_++)                 \
+            anti_dce_sink(call);                                \
+        MEASURE_ONCE(t_, call);                                 \
+        log_trial((variant), (pair), (k), #call, &t_);          \
+    } while (0)
+
+/* Measures `call` `trials` times and reports its median trial. */
+#define MEASURE(res, variant, call)                             \
+    do {                                                        \
+        const int n_trials_ = trial_count();                    \
+        for (int k_ = 0; k_ < n_trials_; k_++)                  \
+            MEASURE_TRAINED((variant), -1, k_, call);           \
+        (res) = representative(current_test, (variant));        \
+    } while (0)
+
+/* Measures two variants `trials` times each in AB/BA order as one pair,
+ * reports each one's median trial (over every pair the variant is in) and
+ * stores the pair id in pair_out. */
+#define MEASURE_PAIR(ra, va, call_a, rb, vb, call_b, pair_out)  \
+    do {                                                        \
+        const int n_trials_ = trial_count();                    \
+        const int p_ = new_pair((va), (vb));                    \
+        for (int k_ = 0; k_ < n_trials_; k_++) {                \
+            if (pair_a_first(k_)) {                             \
+                MEASURE_TRAINED((va), p_, k_, call_a);          \
+                MEASURE_TRAINED((vb), p_, k_, call_b);          \
+            } else {                                            \
+                MEASURE_TRAINED((vb), p_, k_, call_b);          \
+                MEASURE_TRAINED((va), p_, k_, call_a);          \
+            }                                                   \
+        }                                                       \
+        (ra) = representative(current_test, (va));              \
+        (rb) = representative(current_test, (vb));              \
+        (pair_out) = p_;                                        \
+    } while (0)
+
+/* Sums over one variant pair's trials, matched by trial index k.  Times
+ * cover every trial pair; counter deltas (b − a, signed) cover only valid
+ * trial pairs, where both trials read their counters, and only counters
+ * open on both. */
+typedef struct {
+    int      pairs;
+    int      valid;
+    double   ms_a;
+    double   ms_b;
+    double   delta[CTR_COUNT];
+    unsigned open_mask;
+} PairStats;
+
+static const TrialRecord *find_trial(int pair, int variant, int k)
+{
+    for (int i = 0; i < trial_log_len; i++)
+        if (trial_log[i].pair == pair && trial_log[i].variant == variant &&
+            trial_log[i].trial == k)
+            return &trial_log[i];
+    return NULL;
+}
+
+static PairStats pair_stats(int pair)
+{
+    PairStats s;
+    memset(&s, 0, sizeof s);
+    s.open_mask = ~0u;
+    const PairInfo *p = &pair_info[pair];
+    for (int k = 0; ; k++) {
+        const TrialRecord *a = find_trial(pair, p->a, k);
+        const TrialRecord *b = find_trial(pair, p->b, k);
+        if (!a || !b) break;
+        s.pairs++;
+        s.ms_a += a->r.time_ms;
+        s.ms_b += b->r.time_ms;
+        if (a->r.perf_status != PERF_OK || b->r.perf_status != PERF_OK) continue;
+        s.valid++;
+        s.open_mask &= a->r.open_mask & b->r.open_mask;
+        for (int c = 0; c < CTR_COUNT; c++)
+            s.delta[c] += (double)b->r.counts[c] - (double)a->r.counts[c];
+    }
+    if (!s.valid) s.open_mask = 0;
+    return s;
+}
+
+/* Effective extra cycles per additional miss over a pair's valid trials:
+ * Σ Δcycles ÷ Σ Δmisses, signed.  Returns 1 with *cost set, 0 when the miss
+ * difference is too small to resolve, -1 when there is no valid trial pair
+ * or cycles or misses were not open on both trials. */
+static int pair_cost(const PairStats *s, double *cost)
+{
+    const unsigned need = (1u << CTR_CYCLES) | (1u << CTR_MISSES);
+    if (!s->valid || (s->open_mask & need) != need) return -1;
+    if (s->delta[CTR_MISSES] < COST_MIN_MISSES_PER_PAIR * (double)s->valid) return 0;
+    *cost = s->delta[CTR_CYCLES] / s->delta[CTR_MISSES];
+    return 1;
+}
 
 /* ─────────────────────────────────────────────────────────────────────────
  * Fast RNG — xorshift64, avoids stdlib rand() overhead and bias
@@ -441,6 +763,43 @@ static inline u64 rng64(void)
     rng_state ^= rng_state >> 7;
     rng_state ^= rng_state << 17;
     return rng_state;
+}
+
+/* Uniform in [0, bound) for bound >= 1: rejects the low values that would
+ * make some remainders more likely than others. */
+static u64 rng_below(u64 bound)
+{
+    const u64 reject = (0 - bound) % bound;
+    u64 r;
+    do r = rng64(); while (r < reject);
+    return r % bound;
+}
+
+/* The splitmix64 finalizer: a fixed, well-mixed bijection on 64 bits. */
+static u64 splitmix64(u64 x)
+{
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+/* Seed for one input stream of one test, derived only from --seed, the test
+ * number, a configuration number and a stream index, so selecting or
+ * reordering tests never changes another test's input.  Never 0, where
+ * xorshift64 would stick. */
+static u64 test_seed(int test, unsigned config, unsigned index)
+{
+    u64 s = splitmix64(base_seed ^ splitmix64((u64)test));
+    s = splitmix64(s ^ config);
+    s = splitmix64(s ^ index);
+    return s ? s : DEFAULT_SEED;
+}
+
+/* Restarts the generator for test n's setup. */
+static void seed_test(int test)
+{
+    rng_state = test_seed(test, 0, 0);
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
@@ -515,6 +874,58 @@ static double cpu_max_ghz(void)
     return (double)khz_max / 1e6;
 }
 
+/* CPU affinity (--cpu).  Set once, before the counters open, so they and
+ * every measurement run on the requested CPU.  A failure is recorded and
+ * reported, never hidden: the run goes on unpinned. */
+enum { AFF_NOT_REQUESTED, AFF_PINNED, AFF_FAILED, AFF_UNSUPPORTED };
+static int affinity_status = AFF_NOT_REQUESTED;
+static int affinity_errno  = 0;
+
+static const char *affinity_error(void)
+{
+    return strerror(affinity_errno);
+}
+
+#if defined(__linux__) && defined(__NR_sched_setaffinity) && defined(__NR_sched_getaffinity)
+/* Pins to cpu_requested through the raw syscalls (glibc's wrappers need
+ * _GNU_SOURCE) and reads the mask back: exactly that CPU must be set. */
+static void pin_to_cpu(void)
+{
+    unsigned long want[(MAX_CPU + 1) / (8 * sizeof(unsigned long))];
+    unsigned long got[sizeof want / sizeof want[0]];
+    const size_t bits = 8 * sizeof want[0];
+    const size_t cpu = (size_t)cpu_requested;
+    memset(want, 0, sizeof want);
+    memset(got, 0, sizeof got);
+    want[cpu / bits] = 1UL << (cpu % bits);
+    affinity_status = AFF_FAILED;
+    if (syscall(__NR_sched_setaffinity, 0, sizeof want, want) != 0 ||
+        syscall(__NR_sched_getaffinity, 0, sizeof got, got) < 0) {
+        affinity_errno = errno;
+        return;
+    }
+    if (memcmp(want, got, sizeof want) != 0) {
+        affinity_errno = EINVAL;
+        return;
+    }
+    affinity_status = AFF_PINNED;
+}
+#else
+static void pin_to_cpu(void)
+{
+    affinity_status = AFF_UNSUPPORTED;
+}
+#endif
+
+static void apply_affinity(void)
+{
+    if (cpu_requested < 0) return;
+    pin_to_cpu();
+    if (affinity_status == AFF_FAILED)
+        fprintf(stderr, "Warning: could not pin to CPU %d (%s); running unpinned.\n",
+                cpu_requested, affinity_error());
+}
+
 /* Report heading: the CPU model, with any "@ <base clock>" it carries
  * replaced by the maximum clock when that is known. */
 static void cpu_heading(char *buf, size_t bufsz)
@@ -527,14 +938,6 @@ static void cpu_heading(char *buf, size_t bufsz)
     size_t len = strlen(buf);
     snprintf(buf + len, bufsz - len, " @ %.2f GHz", ghz);
 }
-
-/* Work done per trial, for the misses-per-item column: elements processed
- * (tests 1/2/4/5, all passes), indirect calls made (test 3) or blocks run
- * (test 6, all passes). */
-typedef struct {
-    u64         count;
-    const char *unit;      /* "elem", "call" or "block" */
-} Work;
 
 typedef struct {
     const char *label;
@@ -597,7 +1000,7 @@ static void report_table(FILE *f, const char *title, const char *desc,
             else
                 fprintf(f, " – |");
         }
-        if (result_has(r, CTR_BRANCHES) && result_has(r, CTR_MISSES) && branches)
+        if (miss_rate_valid(r))
             fprintf(f, " %.1f%% |", 100.0 * (double)misses / (double)branches);
         else
             fprintf(f, " – |");
@@ -624,44 +1027,49 @@ static void print_row(const char *label, const Result *r, const Work *w)
         printf("  %s %*" PRIu64, d->console_label, d->console_width, r->counts[c]);
         if (c == CTR_MISSES) {
             printf("  (");
-            if (result_has(r, CTR_BRANCHES) && branches)
+            if (miss_rate_valid(r))
                 printf("%.1f%%, ", 100.0 * (double)misses / (double)branches);
             printf("%.3f/%s)", misses_per_item(r, w), w->unit);
         }
     }
-    if (perf_available() && !r->counts_valid)
+    if (perf_available() && r->perf_status != PERF_OK)
         printf("  (hardware counts unavailable)");
     printf("\n");
 }
 
-/* Extra cycles per extra miss between a predictable and an unpredictable
- * run of the same work: the effective cost of one misprediction.  Skipped
- * when the counters are missing or the miss difference is too small to
- * give a meaningful ratio. */
-static void print_miss_cost(FILE *report, const Result *predictable,
-                            const Result *unpredictable)
+/* Prints a pair's effective extra cycles per additional miss, or the raw
+ * differences when they are too small to resolve; nothing without cycle
+ * and miss counts. */
+static void print_pair_cost(FILE *report, int pair)
 {
-    if (!result_has(predictable, CTR_CYCLES) || !result_has(predictable, CTR_MISSES) ||
-        !result_has(unpredictable, CTR_CYCLES) || !result_has(unpredictable, CTR_MISSES))
-        return;
-    const u64 pred_misses   = predictable->counts[CTR_MISSES];
-    const u64 unpred_misses = unpredictable->counts[CTR_MISSES];
-    const u64 pred_cycles   = predictable->counts[CTR_CYCLES];
-    const u64 unpred_cycles = unpredictable->counts[CTR_CYCLES];
-    if (unpred_misses < pred_misses + 1000 || unpred_cycles <= pred_cycles)
-        return;
-    double cost = (double)(unpred_cycles - pred_cycles) /
-                  (double)(unpred_misses - pred_misses);
-    printf("  → Cost per miss: %.1f cycles\n", cost);
-    if (report) fprintf(report, "**Cost per miss:** %.1f cycles\n\n", cost);
+    const PairStats s = pair_stats(pair);
+    double cost = 0;
+    const int status = pair_cost(&s, &cost);
+    if (status < 0) return;
+    char text[160];
+    if (status == 0) {
+        snprintf(text, sizeof text,
+                 "inconclusive (Δcycles %+.0f, Δmisses %+.0f over %d valid pair(s))",
+                 s.delta[CTR_CYCLES], s.delta[CTR_MISSES], s.valid);
+    } else {
+        int n = snprintf(text, sizeof text, "%.1f cycles", cost);
+        if (s.valid < s.pairs && n > 0)
+            snprintf(text + n, sizeof text - (size_t)n, " (%d of %d pairs)", s.valid, s.pairs);
+    }
+    pair_info[pair].cost_shown = 1;
+    printf("  → Effective extra cycles per additional miss: %s\n", text);
+    if (report)
+        fprintf(report, "**Effective extra cycles per additional miss:** %s\n\n", text);
 }
 
 /* Emits all console rows and the Markdown table for a test. */
 static void emit_rows(FILE *report, const char *title, const char *desc,
                       const ReportRow *rows, int n, const Work *w)
 {
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < n; i++) {
         print_row(rows[i].label, &rows[i].r, row_work(&rows[i], w));
+        log_variant(i, rows[i].label, row_work(&rows[i], w));
+    }
     report_table(report, title, desc, rows, n, w);
 }
 
@@ -674,6 +1082,15 @@ static void emit_ratio(FILE *report, const char *console_prefix,
     printf("%s%.2f×%s\n", console_prefix, ratio, suffix);
     if (report)
         fprintf(report, "**%s:** %.2f×%s\n\n", md_label, ratio, suffix);
+}
+
+/* emit_ratio() for a pair: its summed b time over its summed a time. */
+static void emit_pair_ratio(FILE *report, const char *console_prefix,
+                            const char *md_label, int pair, const char *suffix)
+{
+    const PairStats s = pair_stats(pair);
+    pair_info[pair].ratio_label = md_label;
+    emit_ratio(report, console_prefix, md_label, s.ms_b, s.ms_a, suffix);
 }
 
 /* For a test that cannot run at this --size/--reps: says why, on the
@@ -696,14 +1113,13 @@ static void list_append(char *buf, size_t bufsz, size_t *len, const char *item)
 }
 
 /* Standard 2-row emission (predictable vs unpredictable): console rows,
- * Markdown table, slowdown ratio, and cost per miss. */
+ * Markdown table, slowdown ratio, and effective cost per additional miss. */
 static void emit_pair_summary(FILE *report, const char *title, const char *desc,
-                              const ReportRow rows[2], const Work *w)
+                              const ReportRow rows[2], const Work *w, int pair)
 {
     emit_rows(report, title, desc, rows, 2, w);
-    emit_ratio(report, "  → Slowdown:  ", "Slowdown",
-               rows[1].r.time_ms, rows[0].r.time_ms, "");
-    print_miss_cost(report, &rows[0].r, &rows[1].r);
+    emit_pair_ratio(report, "  → Slowdown:  ", "Slowdown", pair, "");
+    print_pair_cost(report, pair);
     printf("\n");
 }
 
@@ -724,7 +1140,7 @@ static void fill_random_bytes(u8 *arr, size_t n)
 static void shuffle_u8(u8 *arr, size_t n)
 {
     for (size_t i = n - 1; i > 0; --i) {
-        size_t j = rng64() % (i + 1);
+        size_t j = (size_t)rng_below((u64)i + 1);
         u8 tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
     }
 }
@@ -758,6 +1174,7 @@ static u64 sum_threshold(const u8 *arr, size_t n, unsigned n_reps)
 
 static void run_test1(FILE *report)
 {
+    seed_test(1);
     /* Read once, so the allocation and every loop provably use the same length. */
     const size_t len = size;
     u8 *sorted   = malloc(len);
@@ -777,8 +1194,9 @@ static void run_test1(FILE *report)
 
     Result rs = {0};
     Result rr = {0};
-    MEASURE(rs, sum_threshold(sorted, len, reps));
-    MEASURE(rr, sum_threshold(shuffled, len, reps));
+    int pair;
+    MEASURE_PAIR(rs, 0, sum_threshold(sorted, len, reps),
+                 rr, 1, sum_threshold(shuffled, len, reps), pair);
 
     anti_dce_sink(rs.result + rr.result);
 
@@ -791,7 +1209,7 @@ static void run_test1(FILE *report)
     };
     emit_pair_summary(report, "Test 1 — Threshold Sum",
                       "Sorted vs shuffled array, same direct branch. Identical data, different order.",
-                      rows, &work);
+                      rows, &work, pair);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -824,6 +1242,7 @@ static u64 count_decisions(const u8 *decisions, size_t n, unsigned n_reps)
 
 static void run_test2(FILE *report)
 {
+    seed_test(2);
     const size_t len = size;
     /* Pre-generated branch decision arrays (avoids RNG in hot loop) */
     u8 *decisions_periodic = malloc(len);  /* 1 at every 4th position        */
@@ -832,7 +1251,7 @@ static void run_test2(FILE *report)
 
     for (size_t i = 0; i < len; i++) {
         decisions_periodic[i] = ((i & 3) == 0) ? 1 : 0;
-        decisions_random[i] = (((rng64() >> 32) % 4) == 0) ? 1 : 0;
+        decisions_random[i] = rng_below(4) == 0 ? 1 : 0;
     }
 
     printf("TEST 2 — Stride Conditional  (periodic vs random 25%%, %zu×%u reps)\n",
@@ -841,8 +1260,9 @@ static void run_test2(FILE *report)
 
     Result rp = {0};
     Result rr = {0};
-    MEASURE(rp, count_decisions(decisions_periodic, len, reps));
-    MEASURE(rr, count_decisions(decisions_random, len, reps));
+    int pair;
+    MEASURE_PAIR(rp, 0, count_decisions(decisions_periodic, len, reps),
+                 rr, 1, count_decisions(decisions_random, len, reps), pair);
 
     anti_dce_sink(rp.result + rr.result);
 
@@ -856,7 +1276,7 @@ static void run_test2(FILE *report)
     };
     emit_pair_summary(report, "Test 2 — Stride Conditional",
                       "Both arrays have ~25% ones; only the pattern differs.",
-                      rows, &work);
+                      rows, &work, pair);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -925,12 +1345,13 @@ static u64 dispatch_random(const u8 *idx, size_t n)
 
 static void run_test3(FILE *report)
 {
+    seed_test(3);
     const size_t len = size;
     /* Pre-built random index sequence (uint8_t → 1 byte/call → cache-friendly) */
     u8 *dispatch_indices = malloc(len);
     if (!dispatch_indices) { perror("malloc"); exit(1); }
     for (size_t i = 0; i < len; i++)
-        dispatch_indices[i] = (u8)((rng64() >> 32) % NUM_FUNCS);
+        dispatch_indices[i] = (u8)rng_below(NUM_FUNCS);
 
     if (len % (1u << 20) == 0)
         printf("TEST 3 — Indirect Dispatch  (%u targets, %zuM calls)\n",
@@ -942,8 +1363,9 @@ static void run_test3(FILE *report)
 
     Result rs = {0};
     Result rr = {0};
-    MEASURE(rs, dispatch_sequential(len));
-    MEASURE(rr, dispatch_random(dispatch_indices, len));
+    int pair;
+    MEASURE_PAIR(rs, 0, dispatch_sequential(len),
+                 rr, 1, dispatch_random(dispatch_indices, len), pair);
 
     anti_dce_sink(rs.result + rr.result);
 
@@ -956,7 +1378,7 @@ static void run_test3(FILE *report)
     };
     emit_pair_summary(report, "Test 3 — Indirect Dispatch",
                       "32 targets, function-pointer call. The indirect predictor must guess the target address.",
-                      rows, &work);
+                      rows, &work, pair);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1017,6 +1439,7 @@ static u64 sum_branchless(const u8 *arr, size_t n, unsigned n_reps)
 
 static void run_test4(FILE *report)
 {
+    seed_test(4);
     const size_t len = size;
     u8 *sorted   = malloc(len);
     u8 *random_d = malloc(len);
@@ -1034,10 +1457,12 @@ static void run_test4(FILE *report)
     Result r_sl = {0};
     Result r_rb = {0};
     Result r_rl = {0};
-    MEASURE(r_sb, sum_branch(sorted, len, reps));
-    MEASURE(r_sl, sum_branchless(sorted, len, reps));
-    MEASURE(r_rb, sum_branch(random_d, len, reps));
-    MEASURE(r_rl, sum_branchless(random_d, len, reps));
+    int pair_branch;
+    int pair_branchless;
+    MEASURE_PAIR(r_sb, 0, sum_branch(sorted, len, reps),
+                 r_rb, 2, sum_branch(random_d, len, reps), pair_branch);
+    MEASURE_PAIR(r_sl, 1, sum_branchless(sorted, len, reps),
+                 r_rl, 3, sum_branchless(random_d, len, reps), pair_branchless);
 
     free(sorted); free(random_d);
 
@@ -1059,13 +1484,11 @@ static void run_test4(FILE *report)
     emit_rows(report, "Test 4 — Branch vs Branchless",
               "Same sum, computed via conditional jump vs. arithmetic mask, on sorted and random data.",
               rows, 4, &work);
-    emit_ratio(report, "\n  Branch penalty on random data:  ",
-               "Branch penalty on random data", r_rb.time_ms, r_sb.time_ms,
-               " vs sorted-branch");
-    emit_ratio(report, "  Branchless is consistent:       ",
-               "Branchless is consistent", r_rl.time_ms, r_sl.time_ms,
-               " random vs sorted");
-    print_miss_cost(report, &r_sb, &r_rb);
+    emit_pair_ratio(report, "\n  Branch penalty on random data:  ",
+                    "Branch penalty on random data", pair_branch, " vs sorted-branch");
+    emit_pair_ratio(report, "  Branchless is consistent:       ",
+                    "Branchless is consistent", pair_branchless, " random vs sorted");
+    print_pair_cost(report, pair_branch);
     printf("\n");
 }
 
@@ -1162,23 +1585,31 @@ static int test5_size_ok(size_t len)
     return len % DB_MAX_PERIOD == 0;
 }
 
-/* Measures count_decisions() on each de Bruijn pattern tiled over buf, then
- * on random bits.  Returns 0, measuring nothing more, if a pattern fails its
- * check. */
-static int measure_patterns(u8 *buf, size_t len, ReportRow rows[DB_ORDERS + 1])
+/* Measures count_decisions() on each de Bruijn pattern tiled over buf and
+ * on random bits in rand_buf.  The shortest and longest periods are each
+ * paired with the random row (pairs[0] and pairs[1]); the others run
+ * alone.  Returns 0, measuring nothing more, if a pattern fails its check. */
+static int measure_patterns(u8 *buf, u8 *rand_buf, size_t len,
+                            ReportRow rows[DB_ORDERS + 1], int pairs[2])
 {
     u8 pattern[DB_MAX_PERIOD];
+    ReportRow *random_row = &rows[DB_ORDERS];
+    fill_random_bits(rand_buf, len, test_seed(5, 0, 0));
     for (unsigned k = DB_MIN_ORDER; k <= DB_MAX_ORDER; k++) {
         const size_t mask = ((size_t)1 << k) - 1;
+        const int v = (int)(k - DB_MIN_ORDER);
         if (!debruijn_prefer_one(k, pattern) || !debruijn_valid(pattern, k)) {
             fprintf(stderr, "  ERROR: de Bruijn sequence of order %u is invalid!\n", k);
             return 0;
         }
         for (size_t i = 0; i < len; i++) buf[i] = pattern[i & mask];
-        MEASURE(rows[k - DB_MIN_ORDER].r, count_decisions(buf, len, reps));
+        if (k == DB_MIN_ORDER || k == DB_MAX_ORDER)
+            MEASURE_PAIR(rows[v].r, v, count_decisions(buf, len, reps),
+                         random_row->r, DB_ORDERS, count_decisions(rand_buf, len, reps),
+                         pairs[k == DB_MAX_ORDER]);
+        else
+            MEASURE(rows[v].r, v, count_decisions(buf, len, reps));
     }
-    fill_random_bits(buf, len, DB_RANDOM_SEED);
-    MEASURE(rows[DB_ORDERS].r, count_decisions(buf, len, reps));
     return 1;
 }
 
@@ -1206,7 +1637,7 @@ static void print_low_miss_periods(FILE *report, const ReportRow *rows, const Wo
  * random row repeats so often that a predictor may learn it, so a note
  * replaces them. */
 static void print_test5_summary(FILE *report, const ReportRow *rows,
-                                const Work *w, size_t len)
+                                const Work *w, size_t len, const int pairs[2])
 {
     if (len < DB_MIN_SAMPLE) {
         printf("\n  → n/a: --size below %d, so a predictor may learn the random row\n",
@@ -1216,19 +1647,17 @@ static void print_test5_summary(FILE *report, const ReportRow *rows,
                             "random row; summary omitted._\n\n", DB_MIN_SAMPLE);
         return;
     }
-    const Result *shortest = &rows[0].r;
-    const Result *longest  = &rows[DB_ORDERS - 1].r;
-    const Result *random_row = &rows[DB_ORDERS].r;
-    emit_ratio(report, "\n  Random vs period 32:    ", "Random vs period 32",
-               random_row->time_ms, shortest->time_ms, "");
-    emit_ratio(report, "  Random vs period 2048:  ", "Random vs period 2048",
-               random_row->time_ms, longest->time_ms, "");
-    print_miss_cost(report, shortest, random_row);
+    emit_pair_ratio(report, "\n  Random vs period 32:    ", "Random vs period 32",
+                    pairs[0], "");
+    emit_pair_ratio(report, "  Random vs period 2048:  ", "Random vs period 2048",
+                    pairs[1], "");
+    print_pair_cost(report, pairs[0]);
     print_low_miss_periods(report, rows, w);
 }
 
 static void run_test5(FILE *report)
 {
+    seed_test(5);
     const size_t len = size;
     printf("TEST 5 — Pattern Learnability  (de Bruijn k=%d..%d vs random 50%%, %zu×%u reps)\n",
            DB_MIN_ORDER, DB_MAX_ORDER, len, reps);
@@ -1243,7 +1672,8 @@ static void run_test5(FILE *report)
     }
 
     u8 *buf = malloc(len);
-    if (!buf) { perror("malloc"); exit(1); }
+    u8 *rand_buf = malloc(len);
+    if (!buf || !rand_buf) { perror("malloc"); exit(1); }
     const Result none = {0};
     ReportRow rows[DB_ORDERS + 1];
     for (int i = 0; i <= DB_ORDERS; i++) {
@@ -1251,8 +1681,10 @@ static void run_test5(FILE *report)
         rows[i].r     = none;
         rows[i].work  = NULL;
     }
-    const int ok = measure_patterns(buf, len, rows);
+    int pairs[2] = { -1, -1 };
+    const int ok = measure_patterns(buf, rand_buf, len, rows, pairs);
     free(buf);
+    free(rand_buf);
     if (!ok) {
         sanity_failed = 1;
         return;
@@ -1263,7 +1695,7 @@ static void run_test5(FILE *report)
 
     const Work work = { (u64)len * reps, "elem" };
     emit_rows(report, DB_TITLE, DB_DESC, rows, DB_ORDERS + 1, &work);
-    print_test5_summary(report, rows, &work, len);
+    print_test5_summary(report, rows, &work, len, pairs);
     printf("\n");
 }
 
@@ -1333,13 +1765,15 @@ typedef struct {
     size_t   blocks;     /* per pass */
     unsigned passes;
     Work     work;       /* blocks × passes, unit "block" */
+    int      pair;       /* pair_info[] index of its two rows */
 } D6Point;
 
-/* Misses the correlated row avoided, as a percentage of the 0.5 misses per
- * block that a random B costs; clamped to 0–100%.  Needs both miss counts. */
-static double correlation_used_pct(const Result *corr, const Result *ref, u64 blocks_run)
+/* Misses the correlated row avoided per valid pair, as a percentage of the
+ * 0.5 misses per block that a random B costs; clamped to 0–100%.  Needs
+ * s->valid and the miss counter. */
+static double correlation_used_pct(const PairStats *s, u64 blocks_run)
 {
-    const double avoided = (double)ref->counts[CTR_MISSES] - (double)corr->counts[CTR_MISSES];
+    const double avoided = s->delta[CTR_MISSES] / (double)s->valid;
     const double pct = 100.0 * avoided / (0.5 * (double)blocks_run);
     if (pct < 0) return 0;
     if (pct > 100) return 100;
@@ -1349,7 +1783,7 @@ static double correlation_used_pct(const Result *corr, const Result *ref, u64 bl
 /* Measures each distance's correlated row (B a copy of A) and reference row
  * (B random), recording each distance's layout in pts[] and pointing both
  * of its rows at that work. */
-static void measure_distances(const u8 *a, u8 *b, size_t len, u64 total,
+static void measure_distances(const u8 *a, u8 *b_corr, u8 *b_ref, size_t len, u64 total,
                               ReportRow rows[2 * D6_DISTS], D6Point pts[D6_DISTS])
 {
     u8 fill[D6_MAX_DIST];
@@ -1364,10 +1798,11 @@ static void measure_distances(const u8 *a, u8 *b, size_t len, u64 total,
         rows[2 * i + 1].work = &pt->work;
         const size_t blocks = pt->blocks;
         const unsigned passes = pt->passes;
-        memcpy(b, a, blocks);
-        MEASURE(rows[2 * i].r, correlate_distance(a, b, fill, blocks, d, passes));
-        fill_random_bits(b, blocks, D6_SEED_B);
-        MEASURE(rows[2 * i + 1].r, correlate_distance(a, b, fill, blocks, d, passes));
+        memcpy(b_corr, a, blocks);
+        fill_random_bits(b_ref, blocks, test_seed(6, 0, 1));
+        MEASURE_PAIR(rows[2 * i].r, 2 * i, correlate_distance(a, b_corr, fill, blocks, d, passes),
+                     rows[2 * i + 1].r, 2 * i + 1,
+                     correlate_distance(a, b_ref, fill, blocks, d, passes), pt->pair);
     }
 }
 
@@ -1377,27 +1812,32 @@ static void measure_distances(const u8 *a, u8 *b, size_t len, u64 total,
  * fewer than D6_MIN_SAMPLE blocks per pass shows n/a: its random sequences
  * repeat so often that a predictor may learn them, which would make B
  * predictable without A. */
-static void print_correlation_used(FILE *report, const ReportRow *rows,
-                                   const D6Point *pts)
+static void print_correlation_used(FILE *report, const D6Point *pts)
 {
     char list[256] = "";
     size_t used = 0;
     unsigned best = 0;
     int evaluated = 0;
+    int counted = 0;   /* distances whose pair has valid miss counts */
+    int short_na = 0;  /* distances n/a because their sample is too short */
     for (int i = 0; i < D6_DISTS; i++) {
         const unsigned d = (unsigned)D6_MIN_DIST << i;
         char entry[32];
-        if (pts[i].blocks < D6_MIN_SAMPLE) {
+        const PairStats s = pair_stats(pts[i].pair);
+        const int has_misses = s.valid && ((s.open_mask >> CTR_MISSES) & 1u);
+        counted += has_misses;
+        if (!has_misses || pts[i].blocks < D6_MIN_SAMPLE) {
+            short_na += has_misses;
             snprintf(entry, sizeof entry, "d=%u n/a", d);
         } else {
-            const double pct = correlation_used_pct(&rows[2 * i].r, &rows[2 * i + 1].r,
-                                                    pts[i].work.count);
+            const double pct = correlation_used_pct(&s, pts[i].work.count);
             snprintf(entry, sizeof entry, "d=%u %.0f%%", d, pct);
             evaluated++;
             if (pct >= 90.0) best = d;
         }
         list_append(list, sizeof list, &used, entry);
     }
+    if (!counted) return;   /* no miss counts at all: no summary */
     char best_d[16];
     snprintf(best_d, sizeof best_d, "%u", best);
     const char *shown = "n/a";
@@ -1406,7 +1846,7 @@ static void print_correlation_used(FILE *report, const ReportRow *rows,
     if (report)
         fprintf(report, "**Correlation used:** %s\n\n**Largest d with ≥ 90%%:** %s\n\n",
                 list, shown);
-    if (evaluated < D6_DISTS) {
+    if (short_na) {
         printf("  → n/a: fewer than %d blocks per pass, so a predictor may learn the sequences\n",
                D6_MIN_SAMPLE);
         if (report)
@@ -1415,20 +1855,21 @@ static void print_correlation_used(FILE *report, const ReportRow *rows,
     }
 }
 
-/* Test 6's summary lines: cost per miss from the d = 4 pair (same work,
- * only B's predictability differs) when its sample is long enough, and the
- * correlation used per distance; both need the miss counter on every row. */
-static void print_test6_summary(FILE *report, const ReportRow *rows, const D6Point *pts)
+/* Test 6's summary lines: the effective cost per additional miss from the
+ * d = 4 pair (same work, only B's predictability differs) when its sample
+ * is long enough, and the correlation used per distance.  Each pair decides
+ * from its own trials whether it has usable counts, so one failed median
+ * row cannot hide the other distances. */
+static void print_test6_summary(FILE *report, const D6Point *pts)
 {
-    for (int i = 0; i < 2 * D6_DISTS; i++)
-        if (!result_has(&rows[i].r, CTR_MISSES)) return;
     if (pts[0].blocks >= D6_MIN_SAMPLE)
-        print_miss_cost(report, &rows[0].r, &rows[1].r);
-    print_correlation_used(report, rows, pts);
+        print_pair_cost(report, pts[0].pair);
+    print_correlation_used(report, pts);
 }
 
 static void run_test6(FILE *report)
 {
+    seed_test(6);
     const size_t len = size;
     const unsigned r = reps;
     printf("TEST 6 — Correlation Distance  (d=%d..%d, budget %zu×%u branches per row)\n",
@@ -1444,9 +1885,10 @@ static void run_test6(FILE *report)
     }
 
     u8 *a = malloc(len);
-    u8 *b = malloc(len);
-    if (!a || !b) { perror("malloc"); exit(1); }
-    fill_random_bits(a, len, D6_SEED_A);
+    u8 *b_corr = malloc(len);
+    u8 *b_ref = malloc(len);
+    if (!a || !b_corr || !b_ref) { perror("malloc"); exit(1); }
+    fill_random_bits(a, len, test_seed(6, 0, 0));
     const Result none = {0};
     ReportRow rows[2 * D6_DISTS];
     D6Point pts[D6_DISTS];
@@ -1455,16 +1897,408 @@ static void run_test6(FILE *report)
         rows[i].r     = none;
         rows[i].work  = NULL;   /* set by measure_distances() */
     }
-    measure_distances(a, b, len, (u64)len * r, rows, pts);
+    measure_distances(a, b_corr, b_ref, len, (u64)len * r, rows, pts);
     free(a);
-    free(b);
+    free(b_corr);
+    free(b_ref);
     u64 sink = 0;
     for (int i = 0; i < 2 * D6_DISTS; i++) sink += rows[i].r.result;
     anti_dce_sink(sink);
 
     emit_rows(report, D6_TITLE, D6_DESC, rows, 2 * D6_DISTS, &pts[0].work);
-    print_test6_summary(report, rows, pts);
+    print_test6_summary(report, pts);
     printf("\n");
+}
+
+static int test_selected(int n)
+{
+    return ((tests_selected ? tests_selected : DEFAULT_TESTS) >> (n - 1)) & 1u;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * JSON Lines export (--json), schema 1
+ *
+ * One object per line: a meta record, then the kernel, variant, trial and
+ * pair records.  Written after all tests from the measurement log, so every
+ * summary in it (and in the report) can be rebuilt from its trials;
+ * .github/scripts/check_export.py does exactly that.  u64 values are bare
+ * integers, doubles use %.17g, and anything absent is null.
+ * ───────────────────────────────────────────────────────────────────────── */
+#define JSON_SCHEMA 1
+
+/* What each kernel's code is declared to contain.  check_kernels.sh
+ * --counts measures the same fields from the binary; -1 is "not declared".
+ * No function pointers here: taking a kernel's address stops GCC folding
+ * sum_branch into sum_threshold, which moves the kernels.  Entry
+ * addresses therefore come from the binary (check_kernels.sh), and the
+ * export's "entry" is null. */
+typedef struct {
+    const char *id;
+    int         revision;
+    const char *backend;
+    const char *unit;
+    int         data_branches;
+    int         indirect_calls;
+    int         inner_loop_branches;
+    const char *tests;
+} KernelDesc;
+
+#define KERNEL(fn) #fn, 1, "c"
+static const KernelDesc kernel_descs[] = {
+    { KERNEL(sum_threshold),       "elem",  1, 0,  2, "1"   },
+    { KERNEL(sum_branch),          "elem",  1, 0,  2, "4"   },
+    { KERNEL(sum_branchless),      "elem",  0, 0,  1, "4"   },
+    { KERNEL(count_decisions),     "elem",  1, 0,  2, "2,5" },
+    { KERNEL(dispatch_sequential), "call",  0, 1,  2, "3"   },
+    { KERNEL(dispatch_random),     "call",  0, 1,  2, "3"   },
+    { KERNEL(correlate_distance),  "block", 3, 0,  2, "6"   },
+};
+#undef KERNEL
+
+/* Writes s as a JSON string, escaping quotes, backslashes and control
+ * bytes; other bytes (UTF-8) pass through. */
+static void json_string(FILE *f, const char *s)
+{
+    fputc('"', f);
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p == '"' || *p == '\\') fprintf(f, "\\%c", *p);
+        else if (*p == '\n') fputs("\\n", f);
+        else if (*p == '\t') fputs("\\t", f);
+        else if (*p < 0x20) fprintf(f, "\\u%04x", *p);
+        else fputc(*p, f);
+    }
+    fputc('"', f);
+}
+
+static void json_string_or_null(FILE *f, const char *s)
+{
+    if (s && *s) json_string(f, s);
+    else fputs("null", f);
+}
+
+/* A double, or null where JSON has no number (inf, nan) or none applies. */
+static void json_double(FILE *f, int has, double v)
+{
+    if (has && isfinite(v)) fprintf(f, "%.17g", v);
+    else fputs("null", f);
+}
+
+static void json_int(FILE *f, int has, long long v)
+{
+    if (has) fprintf(f, "%lld", v);
+    else fputs("null", f);
+}
+
+/* 1 if two open files are the same file (equal paths, hard links, "a" vs
+ * "./a"), 0 if not, -1 if either cannot be examined. */
+static int same_open_file(FILE *a, FILE *b)
+{
+    struct stat sa;
+    struct stat sb;
+    if (fstat(fileno(a), &sa) != 0 || fstat(fileno(b), &sb) != 0) return -1;
+    return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+}
+
+/* First line of a text file, without its newline; 0 if unreadable or empty. */
+static int sysfs_line(const char *path, char *buf, size_t n)
+{
+    char line[256];
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    const int ok = fgets(line, sizeof line, f) != NULL;
+    fclose(f);
+    if (!ok) return 0;
+    const int len = (int)strcspn(line, "\r\n");
+    snprintf(buf, n, "%.*s", len, line);
+    return len > 0;
+}
+
+/* Value of the first /proc/cpuinfo line whose key is exactly `key`. */
+static int cpuinfo_value(const char *key, char *buf, size_t n)
+{
+    int found = 0;
+#ifdef __linux__
+    FILE *f = fopen("/proc/cpuinfo", "r");
+    if (!f) return 0;
+    char line[4096];   /* x86 flags lines pass 1 KB on recent CPUs */
+    const size_t klen = strlen(key);
+    while (fgets(line, sizeof line, f)) {
+        const char *colon = strchr(line, ':');
+        if (!colon || strncmp(line, key, klen) != 0 ||
+            strspn(line + klen, " \t") != (size_t)(colon - line) - klen)
+            continue;
+        const char *v = colon + 1 + strspn(colon + 1, " \t");
+        const int len = (int)strcspn(v, "\r\n");
+        if (len > 0) {
+            snprintf(buf, n, "%.*s", len, v);
+            found = 1;
+            break;
+        }
+    }
+    fclose(f);
+#else
+    (void)key; (void)buf; (void)n;
+#endif
+    return found;
+}
+
+/* 1 or 0 if /proc/cpuinfo's flags list has `flag`, -1 without a flags line. */
+static int cpuinfo_has_flag(const char *flag)
+{
+    char flags[4096];
+    if (!cpuinfo_value("flags", flags, sizeof flags)) return -1;
+    const size_t len = strlen(flag);
+    const char *p = flags + strspn(flags, " ");
+    while (*p) {
+        const size_t word = strcspn(p, " ");
+        if (word == len && strncmp(p, flag, len) == 0) return 1;
+        p += word;
+        p += strspn(p, " ");
+    }
+    return 0;
+}
+
+static void write_counters_meta(FILE *f)
+{
+    fputs(",\"counters\":[", f);
+    for (int c = 0; c < CTR_COUNT; c++) {
+        const int open = (int)((perf_mask() >> c) & 1u);
+        const int raw  = (int)((perf_raw_mask >> c) & 1u);
+        const CounterDesc *d = &counter_descs[c];
+        fprintf(f, "%s{\"name\":", c ? "," : "");
+        json_string(f, d->console_label);
+        const char *type = raw ? "raw" : "hardware";
+        fprintf(f, ",\"open\":%s,\"type\":", open ? "true" : "false");
+        json_string_or_null(f, open ? type : NULL);
+        fputs(",\"config\":", f);
+        json_int(f, open, (long long)(raw ? d->arm_raw : d->generic));
+        fputs(",\"semantics\":", f);
+        json_string_or_null(f, open ? semantics_name(counter_semantics(c, raw, host_arch())) : NULL);
+        fputs(",\"exclude_kernel\":true,\"exclude_hv\":true}", f);
+    }
+    fputs("]", f);
+}
+
+static void write_tests_meta(FILE *f)
+{
+    fputs(",\"test_seeds\":{", f);
+    int first = 1;
+    for (int n = 1; n <= NUM_TESTS; n++) {
+        if (!test_selected(n)) continue;
+        fprintf(f, "%s\"%d\":%" PRIu64, first ? "" : ",", n, test_seed(n, 0, 0));
+        first = 0;
+    }
+    fputs("},\"tests\":[", f);
+    first = 1;
+    for (int n = 1; n <= NUM_TESTS; n++) {
+        if (!test_selected(n)) continue;
+        fprintf(f, "%s%d", first ? "" : ",", n);
+        first = 0;
+    }
+    fputs("]", f);
+}
+
+static void write_affinity_meta(FILE *f)
+{
+    static const char *const status[] = { "not_requested", "pinned", "failed", "unsupported" };
+    fputs(",\"affinity\":{\"requested\":", f);
+    json_int(f, cpu_requested >= 0, cpu_requested);
+    fprintf(f, ",\"status\":\"%s\",\"error\":", status[affinity_status]);
+    json_string_or_null(f, affinity_status == AFF_FAILED ? affinity_error() : NULL);
+    fputs("}", f);
+}
+
+/* ,"key":"<first line of /sys/devices/system/cpu/cpu<cpu>/<leaf>>" or null. */
+static void json_cpu_sysfs(FILE *f, const char *key, int cpu, const char *leaf)
+{
+    char path[128];
+    char buf[256];
+    snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/%s", cpu, leaf);
+    fprintf(f, ",\"%s\":", key);
+    json_string_or_null(f, sysfs_line(path, buf, sizeof buf) ? buf : NULL);
+}
+
+/* SMT siblings and governor of metadata_cpu (the pinned CPU, else CPU 0);
+ * the hypervisor flag from /proc/cpuinfo's first flags line; max_ghz and
+ * the effective rate are machine- and run-wide. */
+static void write_system_meta(FILE *f)
+{
+    const int cpu = affinity_status == AFF_PINNED ? cpu_requested : 0;
+    fprintf(f, ",\"metadata_cpu\":%d,\"hypervisor\":", cpu);
+    const int hv = cpuinfo_has_flag("hypervisor");
+    if (hv < 0) fputs("null", f);
+    else fputs(hv ? "true" : "false", f);
+    json_cpu_sysfs(f, "smt_siblings", cpu, "topology/thread_siblings_list");
+    json_cpu_sysfs(f, "governor", cpu, "cpufreq/scaling_governor");
+    const double max_ghz = cpu_max_ghz();
+    const double eff_ghz = measured_ghz();
+    fputs(",\"max_ghz\":", f);
+    json_double(f, max_ghz > 0, max_ghz);
+    fputs(",\"effective_user_cycle_ghz\":", f);
+    json_double(f, eff_ghz > 0, eff_ghz);
+}
+
+static void write_meta(FILE *f)
+{
+    char cpu[192];
+    char microcode[64];
+    char kernel[160];
+    struct utsname u;
+    const int have_uname = uname(&u) == 0;
+    get_cpu_model(cpu, sizeof cpu);
+    if (have_uname) snprintf(kernel, sizeof kernel, "%s %s", u.sysname, u.release);
+    fprintf(f, "{\"type\":\"meta\",\"schema\":%d,\"revision\":%d,\"cpu\":", JSON_SCHEMA, BENCH_REVISION);
+    json_string(f, cpu);
+    fputs(",\"microcode\":", f);
+    json_string_or_null(f, cpuinfo_value("microcode", microcode, sizeof microcode) ? microcode : NULL);
+    fputs(",\"arch\":", f);
+    json_string_or_null(f, have_uname ? u.machine : NULL);
+    fputs(",\"kernel\":", f);
+    json_string_or_null(f, have_uname ? kernel : NULL);
+    fputs(",\"compiler\":", f);
+    json_string(f, COMPILER_VERSION);
+    fputs(",\"build_flags\":", f);
+    json_string_or_null(f, BUILD_FLAGS);
+    fputs(",\"commit\":", f);
+    json_string_or_null(f, BUILD_COMMIT);
+    fprintf(f, ",\"alignment_policy\":\"%s\",\"seed\":%" PRIu64,
+            strstr(BUILD_FLAGS, "mbranches-within-32B-boundaries") ? "jcc-32B" : "undeclared",
+            base_seed);
+    write_tests_meta(f);
+    fprintf(f, ",\"size\":%zu,\"reps\":%u,\"trials\":%d,\"training_runs\":%d,"
+               "\"schedule\":\"AB/BA\"", size, reps, trial_count(), TRAIN_RUNS);
+    write_affinity_meta(f);
+    write_system_meta(f);
+    write_counters_meta(f);
+    fputs("}\n", f);
+}
+
+static void write_kernels(FILE *f)
+{
+    for (size_t i = 0; i < sizeof kernel_descs / sizeof kernel_descs[0]; i++) {
+        const KernelDesc *k = &kernel_descs[i];
+        fputs("{\"type\":\"kernel\",\"id\":", f);
+        json_string(f, k->id);
+        fprintf(f, ",\"revision\":%d,\"backend\":", k->revision);
+        json_string(f, k->backend);
+        fputs(",\"entry\":null,\"unit\":", f);
+        json_string(f, k->unit);
+        fputs(",\"data_branches\":", f);
+        json_int(f, k->data_branches >= 0, k->data_branches);
+        fputs(",\"indirect_calls\":", f);
+        json_int(f, k->indirect_calls >= 0, k->indirect_calls);
+        fputs(",\"inner_loop_branches\":", f);
+        json_int(f, k->inner_loop_branches >= 0, k->inner_loop_branches);
+        fputs(",\"tests\":", f);
+        json_string(f, k->tests);
+        fputs("}\n", f);
+    }
+}
+
+/* Kernel name of a variant: its first trial's call text up to "(". */
+static void variant_kernel(int test, int variant, char *buf, size_t n)
+{
+    buf[0] = '\0';
+    for (int i = 0; i < trial_log_len; i++) {
+        if (trial_log[i].test != test || trial_log[i].variant != variant) continue;
+        snprintf(buf, n, "%.*s", (int)strcspn(trial_log[i].call, "("), trial_log[i].call);
+        return;
+    }
+}
+
+/* Copies s into out (at most cap - 1 bytes) with runs of spaces collapsed,
+ * as fputs_collapsed() writes labels to the Markdown report. */
+static void collapse_spaces(const char *s, char *out, size_t cap)
+{
+    size_t n = 0;
+    const char *p = s;
+    while (*p && n + 1 < cap) {
+        if (!(p[0] == ' ' && p[1] == ' ')) out[n++] = *p;
+        p++;
+    }
+    out[n] = '\0';
+}
+
+static void write_variants(FILE *f)
+{
+    for (int i = 0; i < variant_count; i++) {
+        const VariantInfo *v = &variant_info[i];
+        char label[128];
+        char kernel[64];
+        collapse_spaces(v->label, label, sizeof label);
+        variant_kernel(v->test, v->variant, kernel, sizeof kernel);
+        fprintf(f, "{\"type\":\"variant\",\"test\":%d,\"variant\":%d,\"label\":", v->test, v->variant);
+        json_string(f, label);
+        fputs(",\"kernel\":", f);
+        json_string_or_null(f, kernel);
+        fprintf(f, ",\"work\":%" PRIu64 ",\"unit\":", v->work.count);
+        json_string(f, v->work.unit);
+        fputs("}\n", f);
+    }
+}
+
+/* {"branches":…,"misses":…,"cycles":…} from a trial's counts or raw counts. */
+static void write_counts(FILE *f, const Result *r, const u64 *v)
+{
+    fputc('{', f);
+    for (int c = 0; c < CTR_COUNT; c++) {
+        fprintf(f, "%s\"%s\":", c ? "," : "", counter_descs[c].console_label);
+        if (result_has(r, c)) fprintf(f, "%" PRIu64, v[c]);
+        else fputs("null", f);
+    }
+    fputc('}', f);
+}
+
+static void write_trials(FILE *f)
+{
+    for (int i = 0; i < trial_log_len; i++) {
+        const TrialRecord *t = &trial_log[i];
+        fprintf(f, "{\"type\":\"trial\",\"test\":%d,\"variant\":%d,\"pair\":", t->test, t->variant);
+        json_int(f, t->pair >= 0, t->pair);
+        fprintf(f, ",\"seq\":%d,\"trial\":%d,\"train_runs\":%d,\"time_ms\":%.17g,"
+                   "\"result\":%" PRIu64 ",\"perf_status\":\"%s\",\"enabled_ns\":%" PRIu64
+                   ",\"running_ns\":%" PRIu64 ",\"counts\":",
+                t->seq, t->trial, TRAIN_RUNS, t->r.time_ms, t->r.result,
+                perf_status_name(t->r.perf_status), t->r.enabled_ns, t->r.running_ns);
+        write_counts(f, &t->r, t->r.counts);
+        fputs(",\"raw_counts\":", f);
+        write_counts(f, &t->r, t->r.raw_counts);
+        fputs("}\n", f);
+    }
+}
+
+static void write_pairs(FILE *f)
+{
+    static const char *const cost_status[] = { "unavailable", "inconclusive", "resolved" };
+    for (int p = 0; p < pair_count; p++) {
+        const PairInfo *pi = &pair_info[p];
+        const PairStats s = pair_stats(p);
+        double cost = 0;
+        const int status = pair_cost(&s, &cost);
+        fprintf(f, "{\"type\":\"pair\",\"test\":%d,\"pair\":%d,\"a\":%d,\"b\":%d,"
+                   "\"pairs\":%d,\"valid\":%d,\"time_ms_a\":%.17g,\"time_ms_b\":%.17g,"
+                   "\"slowdown\":", pi->test, p, pi->a, pi->b, s.pairs, s.valid, s.ms_a, s.ms_b);
+        json_double(f, 1, s.ms_b / s.ms_a);
+        fputs(",\"delta\":{", f);
+        for (int c = 0; c < CTR_COUNT; c++) {
+            fprintf(f, "%s\"%s\":", c ? "," : "", counter_descs[c].console_label);
+            json_double(f, (int)((s.open_mask >> c) & 1u), s.delta[c]);
+        }
+        fputs("},\"effective_cost\":", f);
+        json_double(f, status > 0, cost);
+        fprintf(f, ",\"cost_status\":\"%s\",\"ratio_label\":", cost_status[status + 1]);
+        json_string_or_null(f, pi->ratio_label);
+        fprintf(f, ",\"cost_shown\":%s}\n", pi->cost_shown ? "true" : "false");
+    }
+}
+
+static void write_export(FILE *f)
+{
+    write_meta(f);
+    write_kernels(f);
+    write_variants(f);
+    write_trials(f);
+    write_pairs(f);
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
@@ -1516,14 +2350,33 @@ static int parse_count(const char *s, const char *what,
     return 1;
 }
 
+/* Parses a 64-bit seed: decimal, or hex after "0x".  A leading zero is
+ * still decimal (strtoull's base 0 would read "010" as octal 8).  Prints an
+ * error and returns 0 if invalid. */
+static int parse_seed(const char *s, u64 *out)
+{
+    const int hex = s[0] == '0' && (s[1] == 'x' || s[1] == 'X');
+    const char *digits = hex ? s + 2 : s;
+    const char *allowed = hex ? "0123456789abcdefABCDEF" : "0123456789";
+    const size_t len = strlen(digits);
+    errno = 0;
+    const unsigned long long v = strtoull(digits, NULL, hex ? 16 : 10);
+    if (!len || strspn(digits, allowed) != len || errno == ERANGE) {
+        fprintf(stderr, "Invalid seed: %s (must be 0–18446744073709551615, decimal or 0x hex)\n", s);
+        return 0;
+    }
+    *out = (u64)v;
+    return 1;
+}
+
 static void print_usage(const char *prog)
 {
     printf("Usage: %s [options]\n"
            "  -o, --output <file>  write a formatted Markdown report there\n"
            "                       (in addition to the normal console output)\n"
-           "  -n, --trials <N>     measure each variant N times (1–%d) after one\n"
-           "                       warm-up run and report the median trial\n"
-           "                       (default: 1, a single measurement, no warm-up)\n"
+           "  -n, --trials <N>     measure each variant N times (1–%d), each trial\n"
+           "                       after one untimed training run, and report the\n"
+           "                       median trial (default: 1)\n"
            "  -t, --test <N>       run only test N (1–%d); repeat to run several\n"
            "                       (default: tests 1–4; tests 5–6 run only when selected)\n"
            "      --hard           run all tests, including the hard tests 5 and 6\n"
@@ -1535,6 +2388,9 @@ static void print_usage(const char *prog)
            "      --reps <N>       passes over the array per trial, tests 1/2/4/5;\n"
            "                       scales test 6's branch budget with --size\n"
            "                       (default: %u, max: %lu)\n"
+           "      --json <file>    write every trial and summary as JSON Lines (schema 1)\n"
+           "      --cpu <N>        pin the benchmark to CPU N (0–1023) before measuring\n"
+           "      --seed <N>       base seed for all test inputs (default: 16045690984503054900)\n"
            "  -h, --help           show this help\n",
            prog, MAX_TRIALS, NUM_TESTS, DEFAULT_SIZE, MAX_SIZE, DEFAULT_REPS, MAX_REPS);
 }
@@ -1546,6 +2402,8 @@ static int option_number(int argc, char **argv, int *i, const char *what,
     const char *val = option_value(argc, argv, i, argv[*i - 1], what);
     return val && parse_count(val, what, lo, hi, out);
 }
+
+static int apply_run_option(int argc, char **argv, int *i, const char *arg);
 
 /* Applies the option at argv[*i], advancing *i past it and its value.
  * Returns -1 to go on, or the exit code to stop with (0 after --help,
@@ -1587,6 +2445,29 @@ static int apply_option(int argc, char **argv, int *i, const char **out_path)
         reps = (unsigned)v;
         return -1;
     }
+    return apply_run_option(argc, argv, i, arg);
+}
+
+/* apply_option()'s options that set up the run around the tests: --json,
+ * --cpu and --seed.  Same return convention. */
+static int apply_run_option(int argc, char **argv, int *i, const char *arg)
+{
+    unsigned long v;
+    if (is_opt(arg, NULL, "--json")) {
+        json_path = option_value(argc, argv, i, arg, "file name");
+        return json_path ? -1 : 1;
+    }
+    if (is_opt(arg, NULL, "--cpu")) {
+        if (!option_number(argc, argv, i, "CPU number", 0, MAX_CPU, &v)) return 1;
+        cpu_requested = (int)v;
+        return -1;
+    }
+    if (is_opt(arg, NULL, "--seed")) {
+        const char *val = option_value(argc, argv, i, arg, "seed");
+        if (!val || !parse_seed(val, &base_seed)) return 1;
+        seed_given = 1;
+        return -1;
+    }
     fprintf(stderr, "Unknown argument: %s (try --help)\n", arg);
     return 1;
 }
@@ -1601,11 +2482,6 @@ static int parse_args(int argc, char **argv, const char **out_path)
         if (rc >= 0) return rc;
     }
     return -1;
-}
-
-static int test_selected(int n)
-{
-    return ((tests_selected ? tests_selected : DEFAULT_TESTS) >> (n - 1)) & 1u;
 }
 
 /* Comma-separated list of the selected tests, e.g. "1, 3". */
@@ -1642,13 +2518,24 @@ static void print_banner(const char *tests_list)
     printf("  CPU Branch Prediction Benchmark\n");
     printf("  Array size:      %10zu elements\n", size);
     printf("  Repetitions:     %10u per trial\n", reps);
+    printf("  Revision:        %10d\n", BENCH_REVISION);
+    if (seed_given)
+        printf("  Seed:            %20" PRIu64 "\n", base_seed);
     if (trials > 1)
-        printf("  Trials:          %10d per variant (median shown, after 1 warm-up run)\n",
-               trials);
+        printf("  Trials:          %10d per variant (median shown; each after 1 untimed "
+               "training run, AB/BA order)\n", trials);
     if (hard_selected)
         printf("  Tests:           %10s (all, with --hard)\n", tests_list);
     else if (tests_selected)
         printf("  Tests:           %10s (selected with -t)\n", tests_list);
+    if (affinity_status == AFF_PINNED)
+        printf("  CPU affinity:    pinned to CPU %d\n", cpu_requested);
+    else if (affinity_status == AFF_FAILED)
+        printf("  CPU affinity:    FAILED to pin to CPU %d (%s)\n", cpu_requested,
+               affinity_error());
+    else if (affinity_status == AFF_UNSUPPORTED)
+        printf("  CPU affinity:    not supported on this system (CPU %d requested)\n",
+               cpu_requested);
     printf("  Perf counters:   %s\n",
            perf_available() ? "AVAILABLE (hardware branch-miss counts shown)"
                             : "unavailable — showing wall-clock timing only");
@@ -1677,6 +2564,9 @@ static void write_report_header(FILE *report, const char *tests_list)
 
     fprintf(report, "## %s\n\n", cpu);
     fprintf(report, "_%s_\n\n", date);
+    fprintf(report, "_Benchmark revision %d._\n\n", BENCH_REVISION);
+    if (seed_given)
+        fprintf(report, "_Seed: %" PRIu64 "._\n\n", base_seed);
     fprintf(report, "| Array size | Repetitions | Perf counters | Compiler |\n");
     fprintf(report, "|---:|---:|---|---|\n");
     fprintf(report, "| %zu elements | %u/trial | %s | %s |\n\n",
@@ -1693,25 +2583,134 @@ static void write_report_header(FILE *report, const char *tests_list)
     if (BUILD_COMMIT[0])
         fprintf(report, "_Commit: `%s`_\n\n", BUILD_COMMIT);
     if (trials > 1)
-        fprintf(report, "_Median of %d trials per variant, after one warm-up run. "
+        fprintf(report, "_Median of %d trials per variant; each trial follows one "
+                        "untimed training run, and paired variants alternate AB/BA. "
                         "Range is the fastest–slowest trial._\n\n", trials);
     if (hard_selected)
         fprintf(report, "_All tests were run (--hard), including the hard tests 5 and 6._\n\n");
     else if (tests_selected)
         fprintf(report, "_Only test(s) %s were run._\n\n", tests_list);
+    if (affinity_status == AFF_PINNED)
+        fprintf(report, "_Pinned to CPU %d._\n\n", cpu_requested);
+    else if (affinity_status == AFF_FAILED)
+        fprintf(report, "_CPU affinity request for CPU %d failed: %s._\n\n",
+                cpu_requested, affinity_error());
+    else if (affinity_status == AFF_UNSUPPORTED)
+        fprintf(report, "_CPU affinity not supported on this system (CPU %d requested)._\n\n",
+                cpu_requested);
 }
 
-/* Average clock over all measured trials, when the cycle counter worked. */
+/* User-mode cycles over wall time across all measured trials, when the
+ * cycle counter worked.  Kernel time and preemption lower it, so it is an
+ * effective rate, not the core's instantaneous clock. */
 static void print_clock_summary(FILE *report)
 {
     double avg_ghz = measured_ghz();
     double max_ghz = cpu_max_ghz();
     if (avg_ghz <= 0) return;
-    printf("Average clock during measurements: %.2f GHz", avg_ghz);
+    printf("Effective user-cycle rate during measurements: %.2f GHz", avg_ghz);
     if (max_ghz > 0) printf(" (max %.2f GHz)", max_ghz);
     printf("\n\n");
     if (report)
-        fprintf(report, "**Average clock during measurements:** %.2f GHz\n\n", avg_ghz);
+        fprintf(report, "**Effective user-cycle rate during measurements:** %.2f GHz\n\n", avg_ghz);
+}
+
+/* Opens (creating, owner-only when new) an output file without truncating
+ * it: open() rather than fopen() (0666).  open_outputs() truncates once
+ * both files are known to be usable and distinct.  NULL after printing why. */
+static FILE *open_output(const char *path)
+{
+    int fd = open(path, O_WRONLY | O_CREAT, 0600);
+    if (fd < 0) { perror(path); return NULL; }
+    FILE *f = fdopen(fd, "w");
+    if (!f) { perror("fdopen"); close(fd); }
+    return f;
+}
+
+/* Empties a regular file (a device such as /dev/full is left as is, as
+ * O_TRUNC would); 0 on success. */
+static int truncate_output(FILE *f, const char *path)
+{
+    struct stat st;
+    if (fstat(fileno(f), &st) == 0 && !S_ISREG(st.st_mode)) return 0;
+    if (ftruncate(fileno(f), 0) == 0) return 0;
+    perror(path);
+    return 1;
+}
+
+/* Opens the -o report and the --json export (NULL where not requested).
+ * Neither is truncated until both are open and known to be different
+ * files, so a bad --json path or an alias never empties an existing
+ * report.  0 on success; 1 with both closed after printing why. */
+static int open_outputs(const char *out_path, FILE **report, FILE **json)
+{
+    *report = NULL;
+    *json = NULL;
+    if (out_path) {
+        *report = open_output(out_path);
+        if (!*report) return 1;
+    }
+    int failed = 0;
+    if (json_path) {
+        *json = open_output(json_path);
+        failed = *json == NULL;
+    }
+    if (!failed && *report && *json && same_open_file(*report, *json) != 0) {
+        fprintf(stderr, "Report and JSON export must be different files\n");
+        failed = 1;
+    }
+    if (!failed && *report) failed = truncate_output(*report, out_path);
+    if (!failed && *json) failed = truncate_output(*json, json_path);
+    if (!failed) return 0;
+    if (*report) fclose(*report);
+    if (*json) fclose(*json);
+    *report = NULL;
+    *json = NULL;
+    return 1;
+}
+
+/* Closes an output file; nonzero if any write failed.  A previous buffered
+ * write may have failed even if close succeeds. */
+static int close_output(FILE *f)
+{
+    int failed = ferror(f) != 0;
+    if (fclose(f) != 0) failed = 1;
+    return failed;
+}
+
+static void run_selected_tests(FILE *report)
+{
+    if (test_selected(1)) { begin_test(1); run_test1(report); }
+    if (test_selected(2)) { begin_test(2); run_test2(report); }
+    if (test_selected(3)) { begin_test(3); run_test3(report); }
+    if (test_selected(4)) { begin_test(4); run_test4(report); }
+    if (test_selected(5)) { begin_test(5); run_test5(report); }
+    if (test_selected(6)) { begin_test(6); run_test6(report); }
+}
+
+/* Closes the report, then writes and closes the export.  Nonzero if either
+ * failed. */
+static int finish_outputs(FILE *report, const char *out_path, FILE *json)
+{
+    int failed = 0;
+    if (report) {
+        if (close_output(report)) {
+            fprintf(stderr, "Error writing report to %s\n", out_path);
+            failed = 1;
+        } else {
+            printf("\nFormatted report written to %s\n", out_path);
+        }
+    }
+    if (json) {
+        write_export(json);
+        if (close_output(json)) {
+            fprintf(stderr, "Error writing JSON export to %s\n", json_path);
+            failed = 1;
+        } else {
+            printf("JSON export written to %s\n", json_path);
+        }
+    }
+    return failed;
 }
 
 int main(int argc, char **argv)
@@ -1720,15 +2719,11 @@ int main(int argc, char **argv)
     int rc = parse_args(argc, argv, &out_path);
     if (rc >= 0) return rc;
 
-    FILE *report = NULL;
-    if (out_path) {
-        /* open() rather than fopen() (0666), so a new report is owner-only. */
-        int fd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-        if (fd < 0) { perror(out_path); return 1; }
-        report = fdopen(fd, "w");
-        if (!report) { perror("fdopen"); close(fd); return 1; }
-    }
+    FILE *report;
+    FILE *json;
+    if (open_outputs(out_path, &report, &json)) return 1;
 
+    apply_affinity();
     perf_init();
 
     char tests_list[32];
@@ -1737,29 +2732,15 @@ int main(int argc, char **argv)
     if (report)
         write_report_header(report, tests_list);
 
-    if (test_selected(1)) run_test1(report);
-    if (test_selected(2)) run_test2(report);
-    if (test_selected(3)) run_test3(report);
-    if (test_selected(4)) run_test4(report);
-    if (test_selected(5)) run_test5(report);
-    if (test_selected(6)) run_test6(report);
+    run_selected_tests(report);
 
     print_clock_summary(report);
 
     printf("See README.md for how to interpret these results.\n");
 
-    int report_failed = 0;
-    if (report) {
-        /* A previous buffered write may have failed even if close succeeds. */
-        report_failed = ferror(report) != 0;
-        if (fclose(report) != 0) report_failed = 1;
-        if (report_failed)
-            fprintf(stderr, "Error writing report to %s\n", out_path);
-        else
-            printf("\nFormatted report written to %s\n", out_path);
-    }
+    const int output_failed = finish_outputs(report, out_path, json);
 
     perf_close();
 
-    return sanity_failed || report_failed ? 1 : 0;
+    return sanity_failed || output_failed ? 1 : 0;
 }
