@@ -71,28 +71,21 @@ expect 0 -t 3 --seed 0x1f --size 4K --reps 1
 expect 0 -t 3 --seed 010 --size 4K --reps 1
 expect 0 -t 1 --size 4K --reps 1 -o "$dir/rev.md"
 grep -q '^_Benchmark revision 4._$' "$dir/rev.md" || { echo "FAIL rev.md lacks the revision line"; fail=1; }
-# Test 5 is opt-in; it skips (exit 0) when --size is not a multiple of 2048,
-# while other selected tests still run.
+# Test 5 is opt-in; its grid comes from --profile, not --size.
 # Test 4 first: fake_perf.so fails the first and third counter reads, and its
 # four measurements absorb them, so every Test 5 row gets counts.
 # shellcheck disable=SC2086
-expect 0 -t 4 -t 5 $small -o "$dir/t5.md"
-grep -q '^| Period 2048 (k=11) |' "$dir/t5.md" || { echo "FAIL t5.md lacks Test 5's table"; fail=1; }
-expect 0 -t 5 --size 1000 --reps 1 -o "$dir/skip5.md"
-grep -q 'Skipped:' "$dir/skip5.md" || { echo "FAIL skip5.md lacks the skip reason"; fail=1; }
-# Below 64K elements Test 5 measures, but replaces its summary with a note.
-expect 0 -t 5 --size 2048 --reps 1 -o "$dir/short5.md"
-grep -q '^_n/a: --size below' "$dir/short5.md" || { echo "FAIL short5.md lacks the n/a note"; fail=1; }
-expect 0 -t 1 -t 5 --size 1000 --reps 1 -o "$dir/mixed.md"
-grep -q '^| Sorted |' "$dir/mixed.md" || { echo "FAIL mixed.md lacks Test 1's table"; fail=1; }
-grep -q 'Skipped:' "$dir/mixed.md" || { echo "FAIL mixed.md lacks Test 5's skip reason"; fail=1; }
+expect 0 -t 4 -t 5 --profile quick $small -o "$dir/t5.md"
+grep -q '^| N= 64 L= 32 E= 8 |' "$dir/t5.md" || { echo "FAIL t5.md lacks Test 5's table"; fail=1; }
+grep -q '^_Training: 8 complete periods per site' "$dir/t5.md" || { echo "FAIL t5.md lacks the training note"; fail=1; }
 # Test 2 skips when --size is not a multiple of 16 (whole periods of every
 # bias pattern); other selected tests still run.
 expect 0 -t 2 --size 1000 --reps 1 -o "$dir/skip2.md"
 grep -q 'Skipped:' "$dir/skip2.md" || { echo "FAIL skip2.md lacks the skip reason"; fail=1; }
 expect 0 -t 2 --size 16 --reps 1
 # Test 6 is opt-in; its counts come from --profile, not --size.
-expect 0 -t 4 -t 6 --profile quick -o "$dir/t6.md"
+# shellcheck disable=SC2086
+expect 0 -t 4 -t 6 --profile quick $small -o "$dir/t6.md"
 grep -q '^| C= 16 |' "$dir/t6.md" || { echo "FAIL t6.md lacks Test 6's table"; fail=1; }
 grep -q '^_Construction: one inner loop branch' "$dir/t6.md" || { echo "FAIL t6.md lacks the construction note"; fail=1; }
 # --hard runs all six tests, also next to -t, and says so.
@@ -150,6 +143,23 @@ export_ok "$dir/skip2b.jsonl" --report "$dir/skip2b.md"
 # One element per array: the kernels' smallest input, against the reference.
 expect 0 -t 1 -t 4 --size 1 --reps 1 -o "$dir/one.md" --json "$dir/one.jsonl"
 export_ok "$dir/one.jsonl" --report "$dir/one.md"
+# Test 5's matrices are rebuilt from the export; a changed cell must be
+# caught (no matrix without counters).
+# shellcheck disable=SC2086
+expect 0 -t 4 -t 5 --profile quick $small -o "$dir/t5j.md" --json "$dir/t5.jsonl"
+export_ok "$dir/t5.jsonl" --report "$dir/t5j.md"
+awk '/^\*\*Misses per data branch/ { m = 1 }
+     m && /^\| 1 \|/ && !done { $4 = "9.999"; done = 1 }
+     { print }' "$dir/t5j.md" > "$dir/t5bad.md"
+if cmp -s "$dir/t5j.md" "$dir/t5bad.md"; then
+    echo "skip corrupted-matrix case: no miss counter"
+elif python3 "$check_export" "$dir/t5.jsonl" --report "$dir/t5bad.md" > "$dir/check.out" 2>&1; then
+    echo "FAIL check_export.py accepted a corrupted Test 5 matrix"; fail=1
+elif grep -q '^FAIL Test 5 matrix misses blocks 256 E=8 N=1 L=8:' "$dir/check.out"; then
+    echo "ok   check_export.py rejects a corrupted Test 5 matrix"
+else
+    echo "FAIL check_export.py failed for another reason:"; cat "$dir/check.out"; fail=1
+fi
 # Test 6's loop-exit curve is rebuilt from the export too.
 expect 0 -t 6 --profile quick -o "$dir/t6j.md" --json "$dir/t6.jsonl"
 export_ok "$dir/t6.jsonl" --report "$dir/t6j.md"
@@ -179,9 +189,9 @@ expect 0 -t 6 --profile quick --json "$dir/t6-a.jsonl"
 expect 0 -t 1 -t 6 --profile quick --size 64K --reps 2 --json "$dir/t6-b.jsonl"
 export_ok "$dir/t6-a.jsonl" --same-results "$dir/t6-b.jsonl" --test 6
 for t in 1 2 4 5; do
-    expect 0 -t "$t" --size 64K --reps 2 --json "$dir/t$t-a.jsonl"
-    expect 0 -t 1 -t "$t" --size 64K --reps 2 --json "$dir/t$t-b.jsonl"
-    expect 0 -t "$t" --seed 7 --size 64K --reps 2 --json "$dir/t$t-c.jsonl"
+    expect 0 -t "$t" --profile quick --size 64K --reps 2 --json "$dir/t$t-a.jsonl"
+    expect 0 -t 1 -t "$t" --profile quick --size 64K --reps 2 --json "$dir/t$t-b.jsonl"
+    expect 0 -t "$t" --profile quick --seed 7 --size 64K --reps 2 --json "$dir/t$t-c.jsonl"
     export_ok "$dir/t$t-a.jsonl" --same-results "$dir/t$t-b.jsonl" --test "$t"
     export_ok "$dir/t$t-a.jsonl" --different-results "$dir/t$t-c.jsonl" --test "$t"
 done

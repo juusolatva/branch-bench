@@ -202,7 +202,7 @@ jobs:
           .github/scripts/check_kernels.sh ./branch_bench > "$out" 2>&1 || status=$?
           cat "$out"
           [ "$status" -eq 0 ]
-          for label in 'Test 1/4 sum_threshold' 'Test 2/5 count_decisions' \
+          for label in 'Test 1/4 sum_threshold' 'Test 2 count_decisions' \
                        'Test 4 sum_branchless' 'Test 3 dispatch_indexed' 'Test 3 leaves' \
                        'Test 5 pattern_sites_1' 'Test 5 pattern_sites_4' 'Test 5 pattern_sites_16' \
                        'Test 5 pattern_sites_64' 'Test 5 pattern_sites_256' 'Test 5 pattern_sites_512' \
@@ -318,23 +318,28 @@ jobs:
           # Fails if the shim was not used: these lines need the counters.
           grep -q '^\*\*Effective extra cycles per additional miss:\*\* -\{0,1\}[0-9]' "$dir/report.md"
           grep -q '^\*\*Effective user-cycle rate during measurements:\*\*' "$dir/report.md"
-          grep -q '^\*\*Periods at' "$dir/t5.md"
+          grep -q '^\*\*Misses per data branch (blocks 256, E=8):\*\*' "$dir/t5.md"
           grep -q '"governor":"performance"' "$dir/run.jsonl"
           grep -q '"hypervisor":true' "$dir/run.jsonl"
           grep -Eq '^\| C= 16 \| 16 \| [0-9]+ \| [0-9]+ \| [0-9]+\.[0-9]{3} \| [0-9]+\.[0-9]{3} \|$' "$dir/t6.md"
           # Only some counters open.  Tests 1-2 come first: the shim fails the
           # first and third counter reads, and their four measurements absorb
-          # them.  Test 5's summary and Test 6's Misses/loop curve column need
-          # misses, and only misses.  check_export.py must accept both runs.
-          FAKE_PERF_EVENTS=misses ./branch_bench_cov -t 1 -t 2 -t 5 -t 6 $SMALL_RUN -o "$dir/part.md" --json "$dir/part.jsonl"
-          grep -q '^\*\*Periods at' "$dir/part.md"
+          # them.  Test 5's misses matrices and Test 6's Misses/loop curve
+          # column need misses, the cycles matrices and Cycles/iter cycles.
+          # check_export.py must accept both runs.
+          FAKE_PERF_EVENTS=misses ./branch_bench_cov -t 1 -t 2 -t 5 -t 6 $SMALL_RUN --profile quick -o "$dir/part.md" --json "$dir/part.jsonl"
+          grep -q '^\*\*Misses per data branch' "$dir/part.md"
+          if grep -q '^\*\*Cycles per data branch' "$dir/part.md"; then
+            echo "Test 5 cycles matrix printed without the cycle counter"; exit 1
+          fi
           grep -Eq '^\| C= 16 \| .* \| – \| [0-9]+\.[0-9]{3} \|$' "$dir/part.md"
           python3 .github/scripts/check_export.py "$dir/part.jsonl" --report "$dir/part.md"
-          FAKE_PERF_EVENTS=branches,cycles ./branch_bench_cov -t 1 -t 2 -t 5 -t 6 $SMALL_RUN -o "$dir/part.md" --json "$dir/part.jsonl"
+          FAKE_PERF_EVENTS=branches,cycles ./branch_bench_cov -t 1 -t 2 -t 5 -t 6 $SMALL_RUN --profile quick -o "$dir/part.md" --json "$dir/part.jsonl"
           python3 .github/scripts/check_export.py "$dir/part.jsonl" --report "$dir/part.md"
-          if grep -q 'Periods at' "$dir/part.md"; then
-            echo "Test 5 summary printed without the miss counter"; exit 1
+          if grep -q 'Misses per data branch' "$dir/part.md"; then
+            echo "Test 5 misses matrix printed without the miss counter"; exit 1
           fi
+          grep -q '^\*\*Cycles per data branch' "$dir/part.md"
           grep -Eq '^\| C= 16 \| .* \| [0-9]+\.[0-9]{3} \| – \|$' "$dir/part.md"
 
       # Covers perf_stop()'s error paths, which need failing counter reads.

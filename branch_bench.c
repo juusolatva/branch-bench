@@ -87,8 +87,6 @@
 #define DB_MIN_ORDER   5
 #define DB_MAX_ORDER   11
 #define DB_MAX_PERIOD  (1u << DB_MAX_ORDER)
-#define DB_ORDERS      (DB_MAX_ORDER - DB_MIN_ORDER + 1)
-#define DB_MIN_SAMPLE  65536  /* elements for test 5's summary lines */
 
 /* ── Kernel backend ───────────────────────────────────────────────────────
  * The data-branch kernels (sum_threshold, count_decisions) are one asm
@@ -140,10 +138,10 @@ typedef uint64_t        u64;
 typedef unsigned char   u8;
 
 /* Run-time settings, changed only by command-line options. */
-static size_t   size  = DEFAULT_SIZE;  /* --size: elements per array (tests 1/2/4/5/6),
+static size_t   size  = DEFAULT_SIZE;  /* --size: elements per array (tests 1/2/4),
                                           calls per trial (test 3) */
-static unsigned reps  = DEFAULT_REPS;  /* --reps: passes over the array per trial;
-                                          test 6: scales its branch budget */
+static unsigned reps  = DEFAULT_REPS;  /* --reps: passes over the array per trial
+                                          (tests 1/2/4) */
 static int      trials = 1;            /* -n/--trials: measured trials per variant, each
                                           after TRAIN_RUNS untimed runs */
 static unsigned tests_selected = 0;    /* -t/--test bitmask (bit n-1 = test n);
@@ -574,6 +572,9 @@ typedef struct {
 static TrialRecord *trial_log = NULL;
 static int         trial_log_len = 0;
 static int         trial_log_cap = 0;
+/* Exposure for the next logged trial (Test 5), set by its preparation. */
+static int         next_has_exposure = 0;
+static u64         next_exposure = 0;
 
 /* Two variants of one test measured in alternating order. */
 typedef struct {
@@ -625,6 +626,9 @@ static void log_trial(int variant, int pair, int trial, const char *call, const 
     t->trial   = trial;
     t->call    = call;
     t->r       = *r;
+    t->has_exposure    = next_has_exposure;
+    t->exposure_before = next_exposure;
+    next_has_exposure = 0;
     trial_log_len++;
 }
 
@@ -793,15 +797,21 @@ static int pair_a_first(int k)
         account_clock(&(res));              \
     } while (0)
 
-#define MEASURE_TRAINED(variant, pair, k, call)                 \
+/* One logged trial after the untimed statement `prepare` (training). */
+#define MEASURE_PREPARED(variant, pair, k, prepare, call)       \
     do {                                                        \
         Result t_;                                              \
         memset(&t_, 0, sizeof t_);                              \
-        for (int r_ = 0; r_ < TRAIN_RUNS; r_++)                 \
-            anti_dce_sink(call);                                \
+        prepare;                                                \
         MEASURE_ONCE(t_, call);                                 \
         log_trial((variant), (pair), (k), #call, &t_);          \
     } while (0)
+
+#define MEASURE_TRAINED(variant, pair, k, call)                 \
+    MEASURE_PREPARED(variant, pair, k,                          \
+                     for (int r_ = 0; r_ < TRAIN_RUNS; r_++)    \
+                         anti_dce_sink(call),                   \
+                     call)
 
 /* Measures `call` `trials` times and reports its median trial. */
 #define MEASURE(res, variant, call)                             \
@@ -1606,9 +1616,8 @@ static u64 count_decisions(const u8 *decisions, size_t n, unsigned n_reps)
           [b] "r"(blocks)                                                 \
         : "cc", "memory")
 #  endif
-/* used: emitted (and checked) before Test 5 calls them. */
 #  define DEF_PATTERN_KERNEL(N)                                           \
-    __attribute__((noinline, used))                                      \
+    __attribute__((noinline))                                             \
     static u64 pattern_sites_##N(const u8 *data, size_t blocks, unsigned passes) \
     {                                                                     \
         u64 acc = 0;                                                      \
@@ -1624,10 +1633,13 @@ DEF_PATTERN_KERNEL(64)
 DEF_PATTERN_KERNEL(256)
 DEF_PATTERN_KERNEL(512)
 #else
-__attribute__((noinline, used))
+__attribute__((noinline))
 static u64 pattern_sites_1(const u8 *data, size_t blocks, unsigned passes)
 {
     u64 acc = 0;
+    /* Emits nothing; without it this body equals count_decisions' C loop
+     * and identical code folding merges the two (section 5 of AGENTS.md). */
+    __asm__ __volatile__("");
     for (unsigned rep = 0; rep < passes; rep++)
         for (size_t i = 0; i < blocks; i++)
             if (data[i])        /* the one site */
@@ -1637,7 +1649,6 @@ static u64 pattern_sites_1(const u8 *data, size_t blocks, unsigned passes)
 #endif
 
 /* 1 if this build has pattern_sites_n. */
-__attribute__((unused))  /* called from Task 5 (Test 5) on */
 static int pattern_kernel_available(unsigned n)
 {
     return KERNEL_ASM || n == 1;
@@ -2124,26 +2135,6 @@ static void run_test4(FILE *report)
  *
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-#define DB_TITLE "Test 5 — Pattern Learnability"
-#define DB_DESC  "Repeating de Bruijn patterns (orders 5–11, 50% ones) vs. random 50% ones; same kernel as Test 2."
-
-static const char *const db_labels[] = {
-    "Period   32 (k=5)",  "Period   64 (k=6)",  "Period  128 (k=7)",
-    "Period  256 (k=8)",  "Period  512 (k=9)",  "Period 1024 (k=10)",
-    "Period 2048 (k=11)", "Random 50%",
-};
-CHECK_LEN(db_labels_len_check, db_labels, DB_ORDERS + 1);
-
-/* Fills buf with random 0/1 bytes from a fixed seed, leaving the shared RNG
- * stream as it was, so other tests see the same numbers either way. */
-static void fill_random_bits(u8 *buf, size_t n, u64 seed)
-{
-    const u64 saved = rng_state;
-    rng_state = seed;
-    for (size_t i = 0; i < n; i++)
-        buf[i] = (u8)(rng64() >> 63);   /* top bit: xorshift64's low bit is weakest */
-    rng_state = saved;
-}
 
 /* Marks word w in a bitset; returns 1 if it was not marked before. */
 static int mark_new(u8 *set, unsigned w)
@@ -2204,7 +2195,6 @@ static int debruijn_valid(const u8 *p, unsigned k)
  * reference are controls.  Nothing is rejected or redrawn: duplicates and
  * shorter fundamental periods are counted and exported instead. */
 enum { T5_RANDOM_WORDS, T5_CONSTANT0, T5_ALTERNATING, T5_DEBRUIJN, T5_BALANCED_REF };
-__attribute__((unused))  /* exported from Task 5 (Test 5) on */
 static const char *const t5_family_ids[] = {
     "random-words", "constant-0", "alternating", "de-bruijn", "balanced-ref",
 };
@@ -2256,7 +2246,6 @@ static void t5_balanced(const T5Cell *c, unsigned s, u8 *out)
 
 /* Writes each site's stream into streams[s * l ...] and tiles them into
  * data (blocks * n bytes).  blocks must be a multiple of l. */
-__attribute__((unused))  /* called from Task 5 (Test 5) on */
 static void t5_fill(const T5Cell *c, u8 *data, u8 *streams)
 {
     if (c->l == 0 || c->blocks % c->l != 0) {
@@ -2305,7 +2294,6 @@ static int t5_family_ok(const T5Cell *c, const u8 *st)
  * that each byte is 0 or 1, that each site repeats with period l over all
  * blocks and that each stream fits its family, and counts the statistics.
  * Returns 0 on any mismatch. */
-__attribute__((unused))  /* called from Task 5 (Test 5) on */
 static int t5_validate(const T5Cell *c, const u8 *data, T5Stats *st)
 {
     const unsigned n = c->n;
@@ -2334,124 +2322,579 @@ static int t5_validate(const T5Cell *c, const u8 *data, T5Stats *st)
     return ok;
 }
 
-/* Whole periods of the longest pattern; with --size >= 1 this also means
- * at least one period. */
-static int test5_size_ok(size_t len)
+/* ── Test 5 grids ─────────────────────────────────────────────────────────
+ * Per profile: groups of N × L cells sharing one block count (a multiple
+ * of every L in the group, so each N has the same data footprint across
+ * its periods), the training exposures, the minimum measured executions
+ * and the point budget (training plus measured executions per trial).
+ * The standard values are provisional until the hardware pilots. */
+#define T5_TITLE "Test 5 — Pattern Learnability Matrix"
+#define T5_DESC  "N static data branches per block, each reading its own repeating L-bit random word (block-major); constant, alternating, de Bruijn and balanced-reference controls at N = 1."
+#define T5_MAX_ROWS            200
+#define T5_MIN_MEASURE_PERIODS 64     /* complete periods per site, measured */
+#define T5_CONTROL_BLOCKS      65536
+#define T5_REF_LEN             65536
+
+static const unsigned t5_n_small[] = { 1, 4, 16, 64 };
+static const unsigned t5_n_large[] = { 256, 512 };
+static const unsigned t5_n_one[]   = { 1 };
+static const unsigned t5_l_quick_a[] = { 8, 32 };
+static const unsigned t5_l_quick_b[] = { 16 };
+static const unsigned t5_l_std_a[]   = { 8, 16, 32, 64, 128, 256 };
+static const unsigned t5_l_std_b[]   = { 16, 32, 48 };
+static const unsigned t5_l_res_a[]   = { 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256 };
+static const unsigned t5_l_res_long[] = { 512, 1024, 4096, 16384, 65536 };
+static const unsigned t5_db_all[]   = { 32, 64, 128, 256, 512, 1024, 2048 };
+static const unsigned t5_db_quick[] = { 32, 2048 };
+static const unsigned t5_exp_quick[] = { 8 };
+static const unsigned t5_exp_std[]   = { 64 };
+static const unsigned t5_exp_res[]   = { 8, 64, 512 };
+
+#define T5_LEN(a) ((int)(sizeof a / sizeof a[0]))
+
+typedef struct {
+    const unsigned *n;
+    int             nn;
+    const unsigned *l;
+    int             nl;
+    size_t          blocks;
+} T5Group;
+
+#define T5_GROUP(ns, ls, b) { ns, T5_LEN(ns), ls, T5_LEN(ls), b }
+static const T5Group t5_groups_quick[] = {
+    T5_GROUP(t5_n_small, t5_l_quick_a, 256), T5_GROUP(t5_n_large, t5_l_quick_b, 96),
+};
+static const T5Group t5_groups_std[] = {
+    T5_GROUP(t5_n_small, t5_l_std_a, 256), T5_GROUP(t5_n_large, t5_l_std_b, 96),
+};
+static const T5Group t5_groups_res[] = {
+    T5_GROUP(t5_n_small, t5_l_res_a, 768), T5_GROUP(t5_n_large, t5_l_std_b, 96),
+    T5_GROUP(t5_n_one, t5_l_res_long, 65536),
+};
+
+typedef struct {
+    const T5Group  *groups;
+    int             ngroups;
+    const unsigned *exposures;
+    int             nexp;
+    const unsigned *db;           /* de Bruijn control periods */
+    int             ndb;
+    u64             min_execs;    /* measured data-branch executions per row */
+    u64             budget;       /* training + measured executions per trial */
+} T5Profile;
+
+static const T5Profile t5_profiles[] = {
+    { t5_groups_quick, T5_LEN(t5_groups_quick), t5_exp_quick, T5_LEN(t5_exp_quick),
+      t5_db_quick, T5_LEN(t5_db_quick), 1ULL << 16, 1ULL << 24 },
+    { t5_groups_std, T5_LEN(t5_groups_std), t5_exp_std, T5_LEN(t5_exp_std),
+      t5_db_all, T5_LEN(t5_db_all), 1ULL << 22, 1ULL << 27 },
+    { t5_groups_res, T5_LEN(t5_groups_res), t5_exp_res, T5_LEN(t5_exp_res),
+      t5_db_all, T5_LEN(t5_db_all), 1ULL << 22, 1ULL << 28 },
+};
+CHECK_LEN(t5_profiles_len_check, t5_profiles, PROFILE_RESEARCH + 1);
+
+/* Why a cell was not measured (exported as the "reason" parameter). */
+enum { T5_MEASURED = 0, T5_SKIP_BUDGET = 1, T5_SKIP_BACKEND = 2 };
+
+/* One Test 5 row: its cell, training exposure (periods per site), group
+ * (index into the profile's groups; ngroups for the controls), measured
+ * passes, skip reason and variant id. */
+typedef struct {
+    T5Cell   cell;
+    unsigned exposure;
+    int      group;
+    unsigned passes;
+    int      skip;
+    int      variant;
+} T5Row;
+
+/* Measured passes: at least T5_MIN_MEASURE_PERIODS complete periods per
+ * site and min_execs data-branch executions. */
+static unsigned t5_passes(const T5Cell *c, u64 min_execs)
 {
-    return len % DB_MAX_PERIOD == 0;
+    const u64 per_pass = (u64)c->n * c->blocks;
+    const u64 by_periods = ((u64)T5_MIN_MEASURE_PERIODS * c->l + c->blocks - 1) / c->blocks;
+    const u64 by_execs = (min_execs + per_pass - 1) / per_pass;
+    return (unsigned)(by_periods > by_execs ? by_periods : by_execs);
 }
 
-/* Measures count_decisions() on each de Bruijn pattern tiled over buf and
- * on random bits in rand_buf.  The shortest and longest periods are each
- * paired with the random row (pairs[0] and pairs[1]); the others run
- * alone.  Returns 0, measuring nothing more, if a pattern fails its check. */
-static int measure_patterns(u8 *buf, u8 *rand_buf, size_t len,
-                            ReportRow rows[DB_ORDERS + 1], int pairs[2])
+/* T5_MEASURED, or why the row is skipped: no kernel for its N in this
+ * build, or training plus measurement over the profile's point budget. */
+static int t5_skip_reason(const T5Row *r, const T5Profile *p)
 {
-    u8 pattern[DB_MAX_PERIOD];
-    ReportRow *random_row = &rows[DB_ORDERS];
-    fill_random_bits(rand_buf, len, test_seed(5, 0, 0));
-    for (unsigned k = DB_MIN_ORDER; k <= DB_MAX_ORDER; k++) {
-        const size_t mask = ((size_t)1 << k) - 1;
-        const int v = (int)(k - DB_MIN_ORDER);
-        if (!debruijn_prefer_one(k, pattern) || !debruijn_valid(pattern, k)) {
-            fprintf(stderr, "  ERROR: de Bruijn sequence of order %u is invalid!\n", k);
-            return 0;
+    const T5Cell *c = &r->cell;
+    if (!pattern_kernel_available(c->n)) return T5_SKIP_BACKEND;
+    const u64 per_site = (u64)r->exposure * c->l + (u64)c->blocks * r->passes;
+    return (u64)c->n * per_site > p->budget ? T5_SKIP_BUDGET : T5_MEASURED;
+}
+
+static int t5_add(T5Row *rows, int k, const T5Profile *p, const T5Cell *c,
+                  unsigned exposure, int group)
+{
+    if (k >= T5_MAX_ROWS) log_full("Test 5 row table");
+    T5Row *r = &rows[k];
+    r->cell = *c;
+    r->exposure = exposure;
+    r->group = group;
+    r->passes = t5_passes(c, p->min_execs);
+    r->skip = t5_skip_reason(r, p);
+    r->variant = -1;
+    return k + 1;
+}
+
+/* The profile's rows: every group's N × L cells per exposure, then the
+ * controls at the last exposure (constant-0, alternating, de Bruijn, the
+ * balanced reference last).  Returns how many. */
+static int t5_rows(const T5Profile *p, T5Row rows[T5_MAX_ROWS])
+{
+    int k = 0;
+    for (int e = 0; e < p->nexp; e++)
+        for (int g = 0; g < p->ngroups; g++) {
+            const T5Group *gr = &p->groups[g];
+            for (int i = 0; i < gr->nn; i++)
+                for (int j = 0; j < gr->nl; j++) {
+                    const T5Cell c = { gr->n[i], gr->l[j], gr->blocks, T5_RANDOM_WORDS };
+                    k = t5_add(rows, k, p, &c, p->exposures[e], g);
+                }
         }
-        for (size_t i = 0; i < len; i++) buf[i] = pattern[i & mask];
-        if (k == DB_MIN_ORDER || k == DB_MAX_ORDER)
-            MEASURE_PAIR(rows[v].r, v, count_decisions(buf, len, reps),
-                         random_row->r, DB_ORDERS, count_decisions(rand_buf, len, reps),
-                         pairs[k == DB_MAX_ORDER]);
-        else
-            MEASURE(rows[v].r, v, count_decisions(buf, len, reps));
+    const unsigned last = p->exposures[p->nexp - 1];
+    const T5Cell zero = { 1, 2, T5_CONTROL_BLOCKS, T5_CONSTANT0 };
+    const T5Cell alt = { 1, 2, T5_CONTROL_BLOCKS, T5_ALTERNATING };
+    k = t5_add(rows, k, p, &zero, last, p->ngroups);
+    k = t5_add(rows, k, p, &alt, last, p->ngroups);
+    for (int i = 0; i < p->ndb; i++) {
+        const T5Cell db = { 1, p->db[i], T5_CONTROL_BLOCKS, T5_DEBRUIJN };
+        k = t5_add(rows, k, p, &db, last, p->ngroups);
+    }
+    const T5Cell ref = { 1, T5_REF_LEN, T5_CONTROL_BLOCKS, T5_BALANCED_REF };
+    const int first = k - 2 - p->ndb;
+    k = t5_add(rows, k, p, &ref, last, p->ngroups);
+    /* One pass count for all controls (the longest's), so the de Bruijn
+     * 32 and reference pair, and any two controls, do equal work. */
+    unsigned passes = 0;
+    for (int i = first; i < k; i++)
+        if (rows[i].passes > passes) passes = rows[i].passes;
+    for (int i = first; i < k; i++) {
+        rows[i].passes = passes;
+        rows[i].skip = t5_skip_reason(&rows[i], p);
+    }
+    return k;
+}
+
+/* Per-site executions of each pattern kernel so far (training and timed),
+ * for the exposure records; index by t5_kernel_index(). */
+static u64 t5_site_execs[6];
+
+static int t5_kernel_index(unsigned n)
+{
+    switch (n) {
+    case 1:   return 0;
+    case 4:   return 1;
+    case 16:  return 2;
+    case 64:  return 3;
+    case 256: return 4;
+    default:  return 5;
+    }
+}
+
+/* Calls pattern_sites_N for N = n directly (no function pointers). */
+#define T5_CALL(N) case N: return pattern_sites_##N(data, blocks, passes);
+static u64 t5_run(unsigned n, const u8 *data, size_t blocks, unsigned passes)
+{
+    switch (n) {
+    T5_CALL(1)
+#if KERNEL_ASM
+    T5_CALL(4) T5_CALL(16) T5_CALL(64) T5_CALL(256) T5_CALL(512)
+#endif
+    default:
+        fprintf(stderr, "Internal error: no pattern kernel for N=%u\n", n);
+        exit(1);
+    }
+}
+#undef T5_CALL
+
+/* Runs exactly `periods` periods of every site, untimed: whole passes
+ * over the cell, then a prefix of whole periods.  Returns the kernels'
+ * results. */
+static u64 t5_train(unsigned n, const u8 *data, size_t blocks, unsigned l, unsigned periods)
+{
+    const u64 total = (u64)periods * l;   /* executions per site */
+    const u64 q = total / blocks;
+    const size_t rest = (size_t)(total % blocks);   /* a multiple of l */
+    u64 acc = 0;
+    if (q) acc += t5_run(n, data, blocks, (unsigned)q);
+    if (rest) acc += t5_run(n, data, rest, 1);
+    return acc;
+}
+
+/* A row's untimed preparation: training, then the exposure record of the
+ * trial that follows (per-site executions of this kernel before it). */
+static void t5_prepare(const T5Row *r, const u8 *data)
+{
+    const T5Cell *c = &r->cell;
+    u64 *execs = &t5_site_execs[t5_kernel_index(c->n)];
+    anti_dce_sink(t5_train(c->n, data, c->blocks, c->l, r->exposure));
+    *execs += (u64)r->exposure * c->l;
+    next_exposure = *execs;
+    next_has_exposure = 1;
+    *execs += (u64)c->blocks * r->passes;
+}
+
+/* A row's cell input, checked; NULL (after an error) if the validator
+ * rejects it.  Records the input and parameters of variant r->variant. */
+static u8 *t5_input(const T5Row *r, T5Stats *st)
+{
+    const T5Cell *c = &r->cell;
+    u8 *data = malloc(c->blocks * c->n);
+    u8 *streams = malloc((size_t)c->n * c->l);
+    if (!data || !streams) { perror("malloc"); exit(1); }
+    t5_fill(c, data, streams);
+    free(streams);
+    if (!t5_validate(c, data, st)) {
+        fprintf(stderr, "  ERROR: Test 5 input N=%u L=%u (%s) failed validation\n",
+                c->n, c->l, t5_family_ids[c->family]);
+        free(data);
+        return NULL;
+    }
+    log_input(r->variant, data, c->blocks * c->n, 1, st->ones);
+    return data;
+}
+
+/* The parameters every Test 5 variant records; measured rows add their
+ * stream statistics. */
+static void t5_params(const T5Row *r, const T5Stats *st)
+{
+    const T5Cell *c = &r->cell;
+    const int v = r->variant;
+    log_param(v, "N", c->n);
+    log_param(v, "L", c->l);
+    log_param(v, "blocks", c->blocks);
+    log_param(v, "passes", r->passes);
+    log_param(v, "exposure", r->exposure);
+    log_param(v, "family", (u64)c->family);
+    log_param(v, "group", (u64)r->group);
+    log_param(v, "data_bytes", (u64)c->n * c->blocks);
+    log_param(v, "skipped", r->skip != T5_MEASURED);
+    log_param(v, "reason", (u64)r->skip);
+    if (!st) return;
+    log_param(v, "ones", st->ones);
+    log_param(v, "distinct", st->distinct);
+    log_param(v, "short_period", st->short_period);
+}
+
+/* Measures one row on its own. */
+#define T5_LONE(N)                                                          \
+    case N:                                                                 \
+        for (int k_ = 0; k_ < n_trials; k_++)                               \
+            MEASURE_PREPARED(v, -1, k_, t5_prepare(r, data),                \
+                             pattern_sites_##N(data, blocks, passes));      \
+        break;
+
+static int measure_t5_row(const T5Row *r, ReportRow *row)
+{
+    T5Stats st;
+    u8 *data = t5_input(r, &st);
+    if (!data) return 0;
+    t5_params(r, &st);
+    const int v = r->variant;
+    const size_t blocks = r->cell.blocks;
+    const unsigned passes = r->passes;
+    const int n_trials = trial_count();
+    switch (r->cell.n) {
+    T5_LONE(1)
+#if KERNEL_ASM
+    T5_LONE(4) T5_LONE(16) T5_LONE(64) T5_LONE(256) T5_LONE(512)
+#endif
+    default:
+        break;
+    }
+    row->r = representative(current_test, v);
+    check_result("Test 5 pattern", row->r.result, st.ones * passes);
+    free(data);
+    return 1;
+}
+#undef T5_LONE
+
+/* Measures two N = 1 rows of equal work as one pair, AB/BA. */
+static int measure_t5_pair(const T5Row *ra, const T5Row *rb, ReportRow *a, ReportRow *b,
+                           int *pair)
+{
+    T5Stats sa;
+    T5Stats sb;
+    u8 *da = t5_input(ra, &sa);
+    u8 *db = da ? t5_input(rb, &sb) : NULL;
+    if (!da || !db) { free(da); return 0; }
+    t5_params(ra, &sa);
+    t5_params(rb, &sb);
+    const size_t blocks = ra->cell.blocks;
+    const unsigned passes = ra->passes;
+    const int p = new_pair(ra->variant, rb->variant);
+    for (int k = 0; k < trial_count(); k++) {
+        if (pair_a_first(k)) {
+            MEASURE_PREPARED(ra->variant, p, k, t5_prepare(ra, da), pattern_sites_1(da, blocks, passes));
+            MEASURE_PREPARED(rb->variant, p, k, t5_prepare(rb, db), pattern_sites_1(db, blocks, passes));
+        } else {
+            MEASURE_PREPARED(rb->variant, p, k, t5_prepare(rb, db), pattern_sites_1(db, blocks, passes));
+            MEASURE_PREPARED(ra->variant, p, k, t5_prepare(ra, da), pattern_sites_1(da, blocks, passes));
+        }
+    }
+    a->r = representative(current_test, ra->variant);
+    b->r = representative(current_test, rb->variant);
+    check_result("Test 5 pattern", a->r.result, sa.ones * passes);
+    check_result("Test 5 pattern", b->r.result, sb.ones * passes);
+    *pair = p;
+    free(da);
+    free(db);
+    return 1;
+}
+
+/* Row labels; static because the variant table keeps pointers to them. */
+static char t5_labels[T5_MAX_ROWS][40];
+
+static void t5_label(const T5Row *r, char *buf, size_t n)
+{
+    const T5Cell *c = &r->cell;
+    switch (c->family) {
+    case T5_RANDOM_WORDS:
+        snprintf(buf, n, "N=%3u L=%5u E=%3u", c->n, c->l, r->exposure);
+        break;
+    case T5_DEBRUIJN:
+        snprintf(buf, n, "Control de Bruijn %4u", c->l);
+        break;
+    case T5_BALANCED_REF:
+        snprintf(buf, n, "Control reference %u", c->l);
+        break;
+    default:
+        snprintf(buf, n, "Control %s", t5_family_ids[c->family]);
+        break;
+    }
+}
+
+/* Gives measured rows variant ids 0, 1, ... in row order and skipped rows
+ * the ids after them; returns how many rows are measured. */
+static int t5_number(T5Row *t, int n)
+{
+    int next = 0;
+    for (int i = 0; i < n; i++)
+        if (t[i].skip == T5_MEASURED) t[i].variant = next++;
+    const int measured = next;
+    for (int i = 0; i < n; i++)
+        if (t[i].skip != T5_MEASURED) t[i].variant = next++;
+    return measured;
+}
+
+/* The index in t[] of the row with variant id v. */
+static int t5_by_variant(const T5Row *t, int n, int v)
+{
+    for (int i = 0; i < n; i++)
+        if (t[i].variant == v) return i;
+    return -1;
+}
+
+/* Measures every unskipped row, the de Bruijn 32 and reference controls
+ * as the pair.  rows[] is indexed by variant id.  Returns 0 if an input
+ * failed validation (nothing more is measured). */
+static int t5_measure_all(const T5Row *t, int n, ReportRow *rows, Work *works, int *pair)
+{
+    int db32 = -1;
+    int ref = -1;
+    for (int i = 0; i < n; i++) {
+        if (t[i].skip != T5_MEASURED) continue;
+        if (t[i].cell.family == T5_DEBRUIJN && t[i].cell.l == 32) db32 = i;
+        if (t[i].cell.family == T5_BALANCED_REF) ref = i;
+    }
+    for (int i = 0; i < n; i++) {
+        const T5Row *r = &t[i];
+        if (r->skip != T5_MEASURED || i == ref) continue;
+        ReportRow *row = &rows[r->variant];
+        Work *w = &works[r->variant];
+        w->count = (u64)r->cell.n * r->cell.blocks * r->passes;
+        w->unit = "branch";
+        row->work = w;
+        if (i != db32) {
+            if (!measure_t5_row(r, row)) return 0;
+            continue;
+        }
+        ReportRow *rr = &rows[t[ref].variant];
+        Work *rw = &works[t[ref].variant];
+        *rw = *w;
+        rr->work = rw;
+        if (!measure_t5_pair(r, &t[ref], row, rr, pair)) return 0;
     }
     return 1;
 }
 
-/* Lists the periods at or under 0.05 misses per element; needs the miss
- * counter on every row.  A description of these results, not a capacity. */
-static void print_low_miss_periods(FILE *report, const ReportRow *rows, const Work *w)
+/* Registers the skipped rows (after the measured ones) and says which:
+ * a count of cells without their kernel in this build, and each cell over
+ * the point budget. */
+static void t5_emit_skipped(FILE *report, const T5Row *t, int n, int measured)
 {
-    char list[64] = "";
+    static const Work none = { 0, "branch" };
+    char list[512] = "";
     size_t used = 0;
-    for (int i = 0; i <= DB_ORDERS; i++)
-        if (!result_has(&rows[i].r, CTR_MISSES)) return;
-    for (int i = 0; i < DB_ORDERS; i++) {
-        if (misses_per_item(&rows[i].r, w) > 0.05) continue;
-        char period[16];
-        snprintf(period, sizeof period, "%u", 1u << (i + DB_MIN_ORDER));
-        list_append(list, sizeof list, &used, period);
+    int backend = 0;
+    for (int v = measured; v < n; v++) {
+        const int i = t5_by_variant(t, n, v);
+        log_variant(v, t5_labels[i], &none);
+        t5_params(&t[i], NULL);
+        if (t[i].skip == T5_SKIP_BACKEND) {
+            backend++;
+            continue;
+        }
+        char entry[64];
+        snprintf(entry, sizeof entry, "N=%u L=%u E=%u", t[i].cell.n, t[i].cell.l, t[i].exposure);
+        list_append(list, sizeof list, &used, entry);
     }
-    const char *shown = used ? list : "none";
-    printf("  → Periods at ≤ 0.05 misses/elem: %s\n", shown);
-    if (report) fprintf(report, "**Periods at ≤ 0.05 misses/elem:** %s\n\n", shown);
+    if (backend) {
+        printf("  → Skipped: %d cells with N > 1 (they need the assembly kernels)\n", backend);
+        if (report)
+            fprintf(report, "_Skipped: %d cells with N > 1 (they need the assembly kernels)._\n\n",
+                    backend);
+    }
+    if (used) {
+        printf("  → Skipped (over the point budget): %s\n", list);
+        if (report) fprintf(report, "_Skipped (over the point budget): %s._\n\n", list);
+    }
 }
 
-/* Test 5's summary lines: random vs the shortest and longest period, cost
- * per miss, and the low-miss periods.  Below DB_MIN_SAMPLE elements the
- * random row repeats so often that a predictor may learn it, so a note
- * replaces them. */
-static void print_test5_summary(FILE *report, const ReportRow *rows,
-                                const Work *w, size_t len, const int pairs[2])
+/* One matrix cell: misses (or cycles) per data-branch execution of the row
+ * with group g, exposure e, N and L, "skip" or "–"; returns 1 if it holds a
+ * number. */
+static int t5_cell(char *buf, size_t bn, const T5Row *t, int n, const ReportRow *rows,
+                   int g, unsigned e, unsigned nn, unsigned l, int ctr)
 {
-    if (len < DB_MIN_SAMPLE) {
-        printf("\n  → n/a: --size below %d, so a predictor may learn the random row\n",
-               DB_MIN_SAMPLE);
-        if (report)
-            fprintf(report, "_n/a: --size below %d, so a predictor may learn the "
-                            "random row; summary omitted._\n\n", DB_MIN_SAMPLE);
-        return;
+    for (int i = 0; i < n; i++) {
+        const T5Row *r = &t[i];
+        if (r->group != g || r->exposure != e || r->cell.n != nn || r->cell.l != l) continue;
+        if (r->skip != T5_MEASURED) { snprintf(buf, bn, "skip"); return 0; }
+        const Result *res = &rows[r->variant].r;
+        const u64 work = rows[r->variant].work->count;
+        if (!result_has(res, ctr) || !work) break;
+        snprintf(buf, bn, ctr == CTR_MISSES ? "%.3f" : "%.2f",
+                 (double)res->counts[ctr] / (double)work);
+        return 1;
     }
-    emit_pair_ratio(report, "\n  Random vs period 32:    ", "Random vs period 32",
-                    pairs[0], "");
-    emit_pair_ratio(report, "  Random vs period 2048:  ", "Random vs period 2048",
-                    pairs[1], "");
-    print_pair_cost(report, pairs[0]);
-    print_low_miss_periods(report, rows, w);
+    snprintf(buf, bn, "–");
+    return 0;
+}
+
+/* One N × L table of a group at one exposure, if any cell has the counter. */
+static void t5_matrix(FILE *report, const T5Row *t, int n, const ReportRow *rows,
+                      const T5Group *gr, int g, unsigned e, int ctr)
+{
+    char cell[32];
+    int any = 0;
+    for (int i = 0; i < gr->nn; i++)
+        for (int j = 0; j < gr->nl; j++)
+            any += t5_cell(cell, sizeof cell, t, n, rows, g, e, gr->n[i], gr->l[j], ctr);
+    if (!any) return;
+    const char *what = ctr == CTR_MISSES ? "Misses" : "Cycles";
+    printf("\n  %s per data branch (blocks %zu, E=%u):\n  %5s", what, gr->blocks, e, "N");
+    if (report) fprintf(report, "**%s per data branch (blocks %zu, E=%u):**\n\n| N |",
+                        what, gr->blocks, e);
+    for (int j = 0; j < gr->nl; j++) {
+        snprintf(cell, sizeof cell, "L=%u", gr->l[j]);
+        printf(" %13s", cell);
+        if (report) fprintf(report, " L=%u |", gr->l[j]);
+    }
+    printf("\n");
+    if (report) {
+        fputs("\n|---:|", report);
+        for (int j = 0; j < gr->nl; j++) fputs("---:|", report);
+        fputc('\n', report);
+    }
+    for (int i = 0; i < gr->nn; i++) {
+        printf("  %5u", gr->n[i]);
+        if (report) fprintf(report, "| %u |", gr->n[i]);
+        for (int j = 0; j < gr->nl; j++) {
+            t5_cell(cell, sizeof cell, t, n, rows, g, e, gr->n[i], gr->l[j], ctr);
+            printf(" %13s", cell);
+            if (report) fprintf(report, " %s |", cell);
+        }
+        printf("\n");
+        if (report) fputc('\n', report);
+    }
+    if (report) fputc('\n', report);
+}
+
+/* The training, footprint, contamination and interpretation notes. */
+static void t5_notes(FILE *report, const T5Profile *p)
+{
+    char exp[64] = "";
+    char groups[128] = "";
+    size_t eu = 0;
+    size_t gu = 0;
+    for (int e = 0; e < p->nexp; e++) {
+        char x[16];
+        snprintf(x, sizeof x, "%u", p->exposures[e]);
+        list_append(exp, sizeof exp, &eu, x);
+    }
+    for (int g = 0; g < p->ngroups; g++) {
+        char x[32];
+        snprintf(x, sizeof x, "N × %zu", p->groups[g].blocks);
+        list_append(groups, sizeof groups, &gu, x);
+    }
+    char line[4][320];
+    snprintf(line[0], sizeof line[0], "Training: %s complete periods per site before every "
+             "trial; cumulative exposure per kernel is in the export (exposure_before).", exp);
+    snprintf(line[1], sizeof line[1], "Footprint: %s data bytes per cell in each group (%u "
+             "for the controls); cache residency is not measured.", groups, T5_CONTROL_BLOCKS);
+    snprintf(line[2], sizeof line[2], "Misses include the block and pass loop branches "
+             "(1 per N data branches, plus pass exits).");
+    snprintf(line[3], sizeof line[3], "These rates describe this kernel's learnability on "
+             "this machine; no knee here is a table capacity or history length.");
+    for (int i = 0; i < 4; i++) {
+        printf("  → %s\n", line[i]);
+        if (report) fprintf(report, "_%s_\n\n", line[i]);
+    }
+}
+
+static void t5_summary(FILE *report, const T5Row *t, int n, const ReportRow *rows,
+                       const T5Profile *p, int pair)
+{
+    for (int e = 0; e < p->nexp; e++)
+        for (int g = 0; g < p->ngroups; g++) {
+            t5_matrix(report, t, n, rows, &p->groups[g], g, p->exposures[e], CTR_MISSES);
+            t5_matrix(report, t, n, rows, &p->groups[g], g, p->exposures[e], CTR_CYCLES);
+        }
+    printf("\n");
+    if (pair >= 0) {
+        emit_pair_ratio(report, "  Reference vs de Bruijn 32: ", "Reference vs de Bruijn 32",
+                        pair, "");
+        print_pair_cost(report, pair);
+    }
+    t5_notes(report, p);
 }
 
 static void run_test5(FILE *report)
 {
     seed_test(5);
-    const size_t len = size;
-    printf("TEST 5 — Pattern Learnability  (de Bruijn k=%d..%d vs random 50%%, %zu×%u reps)\n",
-           DB_MIN_ORDER, DB_MAX_ORDER, len, reps);
-    printf("  %s\n\n", DB_DESC);
-    if (!test5_size_ok(len)) {
-        char reason[96];
-        snprintf(reason, sizeof reason,
-                 "--size %zu is not a multiple of %u (whole de Bruijn periods are required).",
-                 len, DB_MAX_PERIOD);
-        emit_skip(report, DB_TITLE, reason);
-        return;
-    }
+    const T5Profile *p = &t5_profiles[profile];
+    T5Row t[T5_MAX_ROWS];
+    const int n = t5_rows(p, t);
+    const int measured = t5_number(t, n);
+    printf("TEST 5 — Pattern Learnability Matrix  (%s profile: %d rows, %d measured)\n",
+           profile_names[profile], n, measured);
+    printf("  %s\n\n", T5_DESC);
+    for (int i = 0; i < n; i++) t5_label(&t[i], t5_labels[i], sizeof t5_labels[i]);
 
-    u8 *buf = malloc(len);
-    u8 *rand_buf = malloc(len);
-    if (!buf || !rand_buf) { perror("malloc"); exit(1); }
-    const Result none = {0};
-    ReportRow rows[DB_ORDERS + 1];
-    for (int i = 0; i <= DB_ORDERS; i++) {
-        rows[i].label = db_labels[i];
-        rows[i].r     = none;
-        rows[i].work  = NULL;
-    }
-    int pairs[2] = { -1, -1 };
-    const int ok = measure_patterns(buf, rand_buf, len, rows, pairs);
-    free(buf);
-    free(rand_buf);
-    if (!ok) {
+    ReportRow *rows = calloc((size_t)(measured ? measured : 1), sizeof *rows);
+    Work *works = calloc((size_t)(measured ? measured : 1), sizeof *works);
+    if (!rows || !works) { perror("calloc"); exit(1); }
+    for (int i = 0; i < n; i++)
+        if (t[i].skip == T5_MEASURED) rows[t[i].variant].label = t5_labels[i];
+    int pair = -1;
+    if (!t5_measure_all(t, n, rows, works, &pair)) {
         sanity_failed = 1;
+        free(rows);
+        free(works);
         return;
     }
-    u64 sink = 0;
-    for (int i = 0; i <= DB_ORDERS; i++) sink += rows[i].r.result;
-    anti_dce_sink(sink);
-
-    const Work work = { (u64)len * reps, "elem" };
-    emit_rows(report, DB_TITLE, DB_DESC, rows, DB_ORDERS + 1, &work);
-    print_test5_summary(report, rows, &work, len, pairs);
+    if (measured) emit_rows(report, T5_TITLE, T5_DESC, rows, measured, &works[0]);
+    t5_emit_skipped(report, t, n, measured);
+    t5_summary(report, t, n, rows, p, pair);
+    free(rows);
+    free(works);
     printf("\n");
 }
 
@@ -2745,7 +3188,7 @@ static const TestDesc test_descs[] = {
     { "bias-ordering",        1, "Test 2 — Bias and Ordering"     },
     { "indirect-dispatch",    1, "Test 3 — Indirect Dispatch"     },
     { "branch-vs-branchless", 1, "Test 4 — Branch vs. Branchless" },
-    { "pattern-matrix",       1, "Test 5 — Pattern Learnability"  },
+    { "pattern-matrix",       1, "Test 5 — Pattern Learnability Matrix" },
     { "loop-exits",           1, "Test 6 — Loop Exits"            },
 };
 CHECK_LEN(test_descs_len_check, test_descs, NUM_TESTS);
@@ -2759,9 +3202,14 @@ static int test_streams(int n)
         5 * 4 + 2,            /* Test 2: two pairs per bias, two constants */
         2 * T3_COUNTS,        /* Test 3: one pair per target count */
         6,                    /* Test 4: three pairs */
-        2 * 2 + DB_ORDERS - 2,/* Test 5: two pairs, the other periods alone */
+        0,                    /* Test 5: counted below, per profile */
         0,                    /* Test 6: counted below, per profile */
     };
+    if (n == 5) {   /* every measured row is one stream (the pair's two included) */
+        T5Row rows[T5_MAX_ROWS];
+        const int k = t5_rows(&t5_profiles[profile], rows);
+        return t5_number(rows, k);
+    }
     if (n == 6) {
         T6Row rows[T6_MAX_ROWS];
         return t6_rows(rows);
@@ -2810,7 +3258,7 @@ typedef struct {
 static const KernelDesc kernel_descs[] = {
     { KERNEL(sum_threshold, 2, KERNEL_BACKEND),   "elem",  1, 0, 2, ASM_TAKEN_WHEN, "1,4" },
     { KERNEL(sum_branchless, 1, "c"),             "elem",  0, 0, 1, NULL,           "4"   },
-    { KERNEL(count_decisions, 2, KERNEL_BACKEND), "elem",  1, 0, 2, ASM_TAKEN_WHEN, "2,5" },
+    { KERNEL(count_decisions, 2, KERNEL_BACKEND), "elem",  1, 0, 2, ASM_TAKEN_WHEN, "2"   },
     { KERNEL(pattern_sites_1, 1, KERNEL_BACKEND), "branch", 1, 0, 2, ASM_TAKEN_WHEN, "5"  },
 #if KERNEL_ASM
     { KERNEL(pattern_sites_4, 1, KERNEL_BACKEND),   "branch", 4,   0, 5,   ASM_TAKEN_WHEN, "5" },
@@ -3161,10 +3609,12 @@ static void write_trials(FILE *f)
         const TrialRecord *t = &trial_log[i];
         fprintf(f, "{\"type\":\"trial\",\"test\":%d,\"variant\":%d,\"pair\":", t->test, t->variant);
         json_int(f, t->pair >= 0, t->pair);
-        fprintf(f, ",\"seq\":%d,\"trial\":%d,\"train_runs\":%d,\"time_ms\":%.17g,"
+        fprintf(f, ",\"seq\":%d,\"trial\":%d,\"train_runs\":", t->seq, t->trial);
+        json_int(f, !t->has_exposure, TRAIN_RUNS);   /* Test 5 trains by exposure */
+        fprintf(f, ",\"time_ms\":%.17g,"
                    "\"result\":%" PRIu64 ",\"perf_status\":\"%s\",\"enabled_ns\":%" PRIu64
                    ",\"running_ns\":%" PRIu64 ",\"counts\":",
-                t->seq, t->trial, TRAIN_RUNS, t->r.time_ms, t->r.result,
+                t->r.time_ms, t->r.result,
                 perf_status_name(t->r.perf_status), t->r.enabled_ns, t->r.running_ns);
         write_counts(f, &t->r, t->r.counts);
         fputs(",\"raw_counts\":", f);
@@ -3304,13 +3754,11 @@ static void print_usage(const char *prog)
            "  -t, --test <N>       run only test N (1–%d); repeat to run several\n"
            "                       (default: tests 1–4; tests 5–6 run only when selected)\n"
            "      --hard           run all tests, including the hard tests 5 and 6\n"
-           "      --size <N>       elements per array (tests 1/2/4/5/6) and calls\n"
-           "                       per trial (test 3); K/M suffixes allowed\n"
-           "                       (default: %u = 4M, max: %lu = 1024M;\n"
-           "                       test 5 needs a multiple of 2048; test 6 needs\n"
-           "                       size ≥ 64 and size × reps ≥ 65664)\n"
-           "      --reps <N>       passes over the array per trial, tests 1/2/4/5;\n"
-           "                       scales test 6's branch budget with --size\n"
+           "      --size <N>       elements per array (tests 1/2/4) and calls per\n"
+           "                       trial (test 3); K/M suffixes allowed\n"
+           "                       (default: %u = 4M, max: %lu = 1024M); tests 5\n"
+           "                       and 6 take their sizes from --profile\n"
+           "      --reps <N>       passes over the array per trial, tests 1/2/4\n"
            "                       (default: %u, max: %lu)\n"
            "      --profile <P>    quick, standard or research: the grids of tests 5\n"
            "                       and 6 (default: standard)\n"
@@ -3489,7 +3937,7 @@ static void print_banner(const char *tests_list)
     }
     printf("  Compiler:        %s\n", COMPILER_VERSION);
     printf("  Kernels:         %s\n", KERNEL_ASM
-           ? KERNEL_BACKEND " (Tests 1, 2, 4 and 5 branch kernels)"
+           ? KERNEL_BACKEND " (the branch kernels of Tests 1, 2 and 4–6)"
            : "C only (branches depend on the compiler)");
     if (BUILD_FLAGS[0])
         printf("  Build flags:     %s\n", BUILD_FLAGS);
@@ -3513,8 +3961,8 @@ static void write_report_header(FILE *report, const char *tests_list)
     fprintf(report, "_Benchmark revision %d._\n\n", BENCH_REVISION);
     fprintf(report, "_Profile: %s._\n\n", profile_names[profile]);
     fprintf(report, "%s\n\n", KERNEL_ASM
-            ? "_Kernels: " KERNEL_BACKEND " for the data-branch kernels of Tests 1, 2, 4 "
-              "and 5; the other kernels are C._"
+            ? "_Kernels: " KERNEL_BACKEND " for the branch kernels of Tests 1, 2 and 4–6; "
+              "the other kernels are C._"
             : "_Kernels: C only; their branches depend on the compiler (check with "
               "check_kernels.sh)._");
     if (seed_given)

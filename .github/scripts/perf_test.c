@@ -210,7 +210,7 @@ static void per_row_work(void)
     puts("ok   per-row work in report tables");
 }
 
-/* Test 5's pattern generator and checker, size rule and seeded fill. */
+/* Test 5's de Bruijn generator and checker, and its RNG discipline. */
 static void pattern_learnability(void)
 {
     u8 p[DB_MAX_PERIOD];
@@ -226,28 +226,13 @@ static void pattern_learnability(void)
     for (unsigned i = 0; i < 32; i++) alt[i] = (u8)(i & 1u);
     assert(debruijn_valid(alt, 5) == 0);
 
-    assert(test5_size_ok(2048) && test5_size_ok(4194304));
-    assert(!test5_size_ok(1000) && !test5_size_ok(1024) && !test5_size_ok(3072));
-
-    static u8 x[65536], y[65536];
+    /* Generating a cell's random words leaves the shared RNG stream alone. */
     const u64 before = rng_state;
-    fill_random_bits(x, sizeof x, 0x1234ULL);
+    u8 w[64];
+    const T5Cell c = { 4, 64, 64, T5_RANDOM_WORDS };
+    t5_random_word(&c, 0, w);
     assert(rng_state == before);
-    fill_random_bits(y, sizeof y, 0x1234ULL);
-    assert(memcmp(x, y, sizeof x) == 0);
-    size_t ones = 0;
-    for (size_t i = 0; i < sizeof x; i++) ones += x[i];
-    assert(ones > sizeof x * 45 / 100 && ones < sizeof x * 55 / 100);
-    puts("ok   Test 5 patterns and size rule");
-}
-
-static Result with_misses(u64 misses)
-{
-    Result r = {0};
-    r.perf_status = PERF_OK;
-    r.open_mask = perf_open_mask;
-    r.counts[CTR_MISSES] = misses;
-    return r;
+    puts("ok   Test 5 de Bruijn patterns and random words");
 }
 
 /* Summary lists stay inside their buffer when an item does not fit. */
@@ -265,88 +250,6 @@ static void bounded_list(void)
     assert(strcmp(buf, "1234567, abcdef") == 0);
     for (size_t i = 16; i < sizeof buf; i++) assert(buf[i] == 'X');
     puts("ok   bounded summary lists");
-}
-
-/* Renders the Test 5 summary into buf. */
-static void test5_summary_text(const ReportRow *rows, const Work *w, size_t len,
-                               char *buf, size_t bufsz)
-{
-    FILE *f = tmpfile();
-    assert(f);
-    reset_log(5);
-    const int pairs[2] = {
-        log_pair(0, DB_ORDERS, &rows[0].r, &rows[DB_ORDERS].r),
-        log_pair(DB_ORDERS - 1, DB_ORDERS, &rows[DB_ORDERS - 1].r, &rows[DB_ORDERS].r),
-    };
-    print_test5_summary(f, rows, w, len, pairs);
-    rewind(f);
-    memset(buf, 0, bufsz);
-    size_t n = fread(buf, 1, bufsz - 1, f);
-    (void)n;
-    assert(fclose(f) == 0);
-}
-
-/* Test 5's summary: the low-miss list, "none", missing counts, and n/a
- * below 64K elements. */
-static void test5_summary(void)
-{
-    ReportRow rows[DB_ORDERS + 1];
-    const Work w = {1000, "elem"};
-    char out[2048];
-    for (int i = 0; i <= DB_ORDERS; i++) {
-        rows[i].label = "x";
-        rows[i].r = with_misses(i < 3 ? 40 : 400);
-        rows[i].r.time_ms = 1;
-        rows[i].work = NULL;
-    }
-    test5_summary_text(rows, &w, 65536, out, sizeof out);
-    assert(strstr(out, "**Random vs period 32:**"));
-    assert(strstr(out, "**Periods at ≤ 0.05 misses/elem:** 32, 64, 128\n"));
-    for (int i = 0; i < 3; i++) {
-        rows[i].r = with_misses(400);
-        rows[i].r.time_ms = 1;
-    }
-    test5_summary_text(rows, &w, 65536, out, sizeof out);
-    assert(strstr(out, "**Periods at ≤ 0.05 misses/elem:** none\n"));
-    rows[2].r.perf_status = PERF_READ_FAILED;
-    test5_summary_text(rows, &w, 65536, out, sizeof out);
-    assert(!strstr(out, "Periods at"));
-    test5_summary_text(rows, &w, 2048, out, sizeof out);
-    assert(strstr(out, "_n/a: --size below 65536"));
-    assert(!strstr(out, "Random vs") && !strstr(out, "Periods at"));
-    puts("ok   Test 5 summary: list, none, missing counts, n/a");
-}
-
-/* Test 5 feeds its kernel the data its labels describe: whole de Bruijn
- * periods and the seeded random row. */
-static void measured_data(void)
-{
-    const int saved_leader = perf_leader;
-    const unsigned saved_reps = reps;
-    perf_leader = -1;   /* MEASURE without counters */
-    reps = 1;
-
-    static u8 buf[4096], rbuf[4096], expect[4096];
-    int pairs5[2];
-    reset_log(5);
-    const Result none = {0};
-    ReportRow rows5[DB_ORDERS + 1];
-    for (int i = 0; i <= DB_ORDERS; i++) {
-        rows5[i].label = "x";
-        rows5[i].r = none;
-        rows5[i].work = NULL;
-    }
-    assert(measure_patterns(buf, rbuf, sizeof buf, rows5, pairs5) == 1);
-    assert(pair_info[pairs5[0]].a == 0 && pair_info[pairs5[0]].b == DB_ORDERS);
-    assert(pair_info[pairs5[1]].a == DB_ORDERS - 1 && pair_info[pairs5[1]].b == DB_ORDERS);
-    for (int i = 0; i < DB_ORDERS; i++)
-        assert(rows5[i].r.result == sizeof buf / 2);   /* half ones per period */
-    fill_random_bits(expect, sizeof expect, test_seed(5, 0, 0));
-    assert(rows5[DB_ORDERS].r.result == count_ones(expect, sizeof expect));
-
-    perf_leader = saved_leader;
-    reps = saved_reps;
-    puts("ok   Test 5 rows measure the data their labels describe");
 }
 
 /* Each trial keeps its raw and scaled counts, scheduling times and the
@@ -901,6 +804,55 @@ static void t5_inputs(void)
     puts("ok   Test 5 inputs: periodic sites, independent validator, controls, seeds");
 }
 
+/* Training runs exactly E periods per site: whole passes plus a prefix
+ * (8 × 16 = 128 executions per site over 96 blocks: one pass and 32
+ * blocks).  The exposure record counts training and the timed passes. */
+static void t5_training(void)
+{
+    const unsigned n = KERNEL_ASM ? 4 : 1;   /* the C build has N = 1 only */
+    static u8 ones[96 * 4];
+    memset(ones, 1, sizeof ones);
+    assert(t5_train(n, ones, 96, 16, 8) == 128 * n);
+    assert(t5_train(n, ones, 96, 16, 6) == 96 * n);      /* exactly one pass */
+    assert(t5_train(n, ones, 96, 16, 2) == 32 * n);      /* a prefix only */
+    memset(t5_site_execs, 0, sizeof t5_site_execs);
+    const T5Row r = { { n, 16, 96, T5_RANDOM_WORDS }, 8, 0, 3, T5_MEASURED, 0 };
+    t5_prepare(&r, ones);
+    assert(next_has_exposure && next_exposure == 128);
+    assert(t5_site_execs[t5_kernel_index(n)] == 128 + 96 * 3);
+    next_has_exposure = 0;
+    memset(t5_site_execs, 0, sizeof t5_site_execs);
+    puts("ok   Test 5 training runs exact periods and records exposure");
+}
+
+/* Cells without a kernel in this build, or over the budget, are skipped
+ * with their reason; every profile's rows fit and are measured as one
+ * stream each. */
+static void t5_skips(void)
+{
+    const T5Profile *p = &t5_profiles[PROFILE_STANDARD];
+    T5Row r = { { 4, 16, 96, T5_RANDOM_WORDS }, 64, 0, 0, T5_MEASURED, 0 };
+    r.passes = t5_passes(&r.cell, p->min_execs);
+    assert(t5_skip_reason(&r, p) == (KERNEL_ASM ? T5_MEASURED : T5_SKIP_BACKEND));
+    r.cell.n = 1;
+    r.exposure = 1u << 30;
+    assert(t5_skip_reason(&r, p) == T5_SKIP_BUDGET);
+    for (int prof = PROFILE_QUICK; prof <= PROFILE_RESEARCH; prof++) {
+        T5Row rows[T5_MAX_ROWS];
+        const int n = t5_rows(&t5_profiles[prof], rows);
+        const int measured = t5_number(rows, n);
+        int skipped = 0;
+        for (int i = 0; i < n; i++) {
+            skipped += rows[i].skip != T5_MEASURED;
+            assert(rows[i].cell.blocks % rows[i].cell.l == 0);
+            if (!KERNEL_ASM && rows[i].cell.n > 1) assert(rows[i].skip == T5_SKIP_BACKEND);
+        }
+        assert(measured + skipped == n);
+        if (KERNEL_ASM) assert(skipped == 0);
+    }
+    puts("ok   Test 5 skips: backend and budget reasons, profile grids fit");
+}
+
 int main(void)
 {
     perf_leader = 42;
@@ -930,8 +882,6 @@ int main(void)
     per_row_work();
     pattern_learnability();
     bounded_list();
-    test5_summary();
-    measured_data();
     seeds();
     counter_metadata();
     pair_schedule();
@@ -946,5 +896,7 @@ int main(void)
     loop_inputs();
     pattern_kernels();
     t5_inputs();
+    t5_training();
+    t5_skips();
     return 0;
 }

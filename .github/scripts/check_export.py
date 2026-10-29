@@ -7,10 +7,12 @@ scaled counts against its raw counts and scheduling times.  With --report,
 also checks that the Markdown report shows the same medians, ranges,
 counter columns, Miss %, misses per item, ratios, effective-cost lines
 (resolved and inconclusive), Tests 1 and 4's condition-count line and
-Test 6's loop-exit curve.  Every selected test must have a test record
-with its id, and every Test 6 row its loop parameters.
+Test 5's matrices and Test 6's loop-exit curve.  Every selected test must
+have a test record with its id, every Test 6 row its loop parameters and
+every Test 5 row its cell parameters, one footprint per N in a group, and
+exposure records that match a replay of its training.
 
-Input records: every row of Tests 1-4 must have one.  Both rows of
+Input records: every measured row of Tests 1-5 must have one.  Both rows of
 a pair must have equal work and, where recorded, equal item and
 condition-true counts; a pair that compares two kernels must see the same
 input hash, and a pair that compares two orders of one kernel different
@@ -38,7 +40,9 @@ import sys
 
 COST_MIN_MISSES_PER_PAIR = 1000.0
 T2_ROWS = 17
-INPUT_TESTS = (1, 2, 3, 4)   # tests whose rows record their input
+INPUT_TESTS = (1, 2, 3, 4, 5)   # tests whose measured rows record their input
+T5_MIN_MEASURE_PERIODS = 64
+T5_FAMILIES = ("random-words", "constant-0", "alternating", "de-bruijn", "balanced-ref")
 # Below this many items per pass, two orders of one multiset can coincide
 # (one element; a 1/16 bias over 16 elements), so they may hash alike.
 ORDER_MIN_ITEMS = 1024
@@ -94,7 +98,9 @@ def check_structure(records):
     kernels = {k["id"] for k in by_type(records, "kernel")}
     variants = {(v["test"], v["variant"]): v for v in by_type(records, "variant")}
     for v in variants.values():
-        check(v["kernel"] in kernels, f"variant {v['test']}/{v['variant']}: no kernel {v['kernel']}")
+        skipped = (v.get("params") or {}).get("skipped")   # Test 5: never measured
+        check(v["kernel"] in kernels or (skipped and v["kernel"] is None),
+              f"variant {v['test']}/{v['variant']}: no kernel {v['kernel']}")
     trials = by_type(records, "trial")
     check(trials, "export has no trial records")
     for t in trials:
@@ -208,7 +214,7 @@ def check_pair_inputs(records, variants):
     do the same work on inputs of the same size and condition count; a
     kernel comparison sees one input, an order comparison two."""
     for (test, _), v in variants.items():
-        if test in INPUT_TESTS:
+        if test in INPUT_TESTS and not (v.get("params") or {}).get("skipped"):
             check(v["pass_items"] is not None and v["input_hash"] is not None,
                   f"Test {test} {v['label']!r}: no input record")
     pairs = by_type(records, "pair")
@@ -404,6 +410,124 @@ def check_loop_curve(records, variants, sections):
     return rows
 
 
+T5_PARAMS = ("N", "L", "blocks", "passes", "exposure", "family", "group", "data_bytes",
+             "skipped", "reason")
+
+
+def t5_variants(variants):
+    return {k: v for (t, k), v in variants.items() if t == 5}
+
+
+def check_t5_params(variants):
+    """Test 5: each measured row runs N sites over whole periods of L, long
+    enough, with the ones it recorded; each N keeps one data footprint
+    across the periods of its group and exposure."""
+    rows = t5_variants(variants)
+    footprint = {}
+    for v in rows.values():
+        where = f"Test 5 {v['label']!r}"
+        prm = v.get("params") or {}
+        check(all(k in prm for k in T5_PARAMS), f"{where}: params {prm}, want {T5_PARAMS}")
+        n, l, blocks, passes = prm["N"], prm["L"], prm["blocks"], prm["passes"]
+        check(prm["data_bytes"] == n * blocks, f"{where}: data_bytes {prm['data_bytes']}, N × blocks {n * blocks}")
+        footprint.setdefault((prm["group"], n, prm["exposure"]), set()).add(prm["data_bytes"])
+        if prm["skipped"]:
+            check(prm["reason"] in (1, 2), f"{where}: skipped with reason {prm['reason']}")
+            continue
+        check(v["work"] == n * blocks * passes and v["unit"] == "branch",
+              f"{where}: work {v['work']} {v['unit']}, want N × blocks × passes = {n * blocks * passes} branch")
+        check(blocks % l == 0, f"{where}: {blocks} blocks are not whole periods of {l}")
+        check(v["pass_items"] == n * blocks and v["cond_true"] == prm["ones"],
+              f"{where}: input {v['pass_items']} items, {v['cond_true']} ones; params say "
+              f"{n * blocks}, {prm['ones']}")
+        check(passes * blocks // l >= T5_MIN_MEASURE_PERIODS,
+              f"{where}: {passes * blocks // l} measured periods, want ≥ {T5_MIN_MEASURE_PERIODS}")
+        if T5_FAMILIES[prm["family"]] in ("de-bruijn", "balanced-ref"):
+            check(prm["ones"] * 2 == n * blocks, f"{where}: {prm['ones']} ones, not half")
+    for key, sizes in footprint.items():
+        check(len(sizes) == 1, f"Test 5 group {key[0]} N={key[1]} E={key[2]}: footprints {sorted(sizes)}")
+    if rows:
+        ok(f"Test 5: {len(rows)} rows have consistent cell parameters and footprints")
+
+
+def check_exposure(records, variants):
+    """Replays Test 5's training and timed calls in run order: each trial's
+    exposure_before is its kernel's per-site executions before the timed
+    call (training of exactly E periods included)."""
+    rows = t5_variants(variants)
+    done = {}
+    n = 0
+    for t in sorted((t for t in by_type(records, "trial") if t["test"] == 5), key=lambda t: t["seq"]):
+        prm = rows[t["variant"]]["params"]
+        before = done.get(prm["N"], 0) + prm["exposure"] * prm["L"]
+        check(t["exposure_before"] == before,
+              f"Test 5 trial seq {t['seq']}: exposure_before {t['exposure_before']}, replay gives {before}")
+        done[prm["N"]] = before + prm["blocks"] * prm["passes"]
+        n += 1
+    for t in by_type(records, "trial"):
+        if t["test"] != 5:
+            check(t.get("exposure_before") is None, f"trial seq {t['seq']}: exposure outside Test 5")
+    if n:
+        ok(f"Test 5: {n} trials' exposure matches the replayed training")
+
+
+def t5_matrices(section):
+    """{(what, blocks, E): [table lines]} from a Test 5 report section."""
+    tables = {}
+    key = None
+    for line in section.splitlines():
+        if line.startswith("**") and " per data branch (blocks " in line:
+            what = line[2:].split()[0]
+            inner = line[line.index("(") + 1:line.index(")")]
+            blocks = int(inner.split(",")[0].split()[1])
+            e = int(inner.split("E=")[1])
+            key = (what, blocks, e)
+            tables[key] = []
+        elif key and line.startswith("|"):
+            tables[key].append(line)
+        elif key and tables[key] and not line.strip():
+            key = None
+    return tables
+
+
+def check_t5_matrix(records, variants, sections):
+    """Every matrix cell is its row's median misses (3 decimals) or cycles
+    (2 decimals) per data-branch execution, "skip" or "–"; each table covers
+    exactly its group's random-word rows.  Returns how many cells."""
+    rows = t5_variants(variants)
+    trials = by_type(records, "trial")
+    cells_seen = 0
+    for (what, blocks, e), lines in t5_matrices(sections.get(5, "")).items():
+        header = cells(lines[0])
+        cols = [int(h[2:]) for h in header[1:]]
+        covered = 0
+        for line in lines[2:]:
+            row = cells(line)
+            n = int(row[0])
+            for l, cell in zip(cols, row[1:]):
+                where = f"Test 5 matrix {what.lower()} blocks {blocks} E={e} N={n} L={l}"
+                match = [(k, v) for k, v in rows.items()
+                         if v["params"]["N"] == n and v["params"]["L"] == l and
+                         v["params"]["blocks"] == blocks and v["params"]["exposure"] == e and
+                         T5_FAMILIES[v["params"]["family"]] == "random-words"]
+                check(len(match) == 1, f"{where}: {len(match)} matching rows")
+                k, v = match[0]
+                if v["params"]["skipped"]:
+                    want = "skip"
+                else:
+                    med = representative([t for t in trials if t["test"] == 5 and t["variant"] == k])[0]
+                    count = med["counts"]["misses" if what == "Misses" else "cycles"]
+                    fmt = "{:.3f}" if what == "Misses" else "{:.2f}"
+                    want = "–" if count is None else fmt.format(count / v["work"])
+                check(cell == want, f"{where}: {cell}, median trial gives {want}")
+                covered += 1
+                cells_seen += 1
+        group = [v for v in rows.values() if v["params"]["blocks"] == blocks and
+                 v["params"]["exposure"] == e and T5_FAMILIES[v["params"]["family"]] == "random-words"]
+        check(covered == len(group), f"Test 5 {what} table blocks {blocks} E={e}: {covered} cells for {len(group)} rows")
+    return cells_seen
+
+
 def check_threshold_note(variants, sections, test):
     """Tests 1 and 4: every row has the same multiset, and the report states
     its condition-true count; returns how many lines were compared."""
@@ -461,6 +585,8 @@ def check_report(records, variants, path):
             lines += check_threshold_note(variants, sections, test)
     if any(t["test"] == 6 for t in trials):
         lines += check_loop_curve(records, variants, sections)
+    if any(t["test"] == 5 for t in trials):
+        lines += check_t5_matrix(records, variants, sections)
     check(rows, "report check compared no table rows")
     ok(f"report matches the export: {rows} table rows, {lines} summary lines")
 
@@ -520,6 +646,8 @@ def main():
         check_pair_inputs(records, variants)
         check_bias(variants)
         check_loop_params(variants)
+        check_t5_params(variants)
+        check_exposure(records, variants)
         if args.report:
             check_report(records, variants, args.report)
         if args.kernel_counts:

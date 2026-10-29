@@ -5,7 +5,7 @@
 # assembly kernels), and losing it silently invalidates results.  x86-64
 # and aarch64 only.
 #
-#   Test 1/4 sum_threshold, Test 2/5 count_decisions:
+#   Test 1/4 sum_threshold, Test 2 count_decisions:
 #       exactly one data branch, no branchless instruction (conditional
 #       move/select, flag arithmetic such as setcc/sbb/adc), no SIMD.
 #   Test 4 sum_branchless: no data branch (cmov/setcc allowed), no SIMD.
@@ -443,7 +443,7 @@ check() {
 }
 
 check "Test 1/4 sum_threshold"            'sum_threshold'             data-branch 1
-check "Test 2/5 count_decisions"          'count_decisions'           data-branch 1
+check "Test 2 count_decisions"            'count_decisions'           data-branch 1
 check "Test 4 sum_branchless"             'sum_branchless'            no-data-branch
 check "Test 3 dispatch_indexed"           'dispatch_indexed'          indirect-call 1
 if c_kernel_build; then
