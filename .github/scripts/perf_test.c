@@ -59,7 +59,7 @@ static void invalid_reporting(Result good)
     print_miss_cost(f, &bad, &good);
     assert(ftell(f) == 0);
     const Work work = {100, "elem"};
-    const ReportRow rows[] = {{"invalid", bad}, {"valid", good}};
+    const ReportRow rows[] = {{"invalid", bad, NULL}, {"valid", good, NULL}};
     report_table(f, "test", NULL, rows, 2, &work);
     rewind(f);
     char output[2048] = {0};
@@ -160,6 +160,30 @@ static void raw_event_reporting(void)
     puts("ok   raw PMU events named in banner and report");
 }
 
+/* A row's own Work overrides the table's for its misses-per-item column. */
+static void per_row_work(void)
+{
+    Result r = {0};
+    r.counts_valid = 1;
+    r.time_ms = 1;
+    r.counts[CTR_MISSES] = 500;
+    const Work shared = {1000, "elem"}, own = {100, "block"};
+    const ReportRow rows[] = {{"shared", r, NULL}, {"own", r, &own}};
+    assert(row_work(&rows[0], &shared) == &shared);
+    assert(row_work(&rows[1], &shared) == &own);
+    FILE *f = tmpfile();
+    assert(f);
+    report_table(f, "test", NULL, rows, 2, &shared);
+    rewind(f);
+    char output[2048] = {0};
+    assert(fread(output, 1, sizeof(output) - 1, f) > 0);
+    assert(fclose(f) == 0);
+    assert(strstr(output, " Misses/elem |\n"));
+    assert(strstr(output, "| shared |") && strstr(output, " 0.500 |\n"));
+    assert(strstr(output, "| own |") && strstr(output, " 5.000 |\n"));
+    puts("ok   per-row work in report tables");
+}
+
 int main(void)
 {
     perf_leader = 42;
@@ -186,5 +210,6 @@ int main(void)
     invalid_reporting(first);
     failed_measurements();
     raw_event_reporting();
+    per_row_work();
     return 0;
 }

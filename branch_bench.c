@@ -503,17 +503,24 @@ static void cpu_heading(char *buf, size_t bufsz)
     snprintf(buf + len, bufsz - len, " @ %.2f GHz", ghz);
 }
 
-typedef struct {
-    const char *label;
-    Result      r;
-} ReportRow;
-
 /* Work done per trial, for the misses-per-item column: elements processed
  * (tests 1/2/4, all passes) or indirect calls made (test 3). */
 typedef struct {
     u64         count;
     const char *unit;      /* "elem" or "call" */
 } Work;
+
+typedef struct {
+    const char *label;
+    Result      r;
+    const Work *work;      /* this row's work, or NULL for the test's Work */
+} ReportRow;
+
+/* The Work that applies to one row: its own, else the test's. */
+static const Work *row_work(const ReportRow *row, const Work *w)
+{
+    return row->work ? row->work : w;
+}
 
 static double misses_per_item(const Result *r, const Work *w)
 {
@@ -569,7 +576,7 @@ static void report_table(FILE *f, const char *title, const char *desc,
         else
             fprintf(f, " – |");
         if (result_has(r, CTR_MISSES))
-            fprintf(f, " %.3f |\n", misses_per_item(r, w));
+            fprintf(f, " %.3f |\n", misses_per_item(r, row_work(&rows[i], w)));
         else
             fprintf(f, " – |\n");
     }
@@ -628,7 +635,7 @@ static void emit_rows(FILE *report, const char *title, const char *desc,
                       const ReportRow *rows, int n, const Work *w)
 {
     for (int i = 0; i < n; i++)
-        print_row(rows[i].label, &rows[i].r, w);
+        print_row(rows[i].label, &rows[i].r, row_work(&rows[i], w));
     report_table(report, title, desc, rows, n, w);
 }
 
@@ -734,8 +741,8 @@ static void run_test1(FILE *report)
 
     const Work work = { (u64)len * reps, "elem" };
     const ReportRow rows[] = {
-        { "Sorted   (predictable, ~0% misses)",    rs },
-        { "Shuffled (unpredictable, ~50% misses)", rr },
+        { "Sorted   (predictable, ~0% misses)",    rs, NULL },
+        { "Shuffled (unpredictable, ~50% misses)", rr, NULL },
     };
     emit_pair_summary(report, "Test 1 — Threshold Sum",
                       "Sorted vs shuffled array, same direct branch. Identical data, different order.",
@@ -799,8 +806,8 @@ static void run_test2(FILE *report)
 
     const Work work = { (u64)len * reps, "elem" };
     const ReportRow rows[] = {
-        { "Periodic (every 4th — learnable)",   rp },
-        { "Random   (same rate — unlearnable)", rr },
+        { "Periodic (every 4th — learnable)",   rp, NULL },
+        { "Random   (same rate — unlearnable)", rr, NULL },
     };
     emit_pair_summary(report, "Test 2 — Stride Conditional",
                       "Both arrays have ~25% ones; only the pattern differs.",
@@ -899,8 +906,8 @@ static void run_test3(FILE *report)
 
     const Work work = { len, "call" };
     const ReportRow rows[] = {
-        { "Sequential i%32 (learnable cycle)", rs },
-        { "Random index (unlearnable)",        rr },
+        { "Sequential i%32 (learnable cycle)", rs, NULL },
+        { "Random index (unlearnable)",        rr, NULL },
     };
     emit_pair_summary(report, "Test 3 — Indirect Dispatch",
                       "32 targets, function-pointer call. The indirect predictor must guess the target address.",
@@ -999,10 +1006,10 @@ static void run_test4(FILE *report)
 
     const Work work = { (u64)len * reps, "elem" };
     const ReportRow rows[] = {
-        { "Sorted  + branch",     r_sb },
-        { "Sorted  + branchless", r_sl },
-        { "Random  + branch",     r_rb },
-        { "Random  + branchless", r_rl },
+        { "Sorted  + branch",     r_sb, NULL },
+        { "Sorted  + branchless", r_sl, NULL },
+        { "Random  + branch",     r_rb, NULL },
+        { "Random  + branchless", r_rl, NULL },
     };
     emit_rows(report, "Test 4 — Branch vs Branchless",
               "Same sum, computed via conditional jump vs. arithmetic mask, on sorted and random data.",

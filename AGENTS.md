@@ -134,7 +134,7 @@ GCC *does* fold `sum_branch` into `sum_threshold`, because their bodies are iden
 ### 7. Formatted Report Emission
 Each test function receives `FILE *report` (which will be `NULL` if `-o` was not specified). Any new test should:
 - describe its work per trial once, as `const Work work = { count, "elem" }` (or `"call"`), which drives the misses-per-item column;
-- construct a `ReportRow` array (`{ label, result }`);
+- construct a `ReportRow` array (`{ label, result, work }`). Every initializer names `work`: `NULL` when the test's single `Work` applies, or a pointer to the row's own `Work` when rows do different amounts of work (it sets that row's misses-per-item; the column header keeps the unit of the `Work` passed to `emit_rows()`). `-Wextra` rejects an initializer that leaves it out;
 - for standard 2-row (predictable vs. unpredictable) tests, call `emit_pair_summary(report, title, desc, rows, &work)`, which emits the console rows, the Markdown table, the slowdown ratio and the cost-per-miss line;
 - for multi-row tests (like Test 4), call `emit_rows(report, title, desc, rows, count, &work)`, `emit_ratio(report, console_prefix, md_label, num_ms, denom_ms, suffix)` for each comparison ratio, and `print_miss_cost(report, &predictable, &unpredictable)`, then `printf("\n")` to end the test's console block (`emit_pair_summary` does this itself).
 
