@@ -49,14 +49,22 @@ grep -q 'Skipped:' "$dir/skip5.md" || { echo "FAIL skip5.md lacks the skip reaso
 expect 0 -t 2 -t 5 --size 1000 --reps 1 -o "$dir/mixed.md"
 grep -q '^### Test 2 ' "$dir/mixed.md" || { echo "FAIL mixed.md lacks Test 2"; fail=1; }
 grep -q 'Skipped:' "$dir/mixed.md" || { echo "FAIL mixed.md lacks Test 5's skip reason"; fail=1; }
+# Test 6 is opt-in; it skips when --size < 64 or --size × --reps < 65664.
+# shellcheck disable=SC2086
+expect 0 -t 4 -t 6 $small -o "$dir/t6.md"
+grep -q '^### Test 6 ' "$dir/t6.md" || { echo "FAIL t6.md lacks Test 6"; fail=1; }
+expect 0 -t 6 --size 1000 --reps 1 -o "$dir/skip6.md"
+grep -q 'Skipped:' "$dir/skip6.md" || { echo "FAIL skip6.md lacks the skip reason"; fail=1; }
+expect 0 -t 6 --size 32 --reps 100000 -o "$dir/skip6b.md"
+grep -q 'Skipped:' "$dir/skip6b.md" || { echo "FAIL skip6b.md lacks the skip reason"; fail=1; }
 
 # The report must contain every test that ran.
 for t in 1 2 3 4; do
     grep -q "^### Test $t " "$dir/report.md" || { echo "FAIL report.md lacks Test $t"; fail=1; }
 done
 # ... and only those: the default run leaves out the opt-in tests.
-if grep -q '^### Test 5 ' "$dir/report.md"; then
-    echo "FAIL default report.md contains opt-in Test 5"; fail=1
+if grep -q '^### Test [56] ' "$dir/report.md"; then
+    echo "FAIL default report.md contains an opt-in test"; fail=1
 fi
 # ... and record the compiler that built it.
 grep -q '^| Array size | Repetitions | Perf counters | Compiler |$' "$dir/report.md" ||
@@ -70,7 +78,7 @@ expect 1 --size 2048M
 expect 1 --reps 0
 expect 1 --reps
 expect 1 -n 100
-expect 1 -t 6
+expect 1 -t 7
 expect 1 -o
 expect 1 -o "$dir/no/such/dir/report.md"
 expect 1 --bogus

@@ -56,12 +56,12 @@
 #endif
 
 /* ── Tuneable parameters ─────────────────────────────────────────────────── */
-#define DEFAULT_SIZE  (1u << 22)   /* 4 194 304 elements (tests 1/2/4/5) or calls (test 3) */
-#define DEFAULT_REPS  64           /* outer repetitions (tests 1/2/4/5)      */
+#define DEFAULT_SIZE  (1u << 22)   /* 4 194 304 elements (tests 1/2/4/5/6) or calls (test 3) */
+#define DEFAULT_REPS  64           /* outer repetitions (tests 1/2/4/5/6)    */
 #define THRESHOLD     128          /* byte comparison threshold               */
 #define NUM_FUNCS     32           /* distinct indirect call targets (test 3) */
-#define NUM_TESTS     5
-#define DEFAULT_TESTS 0xFu         /* tests run without -t: 1–4 (5 is opt-in) */
+#define NUM_TESTS     6
+#define DEFAULT_TESTS 0xFu         /* tests run without -t: 1–4 (5 and 6 are opt-in) */
 #define MAX_TRIALS    99           /* upper limit for -n/--trials             */
 #define MAX_SIZE      (1UL << 30)  /* upper limit for --size                  */
 #define MAX_REPS      100000UL     /* upper limit for --reps                  */
@@ -72,6 +72,14 @@
 #define DB_MAX_PERIOD  (1u << DB_MAX_ORDER)
 #define DB_ORDERS      (DB_MAX_ORDER - DB_MIN_ORDER + 1)
 #define DB_RANDOM_SEED 0x2545f4914f6cdd1dULL  /* nonzero: xorshift64 sticks at 0 */
+
+/* Test 6: distances d (filler branches between A and B), powers of two */
+#define D6_MIN_DIST    4
+#define D6_MAX_DIST    1024
+#define D6_DISTS       9
+#define D6_MIN_BLOCKS  64
+#define D6_SEED_A      0x6a09e667f3bcc908ULL  /* nonzero, distinct seeds */
+#define D6_SEED_B      0xbb67ae8584caa73bULL
 
 /* ── Build provenance (printed in the banner and report) ────────────────── */
 /* Clang's __VERSION__ already names the compiler; GCC's is only the number. */
@@ -91,7 +99,7 @@
 #endif
 
 /* Run-time settings, changed only by command-line options. */
-static size_t   size  = DEFAULT_SIZE;  /* --size: elements per array (tests 1/2/4/5),
+static size_t   size  = DEFAULT_SIZE;  /* --size: elements per array (tests 1/2/4/5/6),
                                           calls per trial (test 3) */
 static unsigned reps  = DEFAULT_REPS;  /* --reps: passes over the array per trial */
 static int      trials = 1;            /* -n/--trials: 1 = single measurement, no warm-up */
@@ -1219,6 +1227,166 @@ static void run_test5(FILE *report)
     printf("\n");
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ *
+ *  TEST 6 — Correlation Distance: correlated vs independent branch  (opt-in)
+ *
+ *  Each block runs branch A on a random outcome, then d filler branches that
+ *  are always taken, then branch B.  In the correlated row B's outcome equals
+ *  A's, so a predictor whose history still reaches A can learn B; in the
+ *  reference row B is independently random.  The pair's miss difference
+ *  isolates B.  d counts filler iterations, not history bits (each adds a
+ *  filler branch and the inner back-edge), so these are results for this
+ *  kernel, not a history length.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+#define D6_TITLE "Test 6 — Correlation Distance"
+#define D6_DESC  "Branch B repeats branch A's random outcome after d constant filler branches; reference rows make B independently random."
+
+static const char *const d6_labels[] = {
+    "d=   4 correlated", "d=   4 random B", "d=   8 correlated", "d=   8 random B",
+    "d=  16 correlated", "d=  16 random B", "d=  32 correlated", "d=  32 random B",
+    "d=  64 correlated", "d=  64 random B", "d= 128 correlated", "d= 128 random B",
+    "d= 256 correlated", "d= 256 random B", "d= 512 correlated", "d= 512 random B",
+    "d=1024 correlated", "d=1024 random B",
+};
+CHECK_LEN(d6_labels_len_check, d6_labels, 2 * D6_DISTS);
+
+__attribute__((noinline))
+static u64 correlate_distance(const u8 *a, const u8 *b, const u8 *fill,
+                              size_t n_blocks, unsigned d, unsigned n_passes)
+{
+    u64 acc = 0;
+    for (unsigned p = 0; p < n_passes; p++)
+        for (size_t i = 0; i < n_blocks; i++) {
+            if (a[i]) acc += 1;              /* branch A */
+            for (unsigned j = 0; j < d; j++)
+                if (fill[j]) acc += 2;       /* filler branches */
+            if (b[i]) acc += 3;              /* branch B: a copy of A, or random */
+        }
+    return acc;
+}
+
+/* Enough blocks that a pass of A's random outcomes cannot be memorized. */
+static int test6_size_ok(size_t len, unsigned r)
+{
+    return len >= D6_MIN_BLOCKS &&
+           (u64)len * r / (D6_MAX_DIST + 2) >= D6_MIN_BLOCKS;
+}
+
+/* Splits a budget of `total` branches over blocks of d + 2: as many blocks
+ * as fit (at most len), then whole passes over them.  The rest of the
+ * budget is left unused. */
+static void d6_layout(u64 total, size_t len, unsigned d, size_t *blocks, unsigned *passes)
+{
+    const u64 per_block = (u64)d + 2;
+    const u64 fit = total / per_block;
+    *blocks = fit < len ? (size_t)fit : len;
+    *passes = (unsigned)(total / (per_block * *blocks));
+}
+
+/* Share of the reference row's B misses (0.5 per block) that the
+ * correlated row avoided, clamped to 0–100%.  Needs both miss counts. */
+static double correlation_used_pct(const Result *corr, const Result *ref, u64 blocks_run)
+{
+    const double avoided = (double)ref->counts[CTR_MISSES] - (double)corr->counts[CTR_MISSES];
+    const double pct = 100.0 * avoided / (0.5 * (double)blocks_run);
+    if (pct < 0) return 0;
+    if (pct > 100) return 100;
+    return pct;
+}
+
+/* Measures each distance's correlated row (B a copy of A) and reference row
+ * (B random), recording each pair's work in works[]. */
+static void measure_distances(const u8 *a, u8 *b, size_t len, u64 total,
+                              ReportRow rows[2 * D6_DISTS], Work works[2 * D6_DISTS])
+{
+    u8 fill[D6_MAX_DIST];
+    memset(fill, 1, sizeof fill);
+    for (int i = 0; i < D6_DISTS; i++) {
+        const unsigned d = (unsigned)D6_MIN_DIST << i;
+        size_t blocks;
+        unsigned passes;
+        d6_layout(total, len, d, &blocks, &passes);
+        const Work w = { (u64)blocks * passes, "block" };
+        works[2 * i] = w;
+        works[2 * i + 1] = w;
+        memcpy(b, a, blocks);
+        MEASURE(rows[2 * i].r, correlate_distance(a, b, fill, blocks, d, passes));
+        fill_random_bits(b, blocks, D6_SEED_B);
+        MEASURE(rows[2 * i + 1].r, correlate_distance(a, b, fill, blocks, d, passes));
+    }
+}
+
+/* Per distance, how much of B's randomness the correlation removed, and the
+ * largest d at 90% or more; needs the miss counter on every row.  These are
+ * descriptive thresholds, not a measured history length. */
+static void print_correlation_used(FILE *report, const ReportRow *rows)
+{
+    char list[256] = "";
+    size_t used = 0;
+    unsigned best = 0;
+    for (int i = 0; i < 2 * D6_DISTS; i++)
+        if (!result_has(&rows[i].r, CTR_MISSES)) return;
+    for (int i = 0; i < D6_DISTS; i++) {
+        const unsigned d = (unsigned)D6_MIN_DIST << i;
+        const double pct = correlation_used_pct(&rows[2 * i].r, &rows[2 * i + 1].r,
+                                                rows[2 * i].work->count);
+        used += (size_t)snprintf(list + used, sizeof list - used, "%sd=%u %.0f%%",
+                                 used ? ", " : "", d, pct);
+        if (pct >= 90.0) best = d;
+    }
+    char best_d[16];
+    snprintf(best_d, sizeof best_d, "%u", best);
+    const char *shown = best ? best_d : "none";
+    printf("  → Correlation used: %s\n  → Largest d with ≥ 90%%: %s\n", list, shown);
+    if (report)
+        fprintf(report, "**Correlation used:** %s\n\n**Largest d with ≥ 90%%:** %s\n\n",
+                list, shown);
+}
+
+static void run_test6(FILE *report)
+{
+    const size_t len = size;
+    const unsigned r = reps;
+    printf("TEST 6 — Correlation Distance  (d=%d..%d, budget %zu×%u branches per row)\n",
+           D6_MIN_DIST, D6_MAX_DIST, len, r);
+    printf("  %s\n\n", D6_DESC);
+    if (!test6_size_ok(len, r)) {
+        char reason[96];
+        snprintf(reason, sizeof reason,
+                 "Test 6 needs --size ≥ %d and --size × --reps ≥ %d.",
+                 D6_MIN_BLOCKS, D6_MIN_BLOCKS * (D6_MAX_DIST + 2));
+        emit_skip(report, D6_TITLE, reason);
+        return;
+    }
+
+    u8 *a = malloc(len);
+    u8 *b = malloc(len);
+    if (!a || !b) { perror("malloc"); exit(1); }
+    fill_random_bits(a, len, D6_SEED_A);
+    const Result none = {0};
+    ReportRow rows[2 * D6_DISTS];
+    Work works[2 * D6_DISTS];
+    for (int i = 0; i < 2 * D6_DISTS; i++) {
+        rows[i].label = d6_labels[i];
+        rows[i].r     = none;
+        rows[i].work  = &works[i];
+    }
+    measure_distances(a, b, len, (u64)len * r, rows, works);
+    free(a);
+    free(b);
+    u64 sink = 0;
+    for (int i = 0; i < 2 * D6_DISTS; i++) sink += rows[i].r.result;
+    anti_dce_sink(sink);
+
+    emit_rows(report, D6_TITLE, D6_DESC, rows, 2 * D6_DISTS, &works[0]);
+    print_miss_cost(report, &rows[0].r, &rows[1].r);
+    print_correlation_used(report, rows);
+    printf("\n");
+}
+
 /* ─────────────────────────────────────────────────────────────────────────
  * main
  * ───────────────────────────────────────────────────────────────────────── */
@@ -1277,12 +1445,13 @@ static void print_usage(const char *prog)
            "                       warm-up run and report the median trial\n"
            "                       (default: 1, a single measurement, no warm-up)\n"
            "  -t, --test <N>       run only test N (1–%d); repeat to run several\n"
-           "                       (default: tests 1–4; test 5 runs only when selected)\n"
-           "      --size <N>       elements per array (tests 1/2/4/5) and calls\n"
+           "                       (default: tests 1–4; tests 5–6 run only when selected)\n"
+           "      --size <N>       elements per array (tests 1/2/4/5/6) and calls\n"
            "                       per trial (test 3); K/M suffixes allowed\n"
            "                       (default: %u = 4M, max: %lu = 1024M;\n"
-           "                       test 5 needs a multiple of 2048)\n"
-           "      --reps <N>       passes over the array per trial, tests 1/2/4/5\n"
+           "                       test 5 needs a multiple of 2048; test 6 needs\n"
+           "                       size ≥ 64 and size × reps ≥ 65664)\n"
+           "      --reps <N>       passes over the array per trial, tests 1/2/4/5/6\n"
            "                       (default: %u, max: %lu)\n"
            "  -h, --help           show this help\n",
            prog, MAX_TRIALS, NUM_TESTS, DEFAULT_SIZE, MAX_SIZE, DEFAULT_REPS, MAX_REPS);
@@ -1482,6 +1651,7 @@ int main(int argc, char **argv)
     if (test_selected(3)) run_test3(report);
     if (test_selected(4)) run_test4(report);
     if (test_selected(5)) run_test5(report);
+    if (test_selected(6)) run_test6(report);
 
     print_clock_summary(report);
 

@@ -215,6 +215,44 @@ static void pattern_learnability(void)
     puts("ok   Test 5 patterns and size rule");
 }
 
+static Result with_misses(u64 misses)
+{
+    Result r = {0};
+    r.counts_valid = 1;
+    r.counts[CTR_MISSES] = misses;
+    return r;
+}
+
+/* Test 6's kernel, block layout, size rule and correlation percentage. */
+static void correlation_distance(void)
+{
+    const u8 a[3] = {1, 0, 1}, b[3] = {1, 0, 1}, fill[4] = {1, 1, 1, 1};
+    assert(correlate_distance(a, b, fill, 3, 4, 2) == 64);
+    assert(correlate_distance(a, b, fill, 3, 0, 2) == 16);
+
+    static const struct { unsigned d; size_t blocks; unsigned passes; } want[] = {
+        {4, 4194304, 10}, {32, 4194304, 1}, {64, 4067203, 1}, {1024, 261632, 1},
+    };
+    for (size_t i = 0; i < sizeof want / sizeof want[0]; i++) {
+        size_t blocks;
+        unsigned passes;
+        d6_layout(64ULL << 22, (size_t)1 << 22, want[i].d, &blocks, &passes);
+        assert(blocks == want[i].blocks && passes == want[i].passes);
+    }
+
+    assert(test6_size_ok(64, 1026) && test6_size_ok(65536, 2));
+    assert(!test6_size_ok(64, 1025) && !test6_size_ok(63, 100000));
+    assert(!test6_size_ok(1000, 1) && !test6_size_ok(32, 100000));
+
+    Result corr = with_misses(100), ref = with_misses(350);
+    assert(correlation_used_pct(&corr, &ref, 1000) == 50.0);
+    corr = with_misses(1100); ref = with_misses(1000);   /* noise: no u64 underflow */
+    assert(correlation_used_pct(&corr, &ref, 1000) == 0.0);
+    corr = with_misses(0); ref = with_misses(2000);
+    assert(correlation_used_pct(&corr, &ref, 1000) == 100.0);
+    puts("ok   Test 6 kernel, layout and correlation");
+}
+
 int main(void)
 {
     perf_leader = 42;
@@ -243,5 +281,6 @@ int main(void)
     raw_event_reporting();
     per_row_work();
     pattern_learnability();
+    correlation_distance();
     return 0;
 }

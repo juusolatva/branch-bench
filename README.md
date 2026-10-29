@@ -14,8 +14,9 @@ A simple benchmark for testing out gains from branch prediction or conversely lo
 3. **Indirect Dispatch** calls 32 functions through a pointer table, in sequential `i % 32` order or at random.
 4. **Branch vs Branchless** computes Test 1's sum with a conditional jump and with an arithmetic mask, on sorted and random data, and checks that both give the same result.
 5. **Pattern Learnability** (opt-in) runs Test 2's kernel on repeating de Bruijn patterns with periods 32 to 2048, and on random 50% ones.
+6. **Correlation Distance** (opt-in) makes a branch repeat the random outcome of a branch d = 4 to 1024 always-taken branches earlier, against a reference where it is random.
 
-A run without `-t` runs Tests 1–4. Test 5 runs only when selected with `-t 5`, so default runs stay comparable with [RESULTS.md](RESULTS.md).
+A run without `-t` runs Tests 1–4. Tests 5 and 6 run only when selected with `-t`, so default runs stay comparable with [RESULTS.md](RESULTS.md).
 
 ## Notes
 
@@ -86,11 +87,13 @@ run to take about N+1 times as long.
 ./branch_bench -t 3                 # run only Test 3 (repeat -t for more)
 ./branch_bench --size 1M --reps 8   # smaller, quicker run (e.g. small boards)
 ./branch_bench -t 5                 # opt-in Test 5 (pattern learnability)
+./branch_bench -t 6                 # opt-in Test 6 (correlation distance)
 ```
 
 Test 5 tiles whole periods of its longest pattern, so it needs a
 `--size` that is a multiple of 2048; at any other size it prints a skip
-note and the other selected tests still run.
+note and the other selected tests still run. Test 6 needs `--size` ≥ 64
+and `--size` × `--reps` ≥ 65664.
 
 `--size` sets the elements per array (and the calls per trial for
 Test 3); `K`/`M` suffixes are allowed. `--reps` sets how many passes each
@@ -199,3 +202,15 @@ Ryzen 5 9600X under WSL2).
   loop has two conditional branches per element (the data branch and the
   back-edge), so a global history sees about 2k outcomes per k-bit
   context, and results also depend on table sizes, hashing and training.
+- **Test 6** asks how far back a correlated outcome can be and still be
+  used. Each block runs branch A on a random outcome, d filler branches
+  that are always taken, then branch B. In the correlated row B equals A,
+  so B is predictable only if the predictor's history still reaches A; in
+  the reference row B is random. "Correlation used" is the share of the
+  reference row's B misses that the correlated row avoids. The filler
+  loop's exit can also mispredict, but equally in both rows, so it cancels.
+  d counts filler iterations, not history bits: each adds two conditional
+  branches (the filler and the loop back-edge), one of them taken. The
+  percentage need not fall steadily with d, and "Largest d with ≥ 90%" is
+  a description of this run, not a measured history length. Rows do
+  different amounts of work, so compare times only within a pair.

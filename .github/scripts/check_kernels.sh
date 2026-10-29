@@ -51,11 +51,13 @@ body() {
             in_fn            { sub(/^[^\t]*\t/, ""); print }'
 }
 
-# True if the function has a forward conditional branch that starts and
-# lands inside a loop.  Branch targets are the "<hex> <" operand.
+# has_loop_branch <function regex> <min>: true if the function has at least
+# <min> forward conditional branches that start and land inside a loop, each
+# counted once however many loops enclose it.  Branch targets are the
+# "<hex> <" operand.
 has_loop_branch() {
     "$objdump" -d --no-show-raw-insn "$bin" |
-        awk -v re="^[0-9a-f]+ <($1)(\\\\.[^>]*)?>:\$" -v cond="^$cond_branch" '
+        awk -v re="^[0-9a-f]+ <($1)(\\\\.[^>]*)?>:\$" -v cond="^$cond_branch" -v min="$2" '
             function hex(s,    i, n) {
                 n = 0
                 for (i = 1; i <= length(s); i++)
@@ -72,13 +74,16 @@ has_loop_branch() {
                 n++; from[n] = at; dest[n] = to
             }
             END {
+                found = 0
                 for (i = 1; i <= n; i++) {
                     if (dest[i] <= from[i]) continue
                     for (j = 1; j <= n; j++)
-                        if (dest[j] < from[j] && dest[j] <= from[i] && from[i] < from[j] && dest[i] <= from[j])
-                            exit 0
+                        if (dest[j] < from[j] && dest[j] <= from[i] && from[i] < from[j] && dest[i] <= from[j]) {
+                            found++
+                            break
+                        }
                 }
-                exit 1
+                exit found >= min ? 0 : 1
             }'
 }
 
@@ -98,8 +103,12 @@ check() {
         echo "FAIL $1: SIMD registers used"; bad=1
     fi
     if [ "$3" = loop-branch ]; then
-        if ! has_loop_branch "$2"; then
+        if ! has_loop_branch "$2" 1; then
             echo "FAIL $1: no conditional branch inside the loop (only the back-edge or exits)"; bad=1
+        fi
+    elif [ "$3" = loop-branch3 ]; then
+        if ! has_loop_branch "$2" 3; then
+            echo "FAIL $1: fewer than three conditional branches inside the loops"; bad=1
         fi
     elif ! printf '%s\n' "$insns" | grep -Eq "^$3"; then
         echo "FAIL $1: required instruction missing ($3)"; bad=1
@@ -111,5 +120,6 @@ check "Test 1/4 sum_threshold/sum_branch" 'sum_threshold|sum_branch' loop-branch
 check "Test 2/5 count_decisions"          'count_decisions'           loop-branch
 check "Test 3 dispatch_sequential"        'dispatch_sequential'       "$indirect_call"
 check "Test 3 dispatch_random"            'dispatch_random'           "$indirect_call"
+check "Test 6 correlate_distance"         'correlate_distance'        loop-branch3
 
 exit "$fail"
