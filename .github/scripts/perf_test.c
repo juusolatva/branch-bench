@@ -74,6 +74,11 @@ static void invalid_reporting(Result good)
 
 static void failed_measurements(void)
 {
+    static const int expected[9] = {
+        PERF_START_FAILED, PERF_READ_FAILED, PERF_READ_FAILED, PERF_NOT_SCHEDULED,
+        PERF_READ_FAILED, PERF_START_FAILED, PERF_START_FAILED, PERF_STOP_FAILED,
+        PERF_TIMES_INVALID,
+    };
     for (int scenario = 0; scenario < 9; scenario++) {
         sample_count = 0;
         sample_next = 0;
@@ -92,10 +97,10 @@ static void failed_measurements(void)
         case 8: samples[1][1] = 99; break; /* invalid cumulative times */
         }
         Result r = {0};
-        r.counts_valid = 1; /* failure must also invalidate a reused result */
+        r.perf_status = PERF_OK; /* failure must also invalidate a reused result */
         perf_start();
         perf_stop(&r);
-        assert(!r.counts_valid);
+        assert(r.perf_status == expected[scenario]);
     }
     /* Later measurements recover. Successfully read zero counts are valid. */
     ioctl_failure = 0;
@@ -107,7 +112,7 @@ static void failed_measurements(void)
     zero.time_ms = 1;
     perf_start();
     perf_stop(&zero);
-    assert(zero.counts_valid);
+    assert(zero.perf_status == PERF_OK);
     account_clock(&zero);
     assert(clock_cycles_sum == 0 && clock_ms_sum == 1);
     clock_ms_sum = 0;
@@ -164,7 +169,8 @@ static void raw_event_reporting(void)
 static void per_row_work(void)
 {
     Result r = {0};
-    r.counts_valid = 1;
+    r.perf_status = PERF_OK;
+    r.open_mask = perf_open_mask;
     r.time_ms = 1;
     r.counts[CTR_MISSES] = 500;
     const Work shared = {1000, "elem"}, own = {100, "block"};
@@ -218,7 +224,8 @@ static void pattern_learnability(void)
 static Result with_misses(u64 misses)
 {
     Result r = {0};
-    r.counts_valid = 1;
+    r.perf_status = PERF_OK;
+    r.open_mask = perf_open_mask;
     r.counts[CTR_MISSES] = misses;
     return r;
 }
@@ -380,7 +387,7 @@ static void test5_summary(void)
     }
     test5_summary_text(rows, &w, 65536, out, sizeof out);
     assert(strstr(out, "**Periods at ≤ 0.05 misses/elem:** none\n"));
-    rows[2].r.counts_valid = 0;
+    rows[2].r.perf_status = PERF_READ_FAILED;
     test5_summary_text(rows, &w, 65536, out, sizeof out);
     assert(!strstr(out, "Periods at"));
     test5_summary_text(rows, &w, 2048, out, sizeof out);
@@ -454,6 +461,60 @@ static void measured_data(void)
     puts("ok   Test 5 and 6 rows measure the data their labels describe");
 }
 
+/* Each trial keeps its raw and scaled counts, scheduling times and the
+ * counter set it was measured with; Miss % needs matching event semantics. */
+static void counter_metadata(void)
+{
+    sample_count = 0;
+    sample_next = 0;
+    ioctl_failure = 0;
+    sample(0, 0, 0);
+    sample(200, 100, 50);
+    Result r = {0};
+    perf_start();
+    perf_stop(&r);
+    assert(r.perf_status == PERF_OK);
+    for (int c = 0; c < CTR_COUNT; c++) {
+        assert(r.raw_counts[c] == 50);
+        assert(r.counts[c] == 100);
+    }
+    assert(r.enabled_ns == 200 && r.running_ns == 100);
+    assert(r.open_mask == perf_open_mask && r.raw_mask == perf_raw_mask);
+
+    const int saved_leader = perf_leader;
+    perf_leader = -1;
+    r.perf_status = PERF_OK;
+    perf_stop(&r);
+    assert(r.perf_status == PERF_NONE);
+    perf_leader = saved_leader;
+
+    assert(counter_semantics(CTR_BRANCHES, 0, ARCH_X86) == SEM_RETIRED);
+    assert(counter_semantics(CTR_MISSES, 0, ARCH_X86) == SEM_RETIRED);
+    assert(counter_semantics(CTR_BRANCHES, 0, ARCH_ARM) == SEM_RETIRED);
+    assert(counter_semantics(CTR_MISSES, 0, ARCH_ARM) == SEM_SPECULATIVE);
+    assert(counter_semantics(CTR_BRANCHES, 1, ARCH_ARM) == SEM_SPECULATIVE);
+    assert(counter_semantics(CTR_MISSES, 1, ARCH_ARM) == SEM_SPECULATIVE);
+    assert(counter_semantics(CTR_MISSES, 0, ARCH_OTHER) == SEM_UNKNOWN);
+    assert(counter_semantics(CTR_CYCLES, 0, ARCH_OTHER) == SEM_CYCLES);
+
+    Result m = {0};
+    m.perf_status = PERF_OK;
+    m.open_mask = perf_open_mask;
+    m.counts[CTR_BRANCHES] = 100;
+    m.counts[CTR_MISSES] = 10;
+    if (host_arch() == ARCH_X86) assert(miss_rate_valid(&m));
+    if (host_arch() == ARCH_ARM) {
+        assert(!miss_rate_valid(&m));                  /* retired vs speculative */
+        m.raw_mask = (1u << CTR_BRANCHES) | (1u << CTR_MISSES);
+        assert(miss_rate_valid(&m));                   /* both speculative */
+        m.raw_mask = 1u << CTR_MISSES;
+        assert(!miss_rate_valid(&m));
+    }
+    m.counts[CTR_BRANCHES] = 0;
+    assert(!miss_rate_valid(&m));
+    puts("ok   per-result counter metadata and semantics");
+}
+
 static void seeds(void)
 {
     const u64 saved = base_seed;
@@ -523,5 +584,6 @@ int main(void)
     test5_summary();
     measured_data();
     seeds();
+    counter_metadata();
     return 0;
 }

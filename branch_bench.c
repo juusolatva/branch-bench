@@ -135,12 +135,29 @@ static int      seed_given = 0;        /* --seed was on the command line */
 #define CTR_ENUM(slot, ev, raw, md, label, width) CTR_##slot,
 enum { FOR_EACH_COUNTER(CTR_ENUM) CTR_COUNT };
 
+/* Why a trial's counts are, or are not, usable.  PERF_NONE is 0, so a
+ * zero-initialized Result never claims valid counts. */
+enum {
+    PERF_NONE,            /* no counter open                          */
+    PERF_OK,              /* counts read for the whole trial          */
+    PERF_START_FAILED,    /* reset, baseline read or enable failed    */
+    PERF_STOP_FAILED,     /* disable failed                           */
+    PERF_READ_FAILED,     /* short read or wrong group size           */
+    PERF_TIMES_INVALID,   /* scheduling times went backwards          */
+    PERF_NOT_SCHEDULED    /* the group never ran during the trial     */
+};
+
 typedef struct {
     double time_ms;
     double time_min_ms;    /* fastest/slowest trial; equal to time_ms */
     double time_max_ms;    /* when trials == 1                        */
-    u64    counts[CTR_COUNT]; /* 0 for any counter not opened         */
-    int    counts_valid;   /* successful counter measurement for this trial */
+    u64    counts[CTR_COUNT];     /* scaled estimate; 0 for any counter not read */
+    u64    raw_counts[CTR_COUNT]; /* as read, before scaling for time-sharing   */
+    u64    enabled_ns;     /* this trial's group scheduling times     */
+    u64    running_ns;
+    unsigned open_mask;    /* counters open for this trial (perf_open_mask) */
+    unsigned raw_mask;     /* ... and those opened as ARM raw events   */
+    int    perf_status;    /* PERF_*: whether counts[] can be used    */
     u64    result;         /* anti-dead-code-elimination sink         */
 } Result;
 
@@ -210,6 +227,42 @@ static const int counter_display_order[] = {
     CTR_CYCLES, CTR_BRANCHES, CTR_MISSES
 };
 CHECK_LEN(counter_display_order_len_check, counter_display_order, CTR_COUNT);
+
+/* What population a counter counts.  A miss rate is only meaningful when
+ * branches and misses count the same one. */
+enum { SEM_UNKNOWN, SEM_RETIRED, SEM_SPECULATIVE, SEM_CYCLES };
+enum { ARCH_X86, ARCH_ARM, ARCH_OTHER };
+
+static int host_arch(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    return ARCH_X86;
+#elif defined(__aarch64__) || defined(__arm__)
+    return ARCH_ARM;
+#else
+    return ARCH_OTHER;
+#endif
+}
+
+/* x86: the generic branch and miss events are retired-branch events on
+ * Intel and AMD.  ARM: Linux v6.12 drivers/perf/arm_pmuv3.c maps generic
+ * branches to BR_RETIRED (0x21) or PC_WRITE_RETIRED (0x0C), both retired,
+ * but generic misses to BR_MIS_PRED (0x10), which is speculative; the raw
+ * fallbacks 0x12 and 0x10 are both speculative.  Other architectures are
+ * unknown. */
+static int counter_semantics(int ctr, int is_raw, int arch)
+{
+    if (ctr == CTR_CYCLES) return SEM_CYCLES;
+    if (arch == ARCH_ARM)
+        return is_raw || ctr == CTR_MISSES ? SEM_SPECULATIVE : SEM_RETIRED;
+    if (arch == ARCH_X86 && !is_raw) return SEM_RETIRED;
+    return SEM_UNKNOWN;
+}
+
+static int result_sem(const Result *r, int ctr)
+{
+    return counter_semantics(ctr, (int)((r->raw_mask >> ctr) & 1u), host_arch());
+}
 
 /* Bit c set when counter c opened only as its ARM raw event because the
  * generic one failed; stays 0 on other architectures and without HAVE_PERF. */
@@ -303,24 +356,34 @@ static void perf_start(void)
                          PERF_IOC_FLAG_GROUP) == 0;
 }
 
+/* Stores the trial's counts and sets r->perf_status to exactly one PERF_*
+ * reason on every path. */
 static void perf_stop(Result *r)
 {
-    r->counts_valid = 0;
+    r->perf_status = PERF_NONE;
+    r->open_mask   = perf_open_mask;
+    r->raw_mask    = perf_raw_mask;
     if (perf_leader < 0) return;
     int stopped = ioctl(perf_leader, PERF_EVENT_IOC_DISABLE,
                         PERF_IOC_FLAG_GROUP) == 0;
     int started = perf_started;
     perf_started = 0;
-    if (!started || !stopped) return;
+    r->perf_status = PERF_START_FAILED;
+    if (!started) return;
+    r->perf_status = PERF_STOP_FAILED;
+    if (!stopped) return;
 
     /* nr, time_enabled, time_running, then one value per member */
     u64 buf[3 + CTR_COUNT];
-    if (!perf_read_group(buf) || buf[1] < perf_enabled_start ||
-        buf[2] < perf_running_start)
-        return;
+    r->perf_status = PERF_READ_FAILED;
+    if (!perf_read_group(buf)) return;
+    r->perf_status = PERF_TIMES_INVALID;
+    if (buf[1] < perf_enabled_start || buf[2] < perf_running_start) return;
     u64 enabled = buf[1] - perf_enabled_start;
     u64 running = buf[2] - perf_running_start;
-    if (!running || running > enabled) return;
+    if (running > enabled) return;
+    r->perf_status = PERF_NOT_SCHEDULED;
+    if (!running) return;
 
     double scale = 1.0;
     if (running < enabled) {       /* counters were time-shared this trial */
@@ -332,10 +395,14 @@ static void perf_stop(Result *r)
             warned = 1;
         }
     }
-    for (int c = 0; c < CTR_COUNT; c++)
-        if (perf_has(c))
-            r->counts[c] = (u64)((double)buf[3 + perf_slot[c]] * scale);
-    r->counts_valid = 1;
+    for (int c = 0; c < CTR_COUNT; c++) {
+        if (!perf_has(c)) continue;
+        r->raw_counts[c] = buf[3 + perf_slot[c]];
+        r->counts[c] = (u64)((double)r->raw_counts[c] * scale);
+    }
+    r->enabled_ns  = enabled;
+    r->running_ns  = running;
+    r->perf_status = PERF_OK;
 }
 
 static int perf_available(void)  { return perf_leader >= 0; }
@@ -344,15 +411,25 @@ static int perf_available(void)  { return perf_leader >= 0; }
 static void perf_init(void)       {}
 static void perf_close(void)      {}
 static void perf_start(void)      {}
-static void perf_stop(Result *r)  { (void)r; }
+static void perf_stop(Result *r)  { r->perf_status = PERF_NONE; r->raw_mask = perf_raw_mask; }
 static int  perf_available(void)  { return 0; }
-static int  perf_has(int ctr)     { (void)ctr; return 0; }
 #endif
 
 /* Opening a counter doesn't guarantee that a particular trial could read it. */
 static int result_has(const Result *r, int ctr)
 {
-    return r->counts_valid && perf_has(ctr);
+    return r->perf_status == PERF_OK && ((r->open_mask >> ctr) & 1u);
+}
+
+/* Miss % only for a trial whose branch and miss counters count the same,
+ * known population (e.g. not retired branches vs speculative misses). */
+static int miss_rate_valid(const Result *r)
+{
+    if (!result_has(r, CTR_BRANCHES) || !result_has(r, CTR_MISSES) ||
+        !r->counts[CTR_BRANCHES])
+        return 0;
+    const int sem = result_sem(r, CTR_BRANCHES);
+    return sem != SEM_UNKNOWN && sem == result_sem(r, CTR_MISSES);
 }
 
 /* Sorts trials by time and returns the median one (the lower of the two
@@ -637,7 +714,7 @@ static void report_table(FILE *f, const char *title, const char *desc,
             else
                 fprintf(f, " – |");
         }
-        if (result_has(r, CTR_BRANCHES) && result_has(r, CTR_MISSES) && branches)
+        if (miss_rate_valid(r))
             fprintf(f, " %.1f%% |", 100.0 * (double)misses / (double)branches);
         else
             fprintf(f, " – |");
@@ -664,12 +741,12 @@ static void print_row(const char *label, const Result *r, const Work *w)
         printf("  %s %*" PRIu64, d->console_label, d->console_width, r->counts[c]);
         if (c == CTR_MISSES) {
             printf("  (");
-            if (result_has(r, CTR_BRANCHES) && branches)
+            if (miss_rate_valid(r))
                 printf("%.1f%%, ", 100.0 * (double)misses / (double)branches);
             printf("%.3f/%s)", misses_per_item(r, w), w->unit);
         }
     }
-    if (perf_available() && !r->counts_valid)
+    if (perf_available() && r->perf_status != PERF_OK)
         printf("  (hardware counts unavailable)");
     printf("\n");
 }

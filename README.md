@@ -130,6 +130,8 @@ Linux reports none, were added by hand.
 
 ## Interpreting the results
 
+**Miss %** is misses ÷ branches, shown only when both counters count the same population. On x86 both are retired branches. On ARM, Linux counts generic branches as retired but generic misses speculatively, so the column shows "–" there unless both counters fell back to their raw (speculative) ARM events; misses per element are shown either way.
+
 A branch misprediction costs a pipeline flush: the work fetched down the
 wrong path is thrown away and the front end restarts at the correct
 target. The minimum penalty is roughly the pipeline depth, typically
