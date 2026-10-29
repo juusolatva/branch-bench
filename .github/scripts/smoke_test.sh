@@ -133,6 +133,9 @@ export_ok "$dir/a.jsonl" --different-results "$dir/c.jsonl" --test 3
 expect 1 -t 3 --size 1K --reps 1 -o "$dir/same.out" --json "$dir/same.out"
 : > "$dir/x.md"; ln -f "$dir/x.md" "$dir/y.json"
 expect 1 -t 3 --size 1K --reps 1 -o "$dir/x.md" --json "$dir/y.json"
+# ... and through two spellings of a file that does not exist yet.
+rm -f "$dir/fresh.md"
+expect 1 -t 3 --size 1K --reps 1 -o "$dir/fresh.md" --json "$dir/./fresh.md"
 
 # Invalid input: exit code 1 with a message
 expect 1 --size 0

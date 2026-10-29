@@ -1982,6 +1982,13 @@ static int same_file(const char *a, const char *b)
            sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
 }
 
+static int same_open_file(FILE *a, FILE *b)
+{
+    struct stat sa, sb;
+    return fstat(fileno(a), &sa) == 0 && fstat(fileno(b), &sb) == 0 &&
+           sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+}
+
 /* First line of a text file, without its newline; 0 if unreadable. */
 static int sysfs_line(const char *path, char *buf, size_t n)
 {
@@ -2351,6 +2358,8 @@ static int option_number(int argc, char **argv, int *i, const char *what,
     return val && parse_count(val, what, lo, hi, out);
 }
 
+static int apply_run_option(int argc, char **argv, int *i, const char *arg);
+
 /* Applies the option at argv[*i], advancing *i past it and its value.
  * Returns -1 to go on, or the exit code to stop with (0 after --help,
  * 1 on an invalid option). */
@@ -2391,6 +2400,14 @@ static int apply_option(int argc, char **argv, int *i, const char **out_path)
         reps = (unsigned)v;
         return -1;
     }
+    return apply_run_option(argc, argv, i, arg);
+}
+
+/* apply_option()'s options that set up the run around the tests: --json,
+ * --cpu and --seed.  Same return convention. */
+static int apply_run_option(int argc, char **argv, int *i, const char *arg)
+{
+    unsigned long v;
     if (is_opt(arg, NULL, "--json")) {
         json_path = option_value(argc, argv, i, arg, "file name");
         return json_path ? -1 : 1;
@@ -2588,6 +2605,14 @@ int main(int argc, char **argv)
     if (out_path && !(report = open_output(out_path))) return 1;
     if (json_path && !(json = open_output(json_path))) {
         if (report) fclose(report);
+        return 1;
+    }
+    /* Paths that only alias once created (e.g. "a" and "./a") pass the
+     * check above; the open files themselves cannot be mistaken. */
+    if (report && json && same_open_file(report, json)) {
+        fprintf(stderr, "Report and JSON export must be different files\n");
+        fclose(report);
+        fclose(json);
         return 1;
     }
 
