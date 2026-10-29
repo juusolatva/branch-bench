@@ -472,18 +472,6 @@ static double measured_ghz(void)
     return clock_ms_sum > 0 ? clock_cycles_sum / (clock_ms_sum * 1e6) : 0;
 }
 
-/* Runs one measured kernel call: counters wrap the timer, never the other
- * way round (see the call convention above).  A macro rather than a function
- * so the kernel is still called directly, keeping its codegen unchanged. */
-#define MEASURE_ONCE(res, call)             \
-    do {                                    \
-        perf_start();                       \
-        double t0_ = now_ms();              \
-        (res).result = (call);              \
-        (res).time_ms = now_ms() - t0_;     \
-        perf_stop(&(res));                  \
-        account_clock(&(res));              \
-    } while (0)
 
 /* `trials` limited to 1..MAX_TRIALS, so MEASURE always has at least one
  * trial to report and never overruns its trial array. */
@@ -494,21 +482,209 @@ static int trial_count(void)
     return trials;
 }
 
-/* Measures `call` `trials` times and keeps the median trial.  With more than
- * one trial, an untimed warm-up run comes first so the first trial doesn't
- * pay for cold caches, an untrained predictor or a CPU still ramping up. */
-#define MEASURE(res, call)                                  \
-    do {                                                    \
-        Result trial_[MAX_TRIALS];                          \
-        const int n_trials_ = trial_count();                \
-        if (n_trials_ > 1)                                  \
-            anti_dce_sink(call);                            \
-        for (int k_ = 0; k_ < n_trials_; k_++) {            \
-            memset(&trial_[k_], 0, sizeof(trial_[k_]));     \
-            MEASURE_ONCE(trial_[k_], call);                 \
-        }                                                   \
-        (res) = median_trial(trial_, n_trials_);            \
+/* ─────────────────────────────────────────────────────────────────────────
+ * Measurement log
+ *
+ * Every measured trial is kept, with its test, variant (the row index in
+ * that test's rows[]), pair and run-wide order, so every reported summary
+ * can be rebuilt from the trials.  Static arrays: nothing is allocated
+ * while measuring.  Up to 37 variant streams × 99 trials fit (--hard -n 99).
+ * ───────────────────────────────────────────────────────────────────────── */
+#define MAX_TRIAL_RECORDS 4096
+#define MAX_PAIRS         64
+#define TRAIN_RUNS        1         /* untimed runs before every measured trial */
+#define COST_MIN_MISSES_PER_PAIR 1000.0
+
+typedef struct {
+    int         test;
+    int         variant;   /* row index in the test's rows[] */
+    int         pair;      /* pair_info[] index, or -1 when unpaired */
+    int         seq;       /* run-wide measurement order */
+    int         trial;     /* 0-based trial of this variant in this pair */
+    const char *call;      /* the kernel call, as written */
+    Result      r;
+} TrialRecord;
+
+static TrialRecord trial_log[MAX_TRIAL_RECORDS];
+static int         trial_log_len = 0;
+
+/* Two variants of one test measured in alternating order. */
+typedef struct {
+    int         test, a, b;
+    const char *ratio_label;   /* Markdown label of its printed ratio, if any */
+    int         cost_shown;    /* its effective cost was printed */
+} PairInfo;
+
+static PairInfo pair_info[MAX_PAIRS];
+static int      pair_count = 0;
+static int      current_test = 0;
+
+static void begin_test(int n)
+{
+    current_test = n;
+}
+
+static void log_full(const char *what)
+{
+    fprintf(stderr, "Internal error: %s full\n", what);
+    exit(1);
+}
+
+static void log_trial(int variant, int pair, int trial, const char *call, const Result *r)
+{
+    if (trial_log_len >= MAX_TRIAL_RECORDS) log_full("trial log");
+    TrialRecord *t = &trial_log[trial_log_len];
+    t->test    = current_test;
+    t->variant = variant;
+    t->pair    = pair;
+    t->seq     = trial_log_len;
+    t->trial   = trial;
+    t->call    = call;
+    t->r       = *r;
+    trial_log_len++;
+}
+
+static int new_pair(int a, int b)
+{
+    if (pair_count >= MAX_PAIRS) log_full("pair table");
+    PairInfo *p = &pair_info[pair_count];
+    p->test = current_test;
+    p->a = a;
+    p->b = b;
+    p->ratio_label = NULL;
+    p->cost_shown = 0;
+    return pair_count++;
+}
+
+/* The reported row for a variant: its median trial by time over all its
+ * logged trials (in any pair), with the fastest and slowest time. */
+static Result representative(int test, int variant)
+{
+    Result t[2 * MAX_TRIALS];
+    int n = 0;
+    for (int i = 0; i < trial_log_len && n < 2 * MAX_TRIALS; i++)
+        if (trial_log[i].test == test && trial_log[i].variant == variant)
+            t[n++] = trial_log[i].r;
+    if (!n) {
+        const Result none = {0};
+        return none;
+    }
+    return median_trial(t, n);
+}
+
+/* Pairs run AB, BA, AB, ... so drift affects both variants alike. */
+static int pair_a_first(int k)
+{
+    return (k & 1) == 0;
+}
+
+/* One measured trial: TRAIN_RUNS untimed calls, then one timed call, which
+ * is logged.  Counters wrap the timer, never the other way round (see the
+ * call convention above).  Macros rather than functions so the kernel is
+ * still called directly, keeping its codegen unchanged. */
+#define MEASURE_ONCE(res, call)             \
+    do {                                    \
+        perf_start();                       \
+        double t0_ = now_ms();              \
+        (res).result = (call);              \
+        (res).time_ms = now_ms() - t0_;     \
+        perf_stop(&(res));                  \
+        account_clock(&(res));              \
     } while (0)
+
+#define MEASURE_TRAINED(variant, pair, k, call)                 \
+    do {                                                        \
+        Result t_;                                              \
+        memset(&t_, 0, sizeof t_);                              \
+        for (int r_ = 0; r_ < TRAIN_RUNS; r_++)                 \
+            anti_dce_sink(call);                                \
+        MEASURE_ONCE(t_, call);                                 \
+        log_trial((variant), (pair), (k), #call, &t_);          \
+    } while (0)
+
+/* Measures `call` `trials` times and reports its median trial. */
+#define MEASURE(res, variant, call)                             \
+    do {                                                        \
+        const int n_trials_ = trial_count();                    \
+        for (int k_ = 0; k_ < n_trials_; k_++)                  \
+            MEASURE_TRAINED((variant), -1, k_, call);           \
+        (res) = representative(current_test, (variant));        \
+    } while (0)
+
+/* Measures two variants `trials` times each in AB/BA order as one pair,
+ * reports each one's median trial and stores the pair id in pair_out. */
+#define MEASURE_PAIR(ra, va, call_a, rb, vb, call_b, pair_out)  \
+    do {                                                        \
+        const int n_trials_ = trial_count();                    \
+        const int p_ = new_pair((va), (vb));                    \
+        for (int k_ = 0; k_ < n_trials_; k_++) {                \
+            if (pair_a_first(k_)) {                             \
+                MEASURE_TRAINED((va), p_, k_, call_a);          \
+                MEASURE_TRAINED((vb), p_, k_, call_b);          \
+            } else {                                            \
+                MEASURE_TRAINED((vb), p_, k_, call_b);          \
+                MEASURE_TRAINED((va), p_, k_, call_a);          \
+            }                                                   \
+        }                                                       \
+        (ra) = representative(current_test, (va));              \
+        (rb) = representative(current_test, (vb));              \
+        (pair_out) = p_;                                        \
+    } while (0)
+
+/* Sums over one pair's trials.  Times cover every pair; counter deltas
+ * (b − a, signed) cover only valid pairs, where both trials read their
+ * counters, and only counters open on both. */
+typedef struct {
+    int      pairs;
+    int      valid;
+    double   ms_a, ms_b;
+    double   delta[CTR_COUNT];
+    unsigned open_mask;
+} PairStats;
+
+static const TrialRecord *find_trial(int pair, int variant, int k)
+{
+    for (int i = 0; i < trial_log_len; i++)
+        if (trial_log[i].pair == pair && trial_log[i].variant == variant &&
+            trial_log[i].trial == k)
+            return &trial_log[i];
+    return NULL;
+}
+
+static PairStats pair_stats(int pair)
+{
+    PairStats s;
+    memset(&s, 0, sizeof s);
+    s.open_mask = ~0u;
+    const PairInfo *p = &pair_info[pair];
+    for (int k = 0; ; k++) {
+        const TrialRecord *a = find_trial(pair, p->a, k);
+        const TrialRecord *b = find_trial(pair, p->b, k);
+        if (!a || !b) break;
+        s.pairs++;
+        s.ms_a += a->r.time_ms;
+        s.ms_b += b->r.time_ms;
+        if (a->r.perf_status != PERF_OK || b->r.perf_status != PERF_OK) continue;
+        s.valid++;
+        s.open_mask &= a->r.open_mask & b->r.open_mask;
+        for (int c = 0; c < CTR_COUNT; c++)
+            s.delta[c] += (double)b->r.counts[c] - (double)a->r.counts[c];
+    }
+    if (!s.valid) s.open_mask = 0;
+    return s;
+}
+
+/* Effective extra cycles per additional miss over a pair's valid trials:
+ * Σ Δcycles ÷ Σ Δmisses, signed.  Returns 1 with *cost set, 0 when the miss
+ * difference is too small to resolve, -1 when cycles or misses are missing. */
+static int pair_cost(const PairStats *s, double *cost)
+{
+    const unsigned need = (1u << CTR_CYCLES) | (1u << CTR_MISSES);
+    if (!s->valid || (s->open_mask & need) != need) return -1;
+    if (s->delta[CTR_MISSES] < COST_MIN_MISSES_PER_PAIR * (double)s->valid) return 0;
+    *cost = s->delta[CTR_CYCLES] / s->delta[CTR_MISSES];
+    return 1;
+}
 
 /* ─────────────────────────────────────────────────────────────────────────
  * Fast RNG — xorshift64, avoids stdlib rand() overhead and bias
@@ -751,26 +927,29 @@ static void print_row(const char *label, const Result *r, const Work *w)
     printf("\n");
 }
 
-/* Extra cycles per extra miss between a predictable and an unpredictable
- * run of the same work: the effective cost of one misprediction.  Skipped
- * when the counters are missing or the miss difference is too small to
- * give a meaningful ratio. */
-static void print_miss_cost(FILE *report, const Result *predictable,
-                            const Result *unpredictable)
+/* Prints a pair's effective extra cycles per additional miss, or the raw
+ * differences when they are too small to resolve; nothing without cycle
+ * and miss counts. */
+static void print_pair_cost(FILE *report, int pair)
 {
-    if (!result_has(predictable, CTR_CYCLES) || !result_has(predictable, CTR_MISSES) ||
-        !result_has(unpredictable, CTR_CYCLES) || !result_has(unpredictable, CTR_MISSES))
-        return;
-    const u64 pred_misses   = predictable->counts[CTR_MISSES];
-    const u64 unpred_misses = unpredictable->counts[CTR_MISSES];
-    const u64 pred_cycles   = predictable->counts[CTR_CYCLES];
-    const u64 unpred_cycles = unpredictable->counts[CTR_CYCLES];
-    if (unpred_misses < pred_misses + 1000 || unpred_cycles <= pred_cycles)
-        return;
-    double cost = (double)(unpred_cycles - pred_cycles) /
-                  (double)(unpred_misses - pred_misses);
-    printf("  → Cost per miss: %.1f cycles\n", cost);
-    if (report) fprintf(report, "**Cost per miss:** %.1f cycles\n\n", cost);
+    const PairStats s = pair_stats(pair);
+    double cost = 0;
+    const int status = pair_cost(&s, &cost);
+    if (status < 0) return;
+    char text[160];
+    if (status == 0) {
+        snprintf(text, sizeof text,
+                 "inconclusive (Δcycles %+.0f, Δmisses %+.0f over %d valid pair(s))",
+                 s.delta[CTR_CYCLES], s.delta[CTR_MISSES], s.valid);
+    } else {
+        int n = snprintf(text, sizeof text, "%.1f cycles", cost);
+        if (s.valid < s.pairs && n > 0)
+            snprintf(text + n, sizeof text - (size_t)n, " (%d of %d pairs)", s.valid, s.pairs);
+        pair_info[pair].cost_shown = 1;
+    }
+    printf("  → Effective extra cycles per additional miss: %s\n", text);
+    if (report)
+        fprintf(report, "**Effective extra cycles per additional miss:** %s\n\n", text);
 }
 
 /* Emits all console rows and the Markdown table for a test. */
@@ -791,6 +970,15 @@ static void emit_ratio(FILE *report, const char *console_prefix,
     printf("%s%.2f×%s\n", console_prefix, ratio, suffix);
     if (report)
         fprintf(report, "**%s:** %.2f×%s\n\n", md_label, ratio, suffix);
+}
+
+/* emit_ratio() for a pair: its summed b time over its summed a time. */
+static void emit_pair_ratio(FILE *report, const char *console_prefix,
+                            const char *md_label, int pair, const char *suffix)
+{
+    const PairStats s = pair_stats(pair);
+    pair_info[pair].ratio_label = md_label;
+    emit_ratio(report, console_prefix, md_label, s.ms_b, s.ms_a, suffix);
 }
 
 /* For a test that cannot run at this --size/--reps: says why, on the
@@ -815,12 +1003,11 @@ static void list_append(char *buf, size_t bufsz, size_t *len, const char *item)
 /* Standard 2-row emission (predictable vs unpredictable): console rows,
  * Markdown table, slowdown ratio, and cost per miss. */
 static void emit_pair_summary(FILE *report, const char *title, const char *desc,
-                              const ReportRow rows[2], const Work *w)
+                              const ReportRow rows[2], const Work *w, int pair)
 {
     emit_rows(report, title, desc, rows, 2, w);
-    emit_ratio(report, "  → Slowdown:  ", "Slowdown",
-               rows[1].r.time_ms, rows[0].r.time_ms, "");
-    print_miss_cost(report, &rows[0].r, &rows[1].r);
+    emit_pair_ratio(report, "  → Slowdown:  ", "Slowdown", pair, "");
+    print_pair_cost(report, pair);
     printf("\n");
 }
 
@@ -895,8 +1082,9 @@ static void run_test1(FILE *report)
 
     Result rs = {0};
     Result rr = {0};
-    MEASURE(rs, sum_threshold(sorted, len, reps));
-    MEASURE(rr, sum_threshold(shuffled, len, reps));
+    int pair;
+    MEASURE_PAIR(rs, 0, sum_threshold(sorted, len, reps),
+                 rr, 1, sum_threshold(shuffled, len, reps), pair);
 
     anti_dce_sink(rs.result + rr.result);
 
@@ -909,7 +1097,7 @@ static void run_test1(FILE *report)
     };
     emit_pair_summary(report, "Test 1 — Threshold Sum",
                       "Sorted vs shuffled array, same direct branch. Identical data, different order.",
-                      rows, &work);
+                      rows, &work, pair);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -960,8 +1148,9 @@ static void run_test2(FILE *report)
 
     Result rp = {0};
     Result rr = {0};
-    MEASURE(rp, count_decisions(decisions_periodic, len, reps));
-    MEASURE(rr, count_decisions(decisions_random, len, reps));
+    int pair;
+    MEASURE_PAIR(rp, 0, count_decisions(decisions_periodic, len, reps),
+                 rr, 1, count_decisions(decisions_random, len, reps), pair);
 
     anti_dce_sink(rp.result + rr.result);
 
@@ -975,7 +1164,7 @@ static void run_test2(FILE *report)
     };
     emit_pair_summary(report, "Test 2 — Stride Conditional",
                       "Both arrays have ~25% ones; only the pattern differs.",
-                      rows, &work);
+                      rows, &work, pair);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1062,8 +1251,9 @@ static void run_test3(FILE *report)
 
     Result rs = {0};
     Result rr = {0};
-    MEASURE(rs, dispatch_sequential(len));
-    MEASURE(rr, dispatch_random(dispatch_indices, len));
+    int pair;
+    MEASURE_PAIR(rs, 0, dispatch_sequential(len),
+                 rr, 1, dispatch_random(dispatch_indices, len), pair);
 
     anti_dce_sink(rs.result + rr.result);
 
@@ -1076,7 +1266,7 @@ static void run_test3(FILE *report)
     };
     emit_pair_summary(report, "Test 3 — Indirect Dispatch",
                       "32 targets, function-pointer call. The indirect predictor must guess the target address.",
-                      rows, &work);
+                      rows, &work, pair);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1155,10 +1345,11 @@ static void run_test4(FILE *report)
     Result r_sl = {0};
     Result r_rb = {0};
     Result r_rl = {0};
-    MEASURE(r_sb, sum_branch(sorted, len, reps));
-    MEASURE(r_sl, sum_branchless(sorted, len, reps));
-    MEASURE(r_rb, sum_branch(random_d, len, reps));
-    MEASURE(r_rl, sum_branchless(random_d, len, reps));
+    int pair_branch, pair_branchless;
+    MEASURE_PAIR(r_sb, 0, sum_branch(sorted, len, reps),
+                 r_rb, 2, sum_branch(random_d, len, reps), pair_branch);
+    MEASURE_PAIR(r_sl, 1, sum_branchless(sorted, len, reps),
+                 r_rl, 3, sum_branchless(random_d, len, reps), pair_branchless);
 
     free(sorted); free(random_d);
 
@@ -1180,13 +1371,11 @@ static void run_test4(FILE *report)
     emit_rows(report, "Test 4 — Branch vs Branchless",
               "Same sum, computed via conditional jump vs. arithmetic mask, on sorted and random data.",
               rows, 4, &work);
-    emit_ratio(report, "\n  Branch penalty on random data:  ",
-               "Branch penalty on random data", r_rb.time_ms, r_sb.time_ms,
-               " vs sorted-branch");
-    emit_ratio(report, "  Branchless is consistent:       ",
-               "Branchless is consistent", r_rl.time_ms, r_sl.time_ms,
-               " random vs sorted");
-    print_miss_cost(report, &r_sb, &r_rb);
+    emit_pair_ratio(report, "\n  Branch penalty on random data:  ",
+                    "Branch penalty on random data", pair_branch, " vs sorted-branch");
+    emit_pair_ratio(report, "  Branchless is consistent:       ",
+                    "Branchless is consistent", pair_branchless, " random vs sorted");
+    print_pair_cost(report, pair_branch);
     printf("\n");
 }
 
@@ -1283,23 +1472,31 @@ static int test5_size_ok(size_t len)
     return len % DB_MAX_PERIOD == 0;
 }
 
-/* Measures count_decisions() on each de Bruijn pattern tiled over buf, then
- * on random bits.  Returns 0, measuring nothing more, if a pattern fails its
- * check. */
-static int measure_patterns(u8 *buf, size_t len, ReportRow rows[DB_ORDERS + 1])
+/* Measures count_decisions() on each de Bruijn pattern tiled over buf and
+ * on random bits in rand_buf.  The shortest and longest periods are each
+ * paired with the random row (pairs[0] and pairs[1]); the others run
+ * alone.  Returns 0, measuring nothing more, if a pattern fails its check. */
+static int measure_patterns(u8 *buf, u8 *rand_buf, size_t len,
+                            ReportRow rows[DB_ORDERS + 1], int pairs[2])
 {
     u8 pattern[DB_MAX_PERIOD];
+    ReportRow *random_row = &rows[DB_ORDERS];
+    fill_random_bits(rand_buf, len, test_seed(5, 0, 0));
     for (unsigned k = DB_MIN_ORDER; k <= DB_MAX_ORDER; k++) {
         const size_t mask = ((size_t)1 << k) - 1;
+        const int v = (int)(k - DB_MIN_ORDER);
         if (!debruijn_prefer_one(k, pattern) || !debruijn_valid(pattern, k)) {
             fprintf(stderr, "  ERROR: de Bruijn sequence of order %u is invalid!\n", k);
             return 0;
         }
         for (size_t i = 0; i < len; i++) buf[i] = pattern[i & mask];
-        MEASURE(rows[k - DB_MIN_ORDER].r, count_decisions(buf, len, reps));
+        if (k == DB_MIN_ORDER || k == DB_MAX_ORDER)
+            MEASURE_PAIR(rows[v].r, v, count_decisions(buf, len, reps),
+                         random_row->r, DB_ORDERS, count_decisions(rand_buf, len, reps),
+                         pairs[k == DB_MAX_ORDER]);
+        else
+            MEASURE(rows[v].r, v, count_decisions(buf, len, reps));
     }
-    fill_random_bits(buf, len, test_seed(5, 0, 0));
-    MEASURE(rows[DB_ORDERS].r, count_decisions(buf, len, reps));
     return 1;
 }
 
@@ -1327,7 +1524,7 @@ static void print_low_miss_periods(FILE *report, const ReportRow *rows, const Wo
  * random row repeats so often that a predictor may learn it, so a note
  * replaces them. */
 static void print_test5_summary(FILE *report, const ReportRow *rows,
-                                const Work *w, size_t len)
+                                const Work *w, size_t len, const int pairs[2])
 {
     if (len < DB_MIN_SAMPLE) {
         printf("\n  → n/a: --size below %d, so a predictor may learn the random row\n",
@@ -1337,14 +1534,11 @@ static void print_test5_summary(FILE *report, const ReportRow *rows,
                             "random row; summary omitted._\n\n", DB_MIN_SAMPLE);
         return;
     }
-    const Result *shortest = &rows[0].r;
-    const Result *longest  = &rows[DB_ORDERS - 1].r;
-    const Result *random_row = &rows[DB_ORDERS].r;
-    emit_ratio(report, "\n  Random vs period 32:    ", "Random vs period 32",
-               random_row->time_ms, shortest->time_ms, "");
-    emit_ratio(report, "  Random vs period 2048:  ", "Random vs period 2048",
-               random_row->time_ms, longest->time_ms, "");
-    print_miss_cost(report, shortest, random_row);
+    emit_pair_ratio(report, "\n  Random vs period 32:    ", "Random vs period 32",
+                    pairs[0], "");
+    emit_pair_ratio(report, "  Random vs period 2048:  ", "Random vs period 2048",
+                    pairs[1], "");
+    print_pair_cost(report, pairs[0]);
     print_low_miss_periods(report, rows, w);
 }
 
@@ -1365,7 +1559,8 @@ static void run_test5(FILE *report)
     }
 
     u8 *buf = malloc(len);
-    if (!buf) { perror("malloc"); exit(1); }
+    u8 *rand_buf = malloc(len);
+    if (!buf || !rand_buf) { perror("malloc"); exit(1); }
     const Result none = {0};
     ReportRow rows[DB_ORDERS + 1];
     for (int i = 0; i <= DB_ORDERS; i++) {
@@ -1373,8 +1568,10 @@ static void run_test5(FILE *report)
         rows[i].r     = none;
         rows[i].work  = NULL;
     }
-    const int ok = measure_patterns(buf, len, rows);
+    int pairs[2] = { -1, -1 };
+    const int ok = measure_patterns(buf, rand_buf, len, rows, pairs);
     free(buf);
+    free(rand_buf);
     if (!ok) {
         sanity_failed = 1;
         return;
@@ -1385,7 +1582,7 @@ static void run_test5(FILE *report)
 
     const Work work = { (u64)len * reps, "elem" };
     emit_rows(report, DB_TITLE, DB_DESC, rows, DB_ORDERS + 1, &work);
-    print_test5_summary(report, rows, &work, len);
+    print_test5_summary(report, rows, &work, len, pairs);
     printf("\n");
 }
 
@@ -1455,13 +1652,15 @@ typedef struct {
     size_t   blocks;     /* per pass */
     unsigned passes;
     Work     work;       /* blocks × passes, unit "block" */
+    int      pair;       /* pair_info[] index of its two rows */
 } D6Point;
 
-/* Misses the correlated row avoided, as a percentage of the 0.5 misses per
- * block that a random B costs; clamped to 0–100%.  Needs both miss counts. */
-static double correlation_used_pct(const Result *corr, const Result *ref, u64 blocks_run)
+/* Misses the correlated row avoided per valid pair, as a percentage of the
+ * 0.5 misses per block that a random B costs; clamped to 0–100%.  Needs
+ * s->valid and the miss counter. */
+static double correlation_used_pct(const PairStats *s, u64 blocks_run)
 {
-    const double avoided = (double)ref->counts[CTR_MISSES] - (double)corr->counts[CTR_MISSES];
+    const double avoided = s->delta[CTR_MISSES] / (double)s->valid;
     const double pct = 100.0 * avoided / (0.5 * (double)blocks_run);
     if (pct < 0) return 0;
     if (pct > 100) return 100;
@@ -1471,7 +1670,7 @@ static double correlation_used_pct(const Result *corr, const Result *ref, u64 bl
 /* Measures each distance's correlated row (B a copy of A) and reference row
  * (B random), recording each distance's layout in pts[] and pointing both
  * of its rows at that work. */
-static void measure_distances(const u8 *a, u8 *b, size_t len, u64 total,
+static void measure_distances(const u8 *a, u8 *b_corr, u8 *b_ref, size_t len, u64 total,
                               ReportRow rows[2 * D6_DISTS], D6Point pts[D6_DISTS])
 {
     u8 fill[D6_MAX_DIST];
@@ -1486,10 +1685,11 @@ static void measure_distances(const u8 *a, u8 *b, size_t len, u64 total,
         rows[2 * i + 1].work = &pt->work;
         const size_t blocks = pt->blocks;
         const unsigned passes = pt->passes;
-        memcpy(b, a, blocks);
-        MEASURE(rows[2 * i].r, correlate_distance(a, b, fill, blocks, d, passes));
-        fill_random_bits(b, blocks, test_seed(6, 0, 1));
-        MEASURE(rows[2 * i + 1].r, correlate_distance(a, b, fill, blocks, d, passes));
+        memcpy(b_corr, a, blocks);
+        fill_random_bits(b_ref, blocks, test_seed(6, 0, 1));
+        MEASURE_PAIR(rows[2 * i].r, 2 * i, correlate_distance(a, b_corr, fill, blocks, d, passes),
+                     rows[2 * i + 1].r, 2 * i + 1,
+                     correlate_distance(a, b_ref, fill, blocks, d, passes), pt->pair);
     }
 }
 
@@ -1499,8 +1699,7 @@ static void measure_distances(const u8 *a, u8 *b, size_t len, u64 total,
  * fewer than D6_MIN_SAMPLE blocks per pass shows n/a: its random sequences
  * repeat so often that a predictor may learn them, which would make B
  * predictable without A. */
-static void print_correlation_used(FILE *report, const ReportRow *rows,
-                                   const D6Point *pts)
+static void print_correlation_used(FILE *report, const D6Point *pts)
 {
     char list[256] = "";
     size_t used = 0;
@@ -1509,11 +1708,11 @@ static void print_correlation_used(FILE *report, const ReportRow *rows,
     for (int i = 0; i < D6_DISTS; i++) {
         const unsigned d = (unsigned)D6_MIN_DIST << i;
         char entry[32];
-        if (pts[i].blocks < D6_MIN_SAMPLE) {
+        const PairStats s = pair_stats(pts[i].pair);
+        if (pts[i].blocks < D6_MIN_SAMPLE || !s.valid || !((s.open_mask >> CTR_MISSES) & 1u)) {
             snprintf(entry, sizeof entry, "d=%u n/a", d);
         } else {
-            const double pct = correlation_used_pct(&rows[2 * i].r, &rows[2 * i + 1].r,
-                                                    pts[i].work.count);
+            const double pct = correlation_used_pct(&s, pts[i].work.count);
             snprintf(entry, sizeof entry, "d=%u %.0f%%", d, pct);
             evaluated++;
             if (pct >= 90.0) best = d;
@@ -1545,8 +1744,8 @@ static void print_test6_summary(FILE *report, const ReportRow *rows, const D6Poi
     for (int i = 0; i < 2 * D6_DISTS; i++)
         if (!result_has(&rows[i].r, CTR_MISSES)) return;
     if (pts[0].blocks >= D6_MIN_SAMPLE)
-        print_miss_cost(report, &rows[0].r, &rows[1].r);
-    print_correlation_used(report, rows, pts);
+        print_pair_cost(report, pts[0].pair);
+    print_correlation_used(report, pts);
 }
 
 static void run_test6(FILE *report)
@@ -1567,8 +1766,9 @@ static void run_test6(FILE *report)
     }
 
     u8 *a = malloc(len);
-    u8 *b = malloc(len);
-    if (!a || !b) { perror("malloc"); exit(1); }
+    u8 *b_corr = malloc(len);
+    u8 *b_ref = malloc(len);
+    if (!a || !b_corr || !b_ref) { perror("malloc"); exit(1); }
     fill_random_bits(a, len, test_seed(6, 0, 0));
     const Result none = {0};
     ReportRow rows[2 * D6_DISTS];
@@ -1578,9 +1778,10 @@ static void run_test6(FILE *report)
         rows[i].r     = none;
         rows[i].work  = NULL;   /* set by measure_distances() */
     }
-    measure_distances(a, b, len, (u64)len * r, rows, pts);
+    measure_distances(a, b_corr, b_ref, len, (u64)len * r, rows, pts);
     free(a);
-    free(b);
+    free(b_corr);
+    free(b_ref);
     u64 sink = 0;
     for (int i = 0; i < 2 * D6_DISTS; i++) sink += rows[i].r.result;
     anti_dce_sink(sink);
@@ -1792,8 +1993,8 @@ static void print_banner(const char *tests_list)
     if (seed_given)
         printf("  Seed:            %20" PRIu64 "\n", base_seed);
     if (trials > 1)
-        printf("  Trials:          %10d per variant (median shown, after 1 warm-up run)\n",
-               trials);
+        printf("  Trials:          %10d per variant (median shown; each after 1 untimed "
+               "training run, AB/BA order)\n", trials);
     if (hard_selected)
         printf("  Tests:           %10s (all, with --hard)\n", tests_list);
     else if (tests_selected)
@@ -1845,7 +2046,8 @@ static void write_report_header(FILE *report, const char *tests_list)
     if (BUILD_COMMIT[0])
         fprintf(report, "_Commit: `%s`_\n\n", BUILD_COMMIT);
     if (trials > 1)
-        fprintf(report, "_Median of %d trials per variant, after one warm-up run. "
+        fprintf(report, "_Median of %d trials per variant; each trial follows one "
+                        "untimed training run, and paired variants alternate AB/BA. "
                         "Range is the fastest–slowest trial._\n\n", trials);
     if (hard_selected)
         fprintf(report, "_All tests were run (--hard), including the hard tests 5 and 6._\n\n");
@@ -1889,12 +2091,12 @@ int main(int argc, char **argv)
     if (report)
         write_report_header(report, tests_list);
 
-    if (test_selected(1)) run_test1(report);
-    if (test_selected(2)) run_test2(report);
-    if (test_selected(3)) run_test3(report);
-    if (test_selected(4)) run_test4(report);
-    if (test_selected(5)) run_test5(report);
-    if (test_selected(6)) run_test6(report);
+    if (test_selected(1)) { begin_test(1); run_test1(report); }
+    if (test_selected(2)) { begin_test(2); run_test2(report); }
+    if (test_selected(3)) { begin_test(3); run_test3(report); }
+    if (test_selected(4)) { begin_test(4); run_test4(report); }
+    if (test_selected(5)) { begin_test(5); run_test5(report); }
+    if (test_selected(6)) { begin_test(6); run_test6(report); }
 
     print_clock_summary(report);
 

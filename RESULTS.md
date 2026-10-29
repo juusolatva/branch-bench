@@ -1,5 +1,7 @@
 # NEW RESULTS
 
+_Entries below are benchmark revision 1 (no training runs, unpaired cost per miss)._
+
 ## Intel(R) Core(TM) i7-4770 CPU @ 3.90 GHz
 
 _2026-10-08_

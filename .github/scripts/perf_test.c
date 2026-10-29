@@ -47,6 +47,22 @@ static void sample(u64 enabled, u64 running, u64 value)
     for (int c = 0; c < CTR_COUNT; c++) s[3 + c] = value;
 }
 
+/* Logs ra and rb as trial 0 of a new pair of variants a and b. */
+static int log_pair(int a, int b, const Result *ra, const Result *rb)
+{
+    const int p = new_pair(a, b);
+    log_trial(a, p, 0, "x", ra);
+    log_trial(b, p, 0, "x", rb);
+    return p;
+}
+
+static void reset_log(int test)
+{
+    trial_log_len = 0;
+    pair_count = 0;
+    begin_test(test);
+}
+
 static void invalid_reporting(Result good)
 {
     Result bad = {0};
@@ -56,7 +72,8 @@ static void invalid_reporting(Result good)
     good.counts[CTR_MISSES] = 5000;
     FILE *f = tmpfile();
     assert(f);
-    print_miss_cost(f, &bad, &good);
+    reset_log(1);
+    print_pair_cost(f, log_pair(0, 1, &bad, &good));
     assert(ftell(f) == 0);
     const Work work = {100, "elem"};
     const ReportRow rows[] = {{"invalid", bad, NULL}, {"valid", good, NULL}};
@@ -251,12 +268,16 @@ static void correlation_distance(void)
     assert(!test6_size_ok(64, 1025) && !test6_size_ok(63, 100000));
     assert(!test6_size_ok(1000, 1) && !test6_size_ok(32, 100000));
 
-    Result corr = with_misses(100), ref = with_misses(350);
-    assert(correlation_used_pct(&corr, &ref, 1000) == 50.0);
-    corr = with_misses(1100); ref = with_misses(1000);   /* noise: no u64 underflow */
-    assert(correlation_used_pct(&corr, &ref, 1000) == 0.0);
-    corr = with_misses(0); ref = with_misses(2000);
-    assert(correlation_used_pct(&corr, &ref, 1000) == 100.0);
+    /* Per valid pair: 250 of 500 random-B misses avoided is 50%. */
+    PairStats ps;
+    memset(&ps, 0, sizeof ps);
+    ps.valid = 2;
+    ps.delta[CTR_MISSES] = 500;
+    assert(correlation_used_pct(&ps, 1000) == 50.0);
+    ps.delta[CTR_MISSES] = -200;                         /* noise: clamped */
+    assert(correlation_used_pct(&ps, 1000) == 0.0);
+    ps.delta[CTR_MISSES] = 4000;
+    assert(correlation_used_pct(&ps, 1000) == 100.0);
     puts("ok   Test 6 kernel, layout and correlation");
 }
 
@@ -298,6 +319,14 @@ static void test6_summary_text(const ReportRow *rows, const D6Point *pts,
     assert(fclose(f) == 0);
 }
 
+/* Logs each distance's two rows as one pair and points pts[] at it. */
+static void log_d6(const ReportRow *rows, D6Point pts[D6_DISTS])
+{
+    reset_log(6);
+    for (int i = 0; i < D6_DISTS; i++)
+        pts[i].pair = log_pair(2 * i, 2 * i + 1, &rows[2 * i].r, &rows[2 * i + 1].r);
+}
+
 static void set_points(D6Point pts[D6_DISTS], size_t blocks, unsigned passes)
 {
     for (int i = 0; i < D6_DISTS; i++) {
@@ -325,18 +354,19 @@ static void test6_summary(void)
     pts[0].blocks = 65536; pts[0].passes = 2; pts[0].work.count = 131072;
     rows[0].r = with_misses_cycles(32768, 1000000);
     rows[1].r = with_misses_cycles(65536, 2000000);
+    log_d6(rows, pts);
     test6_summary_text(rows, pts, out, sizeof out);
     assert(strstr(out, "**Correlation used:** d=4 50%, d=8 n/a, "));
     assert(strstr(out, "d=1024 n/a\n"));
     assert(strstr(out, "**Largest d with ≥ 90%:** none\n"));
     assert(strstr(out, "_n/a: fewer than 65536 blocks per pass"));
-    assert(strstr(out, "**Cost per miss:**"));
+    assert(strstr(out, "**Effective extra cycles per additional miss:** 30.5 cycles\n"));
 
     /* Nothing evaluated: n/a, not "none", and no cost from d = 4. */
     pts[0] = pts[1];
     test6_summary_text(rows, pts, out, sizeof out);
     assert(strstr(out, "**Largest d with ≥ 90%:** n/a\n"));
-    assert(!strstr(out, "Cost per miss"));
+    assert(!strstr(out, "Effective extra cycles"));
 
     /* Every distance evaluated; exactly 90% counts, 89.9% does not. */
     set_points(pts, 100000, 1);
@@ -344,6 +374,7 @@ static void test6_summary(void)
         rows[2 * i].r = with_misses(i == D6_DISTS - 1 ? 5050 : 5000);
         rows[2 * i + 1].r = with_misses(50000);
     }
+    log_d6(rows, pts);
     test6_summary_text(rows, pts, out, sizeof out);
     assert(strstr(out, "d=512 90%, d=1024 90%\n"));
     assert(strstr(out, "**Largest d with ≥ 90%:** 512\n"));
@@ -357,7 +388,12 @@ static void test5_summary_text(const ReportRow *rows, const Work *w, size_t len,
 {
     FILE *f = tmpfile();
     assert(f);
-    print_test5_summary(f, rows, w, len);
+    reset_log(5);
+    const int pairs[2] = {
+        log_pair(0, DB_ORDERS, &rows[0].r, &rows[DB_ORDERS].r),
+        log_pair(DB_ORDERS - 1, DB_ORDERS, &rows[DB_ORDERS - 1].r, &rows[DB_ORDERS].r),
+    };
+    print_test5_summary(f, rows, w, len, pairs);
     rewind(f);
     memset(buf, 0, bufsz);
     size_t n = fread(buf, 1, bufsz - 1, f);
@@ -413,7 +449,9 @@ static void measured_data(void)
     perf_leader = -1;   /* MEASURE without counters */
     reps = 1;
 
-    static u8 buf[4096], expect[4096];
+    static u8 buf[4096], rbuf[4096], expect[4096];
+    int pairs5[2];
+    reset_log(5);
     const Result none = {0};
     ReportRow rows5[DB_ORDERS + 1];
     for (int i = 0; i <= DB_ORDERS; i++) {
@@ -421,13 +459,16 @@ static void measured_data(void)
         rows5[i].r = none;
         rows5[i].work = NULL;
     }
-    assert(measure_patterns(buf, sizeof buf, rows5) == 1);
+    assert(measure_patterns(buf, rbuf, sizeof buf, rows5, pairs5) == 1);
+    assert(pair_info[pairs5[0]].a == 0 && pair_info[pairs5[0]].b == DB_ORDERS);
+    assert(pair_info[pairs5[1]].a == DB_ORDERS - 1 && pair_info[pairs5[1]].b == DB_ORDERS);
     for (int i = 0; i < DB_ORDERS; i++)
         assert(rows5[i].r.result == sizeof buf / 2);   /* half ones per period */
     fill_random_bits(expect, sizeof expect, test_seed(5, 0, 0));
     assert(rows5[DB_ORDERS].r.result == count_ones(expect, sizeof expect));
 
-    static u8 a[1024], b[1024], ref_b[1024];
+    static u8 a[1024], b[1024], b2[1024], ref_b[1024];
+    reset_log(6);
     const u64 total = 1024ULL * 1026;
     ReportRow rows6[2 * D6_DISTS];
     D6Point pts[D6_DISTS];
@@ -438,7 +479,7 @@ static void measured_data(void)
     }
     assert(test_seed(6, 0, 0) != test_seed(6, 0, 1));
     fill_random_bits(a, sizeof a, test_seed(6, 0, 0));
-    measure_distances(a, b, sizeof a, total, rows6, pts);
+    measure_distances(a, b, b2, sizeof a, total, rows6, pts);
     for (int i = 0; i < D6_DISTS; i++) {
         const unsigned d = (unsigned)D6_MIN_DIST << i;
         size_t blocks;
@@ -447,6 +488,7 @@ static void measured_data(void)
         assert(pts[i].blocks == blocks && pts[i].passes == passes);
         assert(pts[i].work.count == (u64)blocks * passes);
         assert(rows6[2 * i].work == &pts[i].work && rows6[2 * i + 1].work == &pts[i].work);
+        assert(pair_info[pts[i].pair].a == 2 * i && pair_info[pts[i].pair].b == 2 * i + 1);
         /* Per block: A adds 1 and B 3 when set, each filler 2. */
         fill_random_bits(ref_b, blocks, test_seed(6, 0, 1));
         const u64 ones_a = count_ones(a, blocks);
@@ -513,6 +555,121 @@ static void counter_metadata(void)
     m.counts[CTR_BRANCHES] = 0;
     assert(!miss_rate_valid(&m));
     puts("ok   per-result counter metadata and semantics");
+}
+
+/* Records which stub ran, so the measurement order can be checked. */
+static char call_order[16];
+static int call_n;
+
+__attribute__((noinline)) static u64 stub_a(int x) { call_order[call_n++] = 'A'; return (u64)x + 1; }
+__attribute__((noinline)) static u64 stub_b(int x) { call_order[call_n++] = 'B'; return (u64)x + 2; }
+
+/* Each measured trial follows one untimed training run of the same variant,
+ * and pairs alternate AB, BA, ... */
+static void pair_schedule(void)
+{
+    const int saved_leader = perf_leader, saved_trials = trials;
+    perf_leader = -1;
+    trials = 2;
+    reset_log(1);
+    Result ra = {0}, rb = {0};
+    int p;
+    MEASURE_PAIR(ra, 0, stub_a(0), rb, 1, stub_b(0), p);
+    assert(call_n == 8 && memcmp(call_order, "AABBBBAA", 8) == 0);
+    assert(trial_log_len == 4);
+    const char order[] = "ABBA";
+    for (int i = 0; i < 4; i++) {
+        const TrialRecord *t = &trial_log[i];
+        assert(t->pair == p && t->test == 1 && t->seq == i);
+        assert(t->variant == (order[i] == 'A' ? 0 : 1));
+        assert(t->trial == i / 2);
+        assert(strcmp(t->call, order[i] == 'A' ? "stub_a(0)" : "stub_b(0)") == 0);
+    }
+    assert(ra.result == 1 && rb.result == 2);
+    assert(pair_info[p].a == 0 && pair_info[p].b == 1 && pair_info[p].test == 1);
+    perf_leader = saved_leader;
+    trials = saved_trials;
+    puts("ok   balanced AB/BA schedule with training runs");
+}
+
+static Result counted(u64 cycles, u64 misses, double ms)
+{
+    Result r = {0};
+    r.perf_status = PERF_OK;
+    r.open_mask = perf_open_mask;
+    r.counts[CTR_CYCLES] = cycles;
+    r.counts[CTR_MISSES] = misses;
+    r.time_ms = ms;
+    return r;
+}
+
+/* Logs three trials per variant as one pair: a at 100 cycles, 0 misses,
+ * 1 ms; b at cycles_b[k] and misses_b, 2 ms.  Trial `bad` of b (or none,
+ * -1) fails its read; `all_bad` fails every trial. */
+static int log_cost_pair(const u64 cycles_b[3], u64 misses_b, int bad, int all_bad)
+{
+    reset_log(1);
+    const int p = new_pair(0, 1);
+    for (int k = 0; k < 3; k++) {
+        Result a = counted(100, 0, 1), b = counted(cycles_b[k], misses_b, 2);
+        if (k == bad || all_bad) b.perf_status = PERF_READ_FAILED;
+        if (all_bad) a.perf_status = PERF_READ_FAILED;
+        log_trial(0, p, k, "x", &a);
+        log_trial(1, p, k, "x", &b);
+    }
+    return p;
+}
+
+static void pair_text(int pair, int ratio, char *buf, size_t bufsz)
+{
+    FILE *f = tmpfile();
+    assert(f);
+    if (ratio) emit_pair_ratio(f, "", "Slowdown", pair, "");
+    print_pair_cost(f, pair);
+    rewind(f);
+    memset(buf, 0, bufsz);
+    size_t n = fread(buf, 1, bufsz - 1, f);
+    (void)n;
+    assert(fclose(f) == 0);
+}
+
+/* Effective cost: summed signed differences over valid pairs, a partial
+ * suffix, the inconclusive form, and nothing without counts. */
+static void paired_cost(void)
+{
+    static const u64 cycles_b[3] = {400, 50, 700};
+    char out[512];
+    int p = log_cost_pair(cycles_b, 1000, -1, 0);
+    PairStats s = pair_stats(p);
+    assert(s.pairs == 3 && s.valid == 3);
+    assert(s.delta[CTR_CYCLES] == 850 && s.delta[CTR_MISSES] == 3000);
+    assert(s.ms_a == 3 && s.ms_b == 6);
+    pair_text(p, 0, out, sizeof out);
+    assert(strcmp(out, "**Effective extra cycles per additional miss:** 0.3 cycles\n\n") == 0);
+    assert(pair_info[p].cost_shown);
+
+    p = log_cost_pair(cycles_b, 1000, 2, 0);
+    pair_text(p, 0, out, sizeof out);
+    assert(strcmp(out, "**Effective extra cycles per additional miss:** 0.1 cycles "
+                       "(2 of 3 pairs)\n\n") == 0);
+
+    p = log_cost_pair(cycles_b, 10, -1, 0);
+    pair_text(p, 0, out, sizeof out);
+    assert(strcmp(out, "**Effective extra cycles per additional miss:** inconclusive "
+                       "(Δcycles +850, Δmisses +30 over 3 valid pair(s))\n\n") == 0);
+    assert(!pair_info[p].cost_shown);
+
+    p = log_cost_pair(cycles_b, 1000, -1, 1);
+    pair_text(p, 1, out, sizeof out);
+    assert(strcmp(out, "**Slowdown:** 2.00×\n\n") == 0);
+    assert(strcmp(pair_info[p].ratio_label, "Slowdown") == 0);
+
+    p = log_cost_pair(cycles_b, 1000, -1, 0);
+    for (int i = 0; i < trial_log_len; i++)
+        trial_log[i].r.open_mask &= ~(1u << CTR_CYCLES);
+    pair_text(p, 0, out, sizeof out);
+    assert(out[0] == '\0');
+    puts("ok   paired effective cost: signed, partial, inconclusive, unavailable");
 }
 
 static void seeds(void)
@@ -585,5 +742,7 @@ int main(void)
     measured_data();
     seeds();
     counter_metadata();
+    pair_schedule();
+    paired_cost();
     return 0;
 }

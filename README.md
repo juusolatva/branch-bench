@@ -28,7 +28,7 @@ Branch, miss and cycle counts need Linux hardware performance counters, which re
 
 If a trial's counter read fails or its group never gets scheduled, that
 trial still reports its wall-clock time. Its hardware counts show as –
-in the report and are excluded from the cost per miss and average clock.
+in the report and are excluded from the effective cost per miss and the cycle rate.
 
 ## Prebuilt binaries
 
@@ -76,10 +76,19 @@ By default each variant is measured once. For steadier numbers use
 ./branch_bench -n 5 -o report.md
 ```
 
-Each variant then gets one untimed warm-up run followed by 5 measured
-trials. The trial with the median time is reported, together with the
-fastest–slowest range, so you can see how noisy the run was. Expect the
-run to take about N+1 times as long.
+Each variant is then measured 5 times. The trial with the median time is
+reported, together with the fastest–slowest range, so you can see how
+noisy the run was.
+
+Every measured trial, also with the default `-n 1`, follows one untimed
+training run of the same variant, so the predictor has seen that
+variant's pattern just before it is timed. This does not reset predictor
+state left by other variants; it only makes the exposure the same for
+every trial. A run takes about twice as long per trial as the measured
+time alone. The two variants of a comparison (e.g. sorted and shuffled)
+are measured in alternating order, AB, BA, AB, ..., so slow drift such as
+clock changes affects both alike, and each **Slowdown** is the summed
+time of one variant's trials over the other's.
 
 ## Choosing tests and sizes
 
@@ -137,20 +146,28 @@ wrong path is thrown away and the front end restarts at the correct
 target. The minimum penalty is roughly the pipeline depth, typically
 ~15–20 cycles on modern out-of-order x86 cores.
 
-When the cycle and miss counters are available, each test prints a
-**Cost per miss**: the extra cycles divided by the extra mispredictions
-between its predictable and unpredictable variant (for Test 4, its two
-branch variants). It is left out when the unpredictable variant adds
-fewer than 1000 misses or no cycles. Being measured in cycles, it is
+When the cycle and miss counters are available, each test prints the
+**Effective extra cycles per additional miss**: the extra cycles divided
+by the extra mispredictions between its predictable and unpredictable
+variant (for Test 4, its two branch variants), summed over the paired
+trials whose counters both read correctly. Differences keep their sign,
+so a pair where the unpredictable variant happened to be faster pulls
+the figure down instead of being dropped. When the unpredictable variant
+adds fewer than 1000 misses per valid pair, the figure would be noise, so
+the line says "inconclusive" and shows the raw differences instead; with
+some pairs invalid it says how many were used. The figure depends on the
+workload around the branch, so it is not the pipeline's recovery latency.
+Being measured in cycles, it is
 far less affected by the clock speed the CPU happened to run at than the
 times are, though not entirely: part of a miss's cost can be waiting on
 memory, which takes a fixed time rather than a fixed number of cycles.
-In [RESULTS.md](RESULTS.md) it is ~22 cycles for Test 1 on the Intel
+In [RESULTS.md](RESULTS.md) (revision 1, where it was called cost per
+miss and came from the median trials) it is ~22 cycles for Test 1 on the Intel
 machines and ~20 on the Raspberry Pi 4's Cortex-A72. For the older
 results, which predate the cycle counter, estimates from the times and
 listed clock speeds put it at ~20–25 cycles for Test 1.
 
-The cost per miss is only meaningful when the unpredictable variant adds
+The effective cost is only meaningful when the unpredictable variant adds
 many misses. When the two variants miss almost equally often, as in
 Test 3 on cores that cannot learn the sequential cycle, the small
 difference in work between the variants dominates and the figure is

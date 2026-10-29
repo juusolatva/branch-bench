@@ -73,6 +73,8 @@ grep -q 'Skipped:' "$dir/skip6b.md" || { echo "FAIL skip6b.md lacks the skip rea
 expect 0 --hard $small -o "$dir/hard.md"
 grep -q '(all, with --hard)' "$dir/stdout" || { echo "FAIL --hard banner lacks its tests line"; fail=1; }
 expect 0 --hard -t 2 --size 4K --reps 1 -o "$dir/hard2.md"
+# The largest legal run fits the trial log (37 variants × 99 trials).
+expect 0 --hard -n 99 --size 4K --reps 1
 for f in hard.md hard2.md; do
     for t in 1 2 3 4 5 6; do
         grep -q "^### Test $t " "$dir/$f" || { echo "FAIL $f lacks Test $t"; fail=1; }
@@ -89,6 +91,9 @@ done
 if grep -q '^### Test [56] ' "$dir/report.md"; then
     echo "FAIL default report.md contains an opt-in test"; fail=1
 fi
+# ... and describe the training and pairing protocol when trials > 1.
+grep -q '^_Median of 3 trials per variant; each trial follows one untimed training run' "$dir/report.md" ||
+    { echo "FAIL report.md lacks the trial protocol line"; fail=1; }
 # ... and record the compiler that built it.
 grep -q '^| Array size | Repetitions | Perf counters | Compiler |$' "$dir/report.md" ||
     { echo "FAIL report.md lacks a Compiler column"; fail=1; }
