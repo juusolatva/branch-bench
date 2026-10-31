@@ -9,7 +9,3 @@ fake_perf.so
 *.plist
 coverage.xml
 build_wrapper_output/
-
-# Local audit notes, not for the repository.
-audit.md
-report.md
