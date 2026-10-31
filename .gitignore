@@ -1,9 +1,12 @@
 branch_bench
 branch_bench_cov
+branch_bench_san
+perf_test_cov
 fake_perf.so
 *.gcda
 *.gcno
 *.gcov
+*.plist
 coverage.xml
 build_wrapper_output/
 

@@ -1,6 +1,7 @@
 # AGENTS.md
 
 This file provides guidance and technical context for AI agents working on code in this repository.
+It is the shared source of project instructions; [`CLAUDE.md`](CLAUDE.md) imports it. User-facing build and usage guidance lives in [`README.md`](README.md).
 
 ## Project Overview
 
@@ -11,9 +12,11 @@ It runs four self-contained tests comparing predictable versus unpredictable bra
 1. **Test 1 — Threshold Sum**: Sorted vs. shuffled array filtering elements above a threshold (`128`). Measures direct branch prediction behavior.
 2. **Test 2 — Stride Conditional**: Periodic 25% take-rate ("every 4th") vs. random 25% take-rate. Evaluates pattern history table learning.
 3. **Test 3 — Indirect Dispatch**: Sequential vs. random function pointer dispatch across 32 distinct leaf functions. Evaluates the history-based indirect branch predictor (a plain Branch Target Buffer alone cannot learn the 32-target cycle).
-4. **Test 4 — Branch vs. Branchless**: Computes identical threshold sums using conditional jumps vs. arithmetic bitmasks (`(u64)0 - (u64)(arr[i] > THRESHOLD)`), across both sorted and random datasets to isolate the pure misprediction cycle penalty.
+4. **Test 4 — Branch vs. Branchless**: Computes identical threshold sums using conditional jumps vs. arithmetic bitmasks (`(u64)0 - (u64)(arr[i] > THRESHOLD)`), across both sorted and random datasets to measure the effective misprediction cost.
 
 On Linux systems supporting `perf_event_open(2)`, the benchmark reads hardware performance counters (`PERF_COUNT_HW_BRANCH_INSTRUCTIONS`, `PERF_COUNT_HW_BRANCH_MISSES` and `PERF_COUNT_HW_CPU_CYCLES`) as one perf group, so all counts cover the same window. Any counter that fails to open is left out of the group; the console omits it and the Markdown report shows "–" for it. From the cycle and miss counts, each test reports a **Cost per miss** (extra cycles ÷ extra misses between its predictable and unpredictable variant; Test 4 uses its two branch variants). It is skipped when either counter is missing, or when the unpredictable variant adds fewer than 1000 misses or no cycles. Counters need `/proc/sys/kernel/perf_event_paranoid` ≤ 2. When hardware counters are unavailable (e.g. non-Linux, locked down VMs/containers), it gracefully falls back to monotonic wall-clock timing (`now_ms()`). The wall-clock fallback uses POSIX `clock_gettime(CLOCK_MONOTONIC)`, so the benchmark needs a POSIX system; it does not build with MSVC.
+
+Counters that are time-shared are scaled using the scheduling times for that trial, with a one-time note that the counts are estimates. If a counter read or control operation fails, or the group never runs during a trial, `Result.counts_valid` stays false: the console marks hardware counts unavailable, the report shows "–", and that trial is excluded from cost-per-miss and average-clock calculations. Wall-clock timing is still reported, and later trials can recover.
 
 ---
 
@@ -42,6 +45,8 @@ Both optimization flags are strictly load-bearing:
 ### Compiler Support
 GCC is the reference compiler. Clang rejects `-fno-if-conversion` and has no equivalent flag; it builds with `clang -std=c99 -O2 -fno-vectorize -fno-slp-vectorize`, but (as of Clang 18–21) makes Tests 1, 2 and Test 4's branch variant branchless: `cmov` in `sum_threshold`/`sum_branch` and `sbb` arithmetic in `count_decisions`. Clang timings for those tests do not show the misprediction cost. When checking any build's disassembly (`objdump -d`), look for a conditional jump on the data inside the inner loop, not just for the absence of `cmov`.
 
+Other POSIX systems use wall-clock timing only. On macOS, plain `gcc` is Clang; build manually with an installed GNU GCC's versioned command (`gcc-<N>`) and omit the x86-64 `-Wa,...` flags, which require GNU assembler (binutils 2.34 or later). `run.sh` calls plain `gcc` and chooses those flags from the host architecture.
+
 ### CLI Options
 - `./branch_bench`: Runs all four benchmarks and outputs results to stdout.
 - `./branch_bench -o <file.md>` / `./branch_bench --output <file.md>`: Generates a structured Markdown report matching the format used in [`RESULTS.md`](RESULTS.md) alongside the stdout stream. Its heading is the CPU model with the highest `cpuinfo_max_freq` from cpufreq sysfs (`@ 3.60 GHz`, replacing any base clock in the model name; left as-is where sysfs has no clock information, e.g. WSL2). When the cycle counter works, the console and report end with the **average clock during measurements** (total cycles ÷ total time over all measured trials, warm-ups excluded). The header table records the compiler, followed by the build flags and commit when `run.sh` built the binary. When a counter opened only as its ARM raw event (see TODO), the banner's "Raw PMU events" line and the report's "Raw ARM PMU events" line name it; no such line means every open counter is the generic event. An existing file is overwritten (a new one is created owner-only, mode 0600), so never pass `RESULTS.md`: write a separate file and paste its `## <CPU>` section into RESULTS.md by hand, under `# NEW RESULTS` (bare metal or WSL2) or `# VPS RESULTS` (cloud VMs), not at the end of the file. Current entries use the defaults with `-n 6`.
@@ -53,7 +58,7 @@ GCC is the reference compiler. Clang rejects `-fno-if-conversion` and has no equ
 - `./branch_bench -h` / `./branch_bench --help`: Displays usage information.
 
 ### Testing and Validation
-There is no dedicated test framework or linter in this repository. Validate changes by compiling with `gcc` using the required flags (plus `-Wall -Wextra -pedantic` to catch issues) and executing the binary. `clang --analyze -std=c99 -Xclang -analyzer-werror <repo>/branch_bench.c` should report no warnings; run it from a scratch directory, because it writes a `.plist` into the current one. It finds the same kind of path-based bugs (uninitialized values, out-of-bounds reads) that SonarQube Cloud reports. SonarQube's C rules that this code has hit are listed in Code Architecture section 8. `.github/scripts/perf_test.c` tests the perf scaling and error paths without a PMU: `gcc -std=c99 -O2 -fno-tree-vectorize -fno-if-conversion -o /tmp/perf_test .github/scripts/perf_test.c && /tmp/perf_test`. It `#include`s `branch_bench.c` with `main`, `read` and `ioctl` renamed, so every `read()`/`ioctl()` in the file reaches its stubs, which serve only counter reads; a new `read()` or `ioctl()` for anything else (e.g. sysfs) needs the stubs to pass it through. Test 4 includes a built-in runtime sanity check verifying that branch and branchless implementations compute identical sums; on a mismatch it prints an error and the program exits with status 1.
+There is no dedicated test framework or linter configuration in this repository. Validate changes by compiling with `gcc` using the required flags (plus `-Wall -Wextra -pedantic -Werror`, as in CI) and executing the binary. Run `.github/scripts/smoke_test.sh ./branch_bench` to exercise the CLI, report contents and error paths at small sizes, including report-write failure via `/dev/full` where available. `clang --analyze -std=c99 -Xclang -analyzer-werror <repo>/branch_bench.c` should report no warnings; run it from a scratch directory, because it writes a `.plist` into the current one. It finds the same kind of path-based bugs (uninitialized values, out-of-bounds reads) that SonarQube Cloud reports. SonarQube's C rules that this code has hit are listed in Code Architecture section 8. `.github/scripts/perf_test.c` tests the perf scaling, error recovery and raw-event reporting paths without a PMU: `gcc -std=c99 -O2 -fno-tree-vectorize -fno-if-conversion -o /tmp/perf_test .github/scripts/perf_test.c && /tmp/perf_test`. It `#include`s `branch_bench.c` with `main`, `read` and `ioctl` renamed, so every `read()`/`ioctl()` in the file reaches its stubs, which serve only counter reads; a new `read()` or `ioctl()` for anything else (e.g. sysfs) needs the stubs to pass it through. Test 4 includes a built-in runtime sanity check verifying that branch and branchless implementations compute identical sums; on a mismatch it prints an error and the program exits with status 1.
 
 Changes anywhere in the file can move the kernels to new addresses, which can change timings even when their code is untouched. After a change, compare the kernels' disassembly with the previous build, ignoring addresses and padding `nop`s:
 ```sh
@@ -79,7 +84,8 @@ The SonarQube Cloud project `juusolatva_branch_bench` is public, so its API need
 
 To reproduce CI's coverage locally (from a scratch copy of the repo, because `.gcda`/`.gcno` files land next to the binaries):
 ```sh
-gcc -std=c99 -O0 -g --coverage -fno-tree-vectorize -fno-if-conversion -o branch_bench_cov branch_bench.c
+gcc -std=c99 -O0 -g --coverage -fno-tree-vectorize -fno-if-conversion \
+    -DBUILD_FLAGS='"--coverage"' -DBUILD_COMMIT='"local-coverage"' -o branch_bench_cov branch_bench.c
 gcc -shared -fPIC -o fake_perf.so .github/scripts/fake_perf.c -ldl
 .github/scripts/smoke_test.sh ./branch_bench_cov                                 # no counters in a VM (CI)
 LD_PRELOAD=$PWD/fake_perf.so .github/scripts/smoke_test.sh ./branch_bench_cov   # all counters faked
@@ -127,7 +133,7 @@ GCC *does* fold `sum_branch` into `sum_threshold`, because their bodies are iden
 - The reported row is one real trial (the median by time, the lower middle one for even counts), never a per-field median, so time, cycles, branches and misses always belong together.
 - Do **not** nest `perf_start()` or `perf_stop()` inside the `now_ms()` timing window; doing so introduces system call overhead into the wall-clock measurements.
 - `MEASURE` is a macro, not a function, on purpose: the kernel must be called directly (not through a function pointer) so its codegen stays unchanged.
-- Guard access to each counter slot in `r.counts[]` with `perf_has(CTR_BRANCHES)`, `perf_has(CTR_MISSES)` or `perf_has(CTR_CYCLES)`; any of them can be missing independently (`print_row()`, `report_table()` and `print_miss_cost()` already do).
+- Before using a result's counter values, check `result_has(&r, CTR_BRANCHES)`, `result_has(&r, CTR_MISSES)` or `result_has(&r, CTR_CYCLES)`. It checks both whether the counter opened and whether this trial's measurement succeeded (`print_row()`, `report_table()` and `print_miss_cost()` already do). `perf_has()` alone checks only whether a counter opened.
 - New counters go into the same group. Each needs a row in the `FOR_EACH_COUNTER` list (slot name, generic event as the `PERF_COUNT_HW_` suffix, ARM raw fallback, Markdown header, console label and width), which generates both its `CTR_*` slot and its `counter_descs[]` entry; its position in `counter_display_order[]` (`CHECK_LEN` fails the build when that list's length differs from `CTR_COUNT`); and an entry in `fake_perf.c`'s `fake_events[]` table (and `FAKE_PERF_EVENTS`). `perf_test.c` sizes its fake reads by `CTR_COUNT` and opens every counter, so it covers the new one unchanged; run it.
 - Which counters are open is tracked in `perf_open_mask`, not by `perf_fd[]` values, so the zero-initialized state means "none open"; test it only through `perf_has()`.
 
@@ -150,14 +156,14 @@ To wire up a new test, bump `NUM_TESTS`, add `if (test_selected(N)) run_testN(re
 - Format `u64` with `PRIu64` and `size_t` with `%zu`.
 - Integer literal suffixes `L`/`UL`/`ULL` are uppercase (SonarQube S818 flags a lowercase `l`); lowercase `u` is accepted.
 - Write every integer-to-`double` conversion as an explicit `(double)` cast, also in mixed arithmetic such as `100.0 * (double)a / (double)b` (SonarQube S5276 flags implicit ones; the code is the same).
-- Every file-scope symbol is `static`.
+- Keep file-scope helpers and globals `static`; `main()` is the program entry point and has external linkage.
 
 ---
 
 ## Git and Contribution Guidelines
 - Committing changes is allowed; prefer opening pull requests on a branch over pushing directly to `main`.
 - Keep the codebase self-contained within [`branch_bench.c`](branch_bench.c).
-- Keep this file and README.md in sync with behaviour changes. The Serena memories in `.serena/memories/` only point here and hold Serena-specific tool notes; don't copy project rules into them.
+- Keep this file and README.md in sync with behaviour changes. Keep shared project rules here so that `CLAUDE.md` can continue importing them without duplicating instructions.
 - RESULTS.md's `# OLD RESULTS` sections are historical (old Test 3 labels and table layout). The i5-3380M hardware is gone, and its section is the only Ivy Bridge data for the Test 3 comparison with Haswell. Don't regenerate or reformat them. Suffixes such as `(WSL2)` in headings are added by hand.
 - Maintain C99 compatibility (C99 language plus POSIX/Linux APIs, built with GCC) without unnecessary external dependencies. GNU extensions already in use, such as `__attribute__((noinline))`, are accepted.
 

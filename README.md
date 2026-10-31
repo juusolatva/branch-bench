@@ -25,7 +25,14 @@ Branch, miss and cycle counts need Linux hardware performance counters, which re
 
 If a trial's counter read fails or its group never gets scheduled, that
 trial still reports its wall-clock time. Its hardware counts show as –
-in the report and are excluded from the cost per miss and average clock.
+in the report, the console marks them unavailable, and they are excluded
+from the cost per miss and average clock. Later trials can recover.
+
+On ARM, a failed generic event is retried as its architectural raw PMU
+event: branches `0x12` (`BR_PRED`), misses `0x10` (`BR_MIS_PRED`), and
+cycles `0x11` (`CPU_CYCLES`). The banner's **Raw PMU events** line and
+the report's **Raw ARM PMU events** line name each counter that used this
+fallback. If neither line appears, every open counter used its generic event.
 
 ## Prebuilt binaries
 
@@ -53,7 +60,8 @@ This writes the report file in addition to the normal
 console output. An existing file is overwritten, and a new one is
 readable only by you. The program exits with status 1 on errors,
 including an invalid option or a mismatch between Test 4's branch and
-branchless sums.
+branchless sums. Failure to write or close the report also exits with
+status 1 and prints an error.
 
 The report heading shows the CPU's maximum (turbo/boost) clock where
 Linux reports it. Where it does not (WSL2, most VMs), the heading is the
@@ -62,7 +70,8 @@ model name as is, which on Intel CPUs may end in the base clock
 so the report also ends with the **average clock during measurements**,
 calculated from the cycle counter. That is the clock the results were
 actually produced at, and it often explains why timings differ between
-runs on the same machine.
+runs on the same machine. It uses all trials with valid cycle counts,
+excluding warm-ups, and is omitted when no valid cycle measurement is available.
 
 ## Repeated measurements
 
@@ -76,7 +85,9 @@ By default each variant is measured once. For steadier numbers use
 Each variant then gets one untimed warm-up run followed by 5 measured
 trials. The trial with the median time is reported, together with the
 fastest–slowest range, so you can see how noisy the run was. Expect the
-run to take about N+1 times as long.
+run to take about N+1 times as long. For an even trial count, the lower
+of the two middle trials is reported. Time and hardware counts always
+come from the same trial.
 
 ## Choosing tests and sizes
 
@@ -87,9 +98,32 @@ run to take about N+1 times as long.
 
 `--size` sets the elements per array (and the calls per trial for
 Test 3); `K`/`M` suffixes are allowed. `--reps` sets how many passes each
-trial makes over the array. Results are only comparable with
+trial makes over the array and does not affect Test 3. Suffixes are
+case-insensitive powers of 1024. Size accepts 1–1024M, repetitions
+1–100000, and trials 1–99. Results are only comparable with
 [RESULTS.md](RESULTS.md) at the defaults (`--size 4M --reps 64`).
 Run `./branch_bench --help` for all options.
+
+## Development checks
+
+Build and run a small workload, then exercise the CLI and report paths:
+
+```sh
+./run.sh --size 64K --reps 2
+.github/scripts/smoke_test.sh ./branch_bench
+.github/scripts/check_kernels.sh ./branch_bench
+gcc -std=c99 -O2 -fno-tree-vectorize -fno-if-conversion -Wall -Wextra -pedantic -Werror \
+    -o /tmp/perf_test .github/scripts/perf_test.c
+/tmp/perf_test
+```
+
+The kernel check supports x86-64 and aarch64. On x86-64, also run
+`.github/scripts/check_jcc.sh ./branch_bench`; a build made by `run.sh`
+must print no hits. The perf regression tests need Linux but no hardware
+counters. CI also checks sanitizer builds, static analysis, coverage and
+the non-perf build path. [AGENTS.md](AGENTS.md) describes the code conventions,
+validation steps and release process; [CLAUDE.md](CLAUDE.md) imports those
+same project instructions.
 
 ## Adding results
 
@@ -98,7 +132,8 @@ with `-n 6` on an otherwise idle machine. Write the report to a separate
 file (never `-o RESULTS.md`) and paste its `## <CPU>` section under
 `# NEW RESULTS`, or under `# VPS RESULTS` for a virtual server. The report
 records the compiler (and, when built by `./run.sh`, the flags and commit),
-since codegen can change timings. `# OLD RESULTS` holds
+since codegen can change timings; existing entries may predate those
+metadata fields. `# OLD RESULTS` holds
 runs from an earlier version (single trial, no cycle counter, older
 Test 3 labels). Suffixes such as `(WSL2)` in headings, and clocks where
 Linux reports none, were added by hand.

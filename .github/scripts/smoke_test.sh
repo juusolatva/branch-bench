@@ -1,8 +1,8 @@
 #!/bin/sh
 # Runs a branch_bench binary through every command-line path with small
 # sizes: all tests, each option in short and long form, the report file and
-# invalid input.  Checks exit codes only, never timings.  Used for the
-# sanitizer and coverage builds.
+# invalid input.  Checks exit codes and report contents, never timings.
+# Used for the sanitizer and coverage builds.
 #
 # Usage: smoke_test.sh <binary> [work dir]
 set -u
