@@ -1,5 +1,6 @@
 # branch bench
 
+[![GitHub Release](https://img.shields.io/github/v/release/juusolatva/branch-bench)](https://github.com/juusolatva/branch-bench/releases/latest)
 [![CI](https://github.com/juusolatva/branch-bench/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/juusolatva/branch-bench/actions/workflows/ci.yml)
 [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=juusolatva_branch_bench&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=juusolatva_branch_bench)
 [![Coverage](https://sonarcloud.io/api/project_badges/measure?project=juusolatva_branch_bench&metric=coverage)](https://sonarcloud.io/summary/new_code?id=juusolatva_branch_bench)
