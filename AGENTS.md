@@ -3,6 +3,8 @@
 This file provides guidance and technical context for AI agents working on code in this repository.
 It is the shared source of project instructions; [`CLAUDE.md`](CLAUDE.md) imports it. User-facing build and usage guidance lives in [`README.md`](README.md).
 
+Project terminology lives in [`GLOSSARY.md`](GLOSSARY.md). Keep its definitions consistent with code and documentation when changing comparisons or measurements.
+
 ## Project Overview
 
 `branch_bench` is a single-file C microbenchmark ([`branch_bench.c`](branch_bench.c)) designed to measure the real CPU performance penalties associated with branch mispredictions across modern processor pipelines.
