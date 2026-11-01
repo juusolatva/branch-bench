@@ -11,7 +11,7 @@ A simple benchmark for testing out gains from branch prediction or conversely lo
 ## The tests
 
 1. **Threshold Sum** sums the bytes above 128 in a sorted and a shuffled copy of the same random array.
-2. **Stride Conditional** counts the ones in a 0/1 array that has them at every 4th position, or at random with the same 25% rate.
+2. **Stride Conditional** counts the ones in a 0/1 array, comparing a one at every 4th position with a 25% probability of a one at each position.
 3. **Indirect Dispatch** calls 32 functions through a pointer table, in sequential `i % 32` order or at random.
 4. **Branch vs Branchless** computes Test 1's sum with a conditional jump and with an arithmetic mask, on sorted and random data, and checks that both give the same result.
 
@@ -142,6 +142,13 @@ Linux reports none, were added by hand.
 
 ## Interpreting the results
 
+**Slowdown** in Tests 1–3 is the unpredictable variant's reported time
+divided by the predictable variant's. Test 4's **Branch penalty on random
+data** divides the branching time on random data by the branching time on
+sorted data. Its **branchless consistency ratio** uses the same random/sorted
+comparison for branchless computation and is labelled **Branchless is
+consistent**; a value near 1 means similar measured times.
+
 A branch misprediction costs a pipeline flush: the work fetched down the
 wrong path is thrown away and the front end restarts at the correct
 target. The minimum penalty is roughly the pipeline depth, typically
@@ -166,12 +173,14 @@ Test 3 on cores that cannot learn the sequential cycle, the small
 difference in work between the variants dominates and the figure is
 inflated (~54 cycles for Test 3 on the Raspberry Pi 4).
 
-**Miss %** is misses divided by *all* branches in the timed loop,
+**Miss %** is misses divided by *all* counted branches in the measurement window,
 including the loop's own back-edge branch, which is almost always
 predicted correctly. Test 1's shuffled branch is mispredicted ~50% of the
 time, but with two branches per element that shows up as ~25%. The
-**misses per element** figure (per call for Test 3) shows the
-mispredicted branch's own rate directly: 0.500 for Test 1 shuffled.
+**misses per element** figure (per call for Test 3) divides all measured
+misses by the work per trial. For Test 1 shuffled it is about 0.500;
+this approximates the data branch's miss probability when other branches
+contribute few misses.
 
 On ARM the branch counter may count speculatively executed branches,
 including ones on the wrong path after a misprediction, so the
@@ -188,7 +197,7 @@ Ryzen 5 9600X under WSL2).
 
 - **Tests 1 and 2** use direct conditional branches (a jump inside the
   loop). Test 2 shows the predictor learning a repeating pattern (every
-  4th element taken) but not a random one with the same 25% rate.
+  4th element taken) but not a random one with a 25% probability of a one.
 - **Test 3** uses indirect calls through a function pointer, so the CPU
   must predict a target address, not just taken/not-taken. A plain branch
   target buffer (BTB) remembers only the last target of each branch and

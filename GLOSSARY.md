@@ -83,11 +83,25 @@ _Avoid_: Data-branch miss rate
 
 **Misses per element / Misses per call**:
 The measured mispredictions divided by work per trial: element visits for Tests 1, 2 and 4, or indirect calls for Test 3.
-_Avoid_: Miss %
+The count includes misses from all branches in the measurement window, so this is an average number of misses per work item rather than the miss probability of one branch.
+_Avoid_: Miss %, data-branch miss probability
+
+**Slowdown**:
+The reported elapsed time of the unpredictable variant divided by that of the predictable variant in Tests 1–3; a value above 1 means the unpredictable variant took longer.
+_Avoid_: Extra time, cycle ratio
+
+**Branch penalty on random data**:
+Test 4's reported elapsed time for random data with branching divided by that for sorted data with branching.
+_Avoid_: Branchless speedup, cost per miss
+
+**Branchless consistency ratio**:
+Test 4's reported elapsed time for random data with branchless computation divided by that for sorted data with branchless computation, labelled “Branchless is consistent” in the results.
+A value near 1 means the two measured times were similar.
+_Avoid_: Guaranteed equal timings
 
 **Cost per miss**:
 An estimate of extra cycles per extra misprediction between the reported unpredictable and predictable trials, using the two branching variants in Test 4.
-It is available only when both trials have cycle and miss counts, with at least 1000 extra misses and a positive cycle difference.
+It depends on available cycle and miss counts and a sufficiently large increase in misses with a positive increase in cycles.
 _Avoid_: Fixed pipeline penalty
 
 **Average clock during measurements**:
