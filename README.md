@@ -173,9 +173,11 @@ Test 3 on cores that cannot learn the sequential cycle, the small
 difference in work between the variants dominates and the figure is
 inflated (~54 cycles for Test 3 on the Raspberry Pi 4).
 
-**Miss %** is misses divided by *all* counted branches in the measurement window,
-including the loop's own back-edge branch, which is almost always
-predicted correctly. Test 1's shuffled branch is mispredicted ~50% of the
+**Miss %** is misses divided by *all* counted branches in the counter
+window (the part of each trial the counters cover, see
+[GLOSSARY.md](GLOSSARY.md)), including the loop's own back-edge branch,
+which is almost always predicted correctly, and in Test 3 the leaf
+function's return (three branches per call). Test 1's shuffled branch is mispredicted ~50% of the
 time, but with two branches per element that shows up as ~25%. The
 **misses per element** figure (per call for Test 3) divides all measured
 misses by the work per trial. For Test 1 shuffled it is about 0.500;
@@ -186,7 +188,9 @@ On ARM the branch counter may count speculatively executed branches,
 including ones on the wrong path after a misprediction, so the
 unpredictable variants show more branches than the predictable ones and
 a lower Miss % (20.7% instead of 25% for Test 1 shuffled on the
-Raspberry Pi 4). Misses per element is unaffected.
+Raspberry Pi 4). The raw `BR_PRED` event counts this way, so expect it
+when the banner's **Raw PMU events** line lists branches. Misses per
+element is unaffected.
 
 **Sanity check for Test 1** (default size): each repetition walks 4,194,304 elements. At
 a 50% miss rate that is ~2.1M misses per repetition; at ~20 cycles each

@@ -9,7 +9,7 @@ One of the four benchmark comparisons: Threshold Sum, Stride Conditional, Indire
 _Avoid_: Trial, variant
 
 **Variant**:
-One case within a test, defined by its input pattern and method of computation, such as sorted with branching or random with branchless computation.
+One case within a test, defined by its decision or target pattern and method of computation, such as sorted with branching or random with branchless computation.
 _Avoid_: Test, trial
 
 **Kernel**:
@@ -49,11 +49,14 @@ _Avoid_: Branch, when loop-control branches are also meant
 A branch that runs a kernel's loops, such as the back-edge of the element or repetition loop, rather than testing the input; it is almost always predicted correctly but is still counted.
 _Avoid_: Data branch
 
+**Leaf return**:
+The return from a Test 3 leaf function after its indirect call; neither a data branch nor a loop-control branch, it is predicted by the return-address stack and still counted, so each Test 3 call executes three counted branches.
+_Avoid_: Data branch, loop-control branch
+
 ## Measurements
 
 **Run**:
 One execution of the benchmark, containing the selected tests and their variants, warm-ups and measured trials.
-The program's output and documentation say "warm-up run" for a single warm-up; that phrase is the one accepted exception.
 _Avoid_: Trial
 
 **Trial**:
@@ -65,7 +68,7 @@ One complete pass over an array within a trial in Tests 1, 2 and 4; Test 3 inste
 _Avoid_: Trial
 
 **Warm-up**:
-One unmeasured execution of a variant before its trials when more than one trial is requested, excluded from reported measurements. Labelled "warm-up run" in the banner, report and help text.
+One unmeasured execution of a variant before its trials when more than one trial is requested, excluded from reported measurements. Labelled "warm-up run" in the banner, report and help text, the one accepted use of "run" for less than a whole run.
 _Avoid_: First trial
 
 **Median trial**:
@@ -76,8 +79,16 @@ _Avoid_: Average trial, median of each metric
 The number of element visits across all repetitions in Tests 1, 2 and 4, or the number of indirect calls in Test 3.
 _Avoid_: Array size when referring to total element visits
 
+**Timed window**:
+The part of a trial measured by the wall-clock timer: the kernel call between the two timer reads, giving the trial's elapsed time.
+_Avoid_: Counter window
+
+**Counter window**:
+The part of a trial over which hardware counters count, from enabling the counter group to disabling it; it encloses the timed window and so also counts the timer calls and the counter control calls' user-mode code, a negligible addition to a kernel's counts.
+_Avoid_: Timed window
+
 **Available hardware count**:
-A hardware event count supported by the run and successfully measured for a particular trial; a missing count is unknown, and a time-shared count is a scaled estimate.
+A hardware event count from a counter that opened for the run and was read successfully for a particular trial; a missing count is unknown, and a time-shared count is a scaled estimate.
 _Avoid_: Zero when a count is unavailable
 
 ## Reported metrics
@@ -87,12 +98,18 @@ The fastest and slowest elapsed times among a variant's measured trials, reporte
 _Avoid_: Confidence interval
 
 **Miss %**:
-The percentage of counted branches that were mispredicted. Both counts cover every branch in the measurement window, so loop-control branches add to the denominator and any of their misses to the numerator; on ARM the branch count may include speculatively executed branches.
-_Avoid_: Data-branch miss rate
+The percentage of counted branches that were mispredicted. Both counts cover every branch in the counter window, so loop-control branches and, in Test 3, leaf returns add to the denominator and any of their misses to the numerator.
+On ARM, a branch count from the raw `BR_PRED` event (named on the banner's "Raw PMU events" line and the report's "Raw ARM PMU events" line) includes speculatively executed branches, which further lowers the percentage.
+_Avoid_: Data-branch miss rate, data-branch miss probability
+
+**Data-branch miss probability**:
+The fraction of a variant's data-branch executions that are mispredicted. No counter measures it directly; misses per element or per call approximates it when other branches add few misses.
+The `~0% misses` and `~50% misses` in Test 1's variant labels refer to it, which is why the shuffled row shows `~50% misses` beside a Miss % of about 25%.
+_Avoid_: Miss %
 
 **Misses per element / Misses per call**:
 The measured mispredictions divided by work per trial: element visits for Tests 1, 2 and 4, or indirect calls for Test 3. Labelled `Misses/elem` or `Misses/call` in the report, and `/elem` or `/call` after the miss count on the console.
-The count includes misses from all branches in the measurement window, so this is an average number of misses per work item rather than the miss probability of one branch.
+The count includes misses from all branches in the counter window, including loop-control branches and, in Test 3, leaf returns, so this is an average number of misses per work item rather than the miss probability of one branch.
 _Avoid_: Miss %, data-branch miss probability
 
 **Slowdown**:
@@ -115,5 +132,5 @@ _Avoid_: Fixed pipeline penalty
 
 **Average clock during measurements**:
 Total measured cycles divided by total elapsed time across all trials with available cycle counts, excluding warm-ups.
-Cycles are counted in user mode only, so time spent in the kernel or preempted lowers the figure slightly.
+Cycles are counted in user mode only, so time spent in the kernel or preempted lowers the figure slightly; cycles come from the counter window and time from the narrower timed window, which raises it negligibly.
 _Avoid_: Maximum clock, base clock, median-trial clock
