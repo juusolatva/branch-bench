@@ -329,7 +329,7 @@ static int result_has(const Result *r, int ctr)
 
 /* Sorts trials by time and returns the median one (the lower of the two
  * middle trials when n is even), so every field of the returned row comes
- * from the same real run.  Also records the fastest and slowest time. */
+ * from the same real trial.  Also records the fastest and slowest time. */
 static Result median_trial(Result *t, int n)
 {
     for (int i = 1; i < n; i++) {
@@ -602,7 +602,7 @@ static void print_row(const char *label, const Result *r, const Work *w)
 }
 
 /* Extra cycles per extra miss between a predictable and an unpredictable
- * run of the same work: the effective cost of one misprediction.  Skipped
+ * variant of the same work: the effective cost of one misprediction.  Skipped
  * when the counters are missing or the miss difference is too small to
  * give a meaningful ratio. */
 static void print_miss_cost(FILE *report, const Result *predictable,
@@ -720,7 +720,7 @@ static void run_test1(FILE *report)
 
     printf("TEST 1 — Threshold Sum  (sorted vs shuffled array, %zu×%u reps)\n",
            len, reps);
-    printf("  Counts/sums elements > %d.  Identical data, different order.\n\n",
+    printf("  Sums elements > %d.  Identical data, different order.\n\n",
            THRESHOLD);
 
     Result rs = {0};
