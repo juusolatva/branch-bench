@@ -113,13 +113,23 @@ static long fake_perf_event_open(const struct perf_event_attr *attr, int group_f
 long syscall(long number, ...)
 {
     va_list ap;
-    long a[6];
     va_start(ap, number);
+
+    /* Read perf_event_open's arguments with their real types: callers pass
+     * five (attr, pid, cpu, group_fd, flags), so reading six longs would
+     * read past the end. */
+    if (number == __NR_perf_event_open) {
+        const struct perf_event_attr *attr = va_arg(ap, const struct perf_event_attr *);
+        (void)va_arg(ap, int);              /* pid */
+        (void)va_arg(ap, int);              /* cpu */
+        int group_fd = va_arg(ap, int);
+        va_end(ap);                         /* flags not needed */
+        return fake_perf_event_open(attr, group_fd);
+    }
+
+    long a[6];
     for (int i = 0; i < 6; i++) a[i] = va_arg(ap, long);
     va_end(ap);
-
-    if (number == __NR_perf_event_open)
-        return fake_perf_event_open((const struct perf_event_attr *)a[0], (int)a[3]);
 
     static long (*real)(long, ...);
     if (!real) real = (long (*)(long, ...))dlsym(RTLD_NEXT, "syscall");
