@@ -1,11 +1,34 @@
 /* Deterministic tests of the real perf code; no hardware PMU is needed.
  * Reads return Linux-style cumulative scheduling times.
  *
- * The #defines below rename every read() and ioctl() in branch_bench.c and
- * the system headers it includes, so all of them reach the stubs, which
- * serve only perf counter reads (test_read asserts when it runs out of
- * samples).  If branch_bench.c starts calling read() or ioctl() for anything
- * else, e.g. sysfs, make the stubs pass those calls through. */
+ * The #defines below rename every read() and ioctl() call in branch_bench.c,
+ * so all of them reach the stubs, which serve only perf counter reads
+ * (test_read asserts when it runs out of samples).  If branch_bench.c starts
+ * calling read() or ioctl() for anything else, e.g. sysfs, make the stubs
+ * pass those calls through.
+ *
+ * The system headers branch_bench.c uses are included first, so the renames
+ * never reach them: with _FORTIFY_SOURCE, <unistd.h> defines an inline read()
+ * wrapper that calls glibc directly, and renaming it to test_read made Clang
+ * inline that wrapper instead of calling the stub.  Keep this list in sync
+ * with branch_bench.c's includes. */
+#define _DEFAULT_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <time.h>
+#include <inttypes.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <linux/perf_event.h>
+#include <sys/ioctl.h>
+#undef _DEFAULT_SOURCE /* <features.h> redefined it; branch_bench.c defines it */
+
+ssize_t test_read(int fd, void *buf, size_t count);
+int test_ioctl(int fd, unsigned long request, ...);
+
 #define main benchmark_main
 #define read test_read
 #define ioctl test_ioctl
@@ -70,6 +93,35 @@ static void invalid_reporting(Result good)
     account_clock(&bad);
     assert(clock_cycles_sum == 0 && clock_ms_sum == 0);
     puts("ok   invalid counters excluded from report, miss cost and clock");
+}
+
+/* Cost per miss needs both counters in both results; a ratio needs nonzero
+ * times.  The fake_perf.c runs reach only some of these combinations. */
+static void skipped_summaries(Result good)
+{
+    Result base = good;
+    base.counts[CTR_CYCLES] = 1000;
+    base.counts[CTR_MISSES] = 0;
+    good.counts[CTR_CYCLES] = 50000;
+    good.counts[CTR_MISSES] = 5000;
+    Result bad = good;
+    bad.counts_valid = 0;
+    FILE *f = tmpfile();
+    assert(f);
+    print_miss_cost(f, &base, &bad);
+    const int needed[] = {CTR_CYCLES, CTR_MISSES};
+    for (int i = 0; i < 2; i++) {
+        perf_open_mask &= ~(1u << needed[i]);
+        print_miss_cost(f, &base, &good);
+        perf_open_mask |= 1u << needed[i];
+    }
+    emit_ratio(f, "", "ratio", 1.0, 0.0, "");
+    emit_ratio(f, "", "ratio", 0.0, 1.0, "");
+    assert(ftell(f) == 0);
+    print_miss_cost(f, &base, &good); /* the same results with all counters */
+    assert(ftell(f) > 0);
+    assert(fclose(f) == 0);
+    puts("ok   cost per miss and ratios skipped without data");
 }
 
 static void failed_measurements(void)
@@ -184,6 +236,7 @@ int main(void)
     assert(sample_next == sample_count);
     puts("ok   per-trial perf scaling with changing multiplexing");
     invalid_reporting(first);
+    skipped_summaries(first);
     failed_measurements();
     raw_event_reporting();
     return 0;

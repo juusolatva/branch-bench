@@ -427,27 +427,53 @@ static inline u64 rng64(void)
  * terminal transcript.
  * ───────────────────────────────────────────────────────────────────────── */
 #ifdef __linux__
-/* If `line` is a /proc/cpuinfo CPU-model entry with a non-empty value, copy
- * the value (minus its trailing newline) into buf and return 1; otherwise
- * leave buf untouched and return 0.
- * x86: "model name\t: ..."   ARM: "Model\t: ..." (falls back to
- * "Hardware" on some older ARM kernels if "Model" is absent) */
-static int cpuinfo_model_value(const char *line, char *buf, size_t bufsz)
+/* If `line` is the /proc/cpuinfo entry `key` ("key<spaces/tabs>: value")
+ * with a non-empty value, copy the value (minus its trailing newline) into
+ * buf and return 1; otherwise leave buf untouched and return 0.  Control
+ * characters become spaces, so the value cannot inject terminal escapes or
+ * line breaks into the console or the Markdown heading. */
+static int cpuinfo_value(const char *line, const char *key, char *buf,
+                         size_t bufsz)
 {
-    if (strncmp(line, "model name", 10) != 0 &&
-        strncmp(line, "Model", 5) != 0 &&
-        strncmp(line, "Hardware", 8) != 0)
-        return 0;
-    const char *value = strchr(line, ':');
-    if (!value) return 0;
+    size_t keylen = strlen(key);
+    if (strncmp(line, key, keylen) != 0) return 0;
+    const char *value = line + keylen;
+    while (*value == ' ' || *value == '\t') value++;
+    if (*value != ':') return 0;
     value++;
     while (*value == ' ' || *value == '\t') value++;
     size_t len = strlen(value);
     while (len && (value[len-1] == '\n' || value[len-1] == '\r'))
         len--;
-    if (!len) return 0;
-    snprintf(buf, bufsz, "%.*s", (int)len, value);
+    if (!len || !bufsz) return 0;
+    if (len > bufsz - 1) len = bufsz - 1;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)value[i];
+        buf[i] = (c < 0x20 || c == 0x7f) ? ' ' : (char)c;
+    }
+    buf[len] = '\0';
     return 1;
+}
+
+/* CPU-model keys, most preferred first; the first entry of the best key
+ * present wins, wherever it is in the file.
+ *   "Model":      board name from Raspberry Pi kernels (arm64 and 32-bit)
+ *   "model name": x86 CPU name; 32-bit ARM kernels print one per core too,
+ *                 but only a generic "ARMv7 Processor rev 3 (v7l)"
+ *   "Hardware":   SoC name on 32-bit ARM kernels, e.g. "BCM2835" */
+static const char *const cpuinfo_model_keys[] = { "Model", "model name", "Hardware" };
+#define NUM_CPUINFO_MODEL_KEYS \
+    (sizeof cpuinfo_model_keys / sizeof cpuinfo_model_keys[0])
+
+/* Index of the first of cpuinfo_model_keys[0..limit-1] that `line` is an
+ * entry for (its value copied into buf), or limit if none. */
+static size_t cpuinfo_model_match(const char *line, size_t limit, char *buf,
+                                  size_t bufsz)
+{
+    for (size_t k = 0; k < limit; k++)
+        if (cpuinfo_value(line, cpuinfo_model_keys[k], buf, bufsz))
+            return k;
+    return limit;
 }
 #endif
 
@@ -458,10 +484,15 @@ static void get_cpu_model(char *buf, size_t bufsz)
     FILE *f = fopen("/proc/cpuinfo", "r");
     if (!f) return;
     char line[256];
-    while (fgets(line, sizeof(line), f)) {
-        if (!cpuinfo_model_value(line, buf, bufsz)) continue;
-        if (strncmp(line, "model name", 10) == 0)
-            break;  /* prefer x86 "model name" over any later match */
+    size_t best = NUM_CPUINFO_MODEL_KEYS;  /* key buf came from; none yet */
+    int at_line_start = 1;
+    while (best > 0 && fgets(line, sizeof(line), f)) {
+        /* Lines such as x86 "flags" are longer than line[]: skip the rest
+         * of a line, which fgets() returns as further chunks. */
+        int starts_line = at_line_start;
+        at_line_start = strchr(line, '\n') != NULL;
+        if (!starts_line) continue;
+        best = cpuinfo_model_match(line, best, buf, bufsz);
     }
     fclose(f);
 #endif
@@ -632,11 +663,14 @@ static void emit_rows(FILE *report, const char *title, const char *desc,
     report_table(report, title, desc, rows, n, w);
 }
 
-/* Emits a ratio summary line to both console and the Markdown report. */
+/* Emits a ratio summary line to both console and the Markdown report, or
+ * nothing when either time is zero (possible with a coarse clock). */
 static void emit_ratio(FILE *report, const char *console_prefix,
                        const char *md_label, double num_ms, double denom_ms,
                        const char *suffix)
 {
+    if (num_ms <= 0.0 || denom_ms <= 0.0)
+        return;  /* below the timer's resolution: no meaningful ratio */
     double ratio = num_ms / denom_ms;
     printf("%s%.2f×%s\n", console_prefix, ratio, suffix);
     if (report)
