@@ -215,9 +215,9 @@ ssize_t __read_chk(int fd, void *buf, size_t count, size_t buflen)
  * order, and skips empty values and keys that only start with a known one.
  * The flags line is longer than branch_bench.c's 256-byte line buffer, and
  * its second chunk starts with "Model": that text is not at the start of a
- * line, so it must be skipped.  The winning value's " @ " base clock must be
- * replaced by the cpufreq maximum: CI checks the report heading for
- * "Fake Board @ 3.60 GHz". */
+ * line, so it must be skipped.  The escape character in the winning value
+ * must become a space, and its " @ " base clock must be replaced by the
+ * cpufreq maximum: CI checks the report heading for "Fake Board @ 3.60 GHz". */
 #define FLAGS_CHUNK 255 /* bytes one fgets() into char[256] reads */
 static char cpuinfo[1024];
 
@@ -234,7 +234,7 @@ static void build_cpuinfo(void)
              "%sModel\t\t: Second chunk of the flags line\n"
              "Model name\t: Not a Model entry\n"
              "Model\t\t: \n"
-             "Model\t\t: Fake Board @ 2.40GHz\n"
+             "Model\t\t: Fake\x1b" "Board @ 2.40GHz\n"
              "Model\t\t: Not used after the first Model\n", flags);
 }
 

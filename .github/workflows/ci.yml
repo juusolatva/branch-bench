@@ -140,6 +140,20 @@ jobs:
             -o "$RUNNER_TEMP/perf_test" .github/scripts/perf_test.c
           "$RUNNER_TEMP/perf_test"
 
+      # A fortified build reads the counters through __read_chk(), not read();
+      # without the shim's wrapper every trial would read as unavailable and
+      # the average-clock line would be missing.
+      - name: Faked perf counters reach a fortified build
+        run: |
+          gcc -std=c99 -O2 -Wall -Wextra -Werror -shared -fPIC \
+            -o "$RUNNER_TEMP/fake_perf.so" .github/scripts/fake_perf.c -ldl
+          clang $CLANG_FLAGS $WARN_FLAGS -D_FORTIFY_SOURCE=2 \
+            -o "$RUNNER_TEMP/branch_bench_fortify" branch_bench.c
+          objdump -T "$RUNNER_TEMP/branch_bench_fortify" | grep -q '__read_chk'
+          LD_PRELOAD="$RUNNER_TEMP/fake_perf.so" "$RUNNER_TEMP/branch_bench_fortify" \
+            $SMALL_RUN -o "$RUNNER_TEMP/fortify.md" > /dev/null
+          grep -q '^\*\*Average clock during measurements:\*\*' "$RUNNER_TEMP/fortify.md"
+
       # Clang makes Tests 1-2 branchless (cmov in sum_threshold, sbb in
       # count_decisions), so check_kernels.sh must reject both. This proves
       # the checker still detects lost branches.

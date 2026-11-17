@@ -429,7 +429,9 @@ static inline u64 rng64(void)
 #ifdef __linux__
 /* If `line` is the /proc/cpuinfo entry `key` ("key<spaces/tabs>: value")
  * with a non-empty value, copy the value (minus its trailing newline) into
- * buf and return 1; otherwise leave buf untouched and return 0. */
+ * buf and return 1; otherwise leave buf untouched and return 0.  Control
+ * characters become spaces, so the value cannot inject terminal escapes or
+ * line breaks into the console or the Markdown heading. */
 static int cpuinfo_value(const char *line, const char *key, char *buf,
                          size_t bufsz)
 {
@@ -443,8 +445,13 @@ static int cpuinfo_value(const char *line, const char *key, char *buf,
     size_t len = strlen(value);
     while (len && (value[len-1] == '\n' || value[len-1] == '\r'))
         len--;
-    if (!len) return 0;
-    snprintf(buf, bufsz, "%.*s", (int)len, value);
+    if (!len || !bufsz) return 0;
+    if (len > bufsz - 1) len = bufsz - 1;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)value[i];
+        buf[i] = (c < 0x20 || c == 0x7f) ? ' ' : (char)c;
+    }
+    buf[len] = '\0';
     return 1;
 }
 
@@ -457,6 +464,17 @@ static int cpuinfo_value(const char *line, const char *key, char *buf,
 static const char *const cpuinfo_model_keys[] = { "Model", "model name", "Hardware" };
 #define NUM_CPUINFO_MODEL_KEYS \
     (sizeof cpuinfo_model_keys / sizeof cpuinfo_model_keys[0])
+
+/* Index of the first of cpuinfo_model_keys[0..limit-1] that `line` is an
+ * entry for (its value copied into buf), or limit if none. */
+static size_t cpuinfo_model_match(const char *line, size_t limit, char *buf,
+                                  size_t bufsz)
+{
+    for (size_t k = 0; k < limit; k++)
+        if (cpuinfo_value(line, cpuinfo_model_keys[k], buf, bufsz))
+            return k;
+    return limit;
+}
 #endif
 
 static void get_cpu_model(char *buf, size_t bufsz)
@@ -474,11 +492,7 @@ static void get_cpu_model(char *buf, size_t bufsz)
         int starts_line = at_line_start;
         at_line_start = strchr(line, '\n') != NULL;
         if (!starts_line) continue;
-        for (size_t k = 0; k < best; k++)
-            if (cpuinfo_value(line, cpuinfo_model_keys[k], buf, bufsz)) {
-                best = k;
-                break;
-            }
+        best = cpuinfo_model_match(line, best, buf, bufsz);
     }
     fclose(f);
 #endif
