@@ -10,10 +10,10 @@
  *    (comma-separated: branches, misses, cycles; default all three).  Other
  *    events fail with ENOENT.
  *  - ioctl() on the group leader enables, disables and resets the group, and
- *    read() returns counts derived from the time the group was enabled:
- *    1 branch and 3 cycles per ns, 1 miss per 20 ns.  The first three reads
- *    exercise the error paths: a group that never ran, counters that were
- *    time-shared, and a short read.
+ *    read() (or __read_chk() under _FORTIFY_SOURCE) returns counts derived
+ *    from the time the group was enabled: 1 branch and 3 cycles per ns, 1
+ *    miss per 20 ns.  The first three reads exercise the error paths: a
+ *    group that never ran, counters that were time-shared, and a short read.
  *  - fopen() of /proc/cpuinfo and of cpufreq's cpuinfo_max_freq returns
  *    fixed contents.
  *
@@ -138,11 +138,6 @@ long syscall(long number, ...)
 
 int ioctl(int fd, unsigned long request, ...)
 {
-    va_list ap;
-    va_start(ap, request);
-    void *arg = va_arg(ap, void *);
-    va_end(ap);
-
     if (fd >= 0 && fd == leader) {
         if (request == PERF_EVENT_IOC_RESET) {
             elapsed_ns = 0;
@@ -164,12 +159,19 @@ int ioctl(int fd, unsigned long request, ...)
         return 0;
     }
 
+    /* Read the third argument only to pass it on: the perf calls above pass
+     * an int flag, not a pointer. */
+    va_list ap;
+    va_start(ap, request);
+    void *arg = va_arg(ap, void *);
+    va_end(ap);
+
     static int (*real)(int, unsigned long, ...);
     if (!real) real = (int (*)(int, unsigned long, ...))dlsym(RTLD_NEXT, "ioctl");
     return real(fd, request, arg);
 }
 
-ssize_t read(int fd, void *buf, size_t count)
+static ssize_t fake_read(int fd, void *buf, size_t count)
 {
     if (fd >= 0 && fd == leader) {
         /* nr, time_enabled, time_running, then one value per member */
@@ -195,14 +197,46 @@ ssize_t read(int fd, void *buf, size_t count)
     return real(fd, buf, count);
 }
 
-/* An empty Model line (skipped), then Hardware and model name entries; the
- * " @ " base clock must be replaced by the cpufreq maximum. */
-static char cpuinfo[] =
-    "processor\t: 0\n"
-    "Model\t\t: \n"
-    "Hardware\t: Fake SoC\n"
-    "model name\t: Fake CPU 1234 @ 2.40GHz\n"
-    "Model\t\t: Not used after model name\n";
+ssize_t read(int fd, void *buf, size_t count)
+{
+    return fake_read(fd, buf, count);
+}
+
+/* With _FORTIFY_SOURCE (e.g. clang -O2 -D_FORTIFY_SOURCE=2), calls whose
+ * buffer size the compiler knows can go to glibc's __read_chk() instead of
+ * read(). */
+ssize_t __read_chk(int fd, void *buf, size_t count, size_t buflen)
+{
+    if (count > buflen) abort();    /* glibc's __chk_fail() aborts too */
+    return fake_read(fd, buf, count);
+}
+
+/* branch_bench.c prefers Model over model name over Hardware, whatever their
+ * order, and skips empty values and keys that only start with a known one.
+ * The flags line is longer than branch_bench.c's 256-byte line buffer, and
+ * its second chunk starts with "Model": that text is not at the start of a
+ * line, so it must be skipped.  The winning value's " @ " base clock must be
+ * replaced by the cpufreq maximum: CI checks the report heading for
+ * "Fake Board @ 3.60 GHz". */
+#define FLAGS_CHUNK 255 /* bytes one fgets() into char[256] reads */
+static char cpuinfo[1024];
+
+static void build_cpuinfo(void)
+{
+    char flags[FLAGS_CHUNK + 1];
+    int n = snprintf(flags, sizeof flags, "flags\t\t: ");
+    memset(flags + n, 'f', FLAGS_CHUNK - (size_t)n);
+    flags[FLAGS_CHUNK] = '\0';
+    snprintf(cpuinfo, sizeof cpuinfo,
+             "processor\t: 0\n"
+             "model name\t: Fake CPU 1234 @ 2.40GHz\n"
+             "Hardware\t: Fake SoC\n"
+             "%sModel\t\t: Second chunk of the flags line\n"
+             "Model name\t: Not a Model entry\n"
+             "Model\t\t: \n"
+             "Model\t\t: Fake Board @ 2.40GHz\n"
+             "Model\t\t: Not used after the first Model\n", flags);
+}
 
 /* Per-CPU maximum clock in kHz: a lower value, a higher one, an unparsable
  * one, then lower ones again. */
@@ -214,8 +248,10 @@ FILE *fopen(const char *path, const char *mode)
 {
     long cpu;
     char tail[32];
-    if (strcmp(path, "/proc/cpuinfo") == 0)
+    if (strcmp(path, "/proc/cpuinfo") == 0) {
+        build_cpuinfo();
         return fmemopen(cpuinfo, strlen(cpuinfo), "r");
+    }
     if (sscanf(path, "/sys/devices/system/cpu/cpu%ld/cpufreq/%31s", &cpu, tail) == 2 &&
         strcmp(tail, "cpuinfo_max_freq") == 0) {
         char *s = cpu == 1 ? khz_high : cpu == 2 ? khz_bad : khz_low;

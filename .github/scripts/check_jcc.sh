@@ -2,7 +2,7 @@
 # Lists jumps in the benchmark kernels that cross or end on a 32-byte
 # boundary.  Intel's JCC-erratum microcode (Skylake-derived CPUs) slows such
 # jumps; a macro-fused cmp/test/add/sub/and/inc/dec + jcc pair counts as one
-# jump.  A hit inside a kernel's hot loop can change timings; hits in setup
+# jump.  Test 3's leaf functions count as kernels: each call runs one's ret.  A hit inside a kernel's hot loop can change timings; hits in setup
 # code outside the loop do not matter.  Builds with run.sh's alignment flags
 # (-Wa,-mbranches-within-32B-boundaries,...) have no hits at all, and CI's
 # x86-64 gcc job fails on any.  x86-64 only.
@@ -29,14 +29,16 @@ printf '%s\n' "$disassembly" | awk -F'\t' '
     /^[0-9a-f]+ </ {
         fn = $0; sub(/^[0-9a-f]+ /, "", fn); sub(/:$/, "", fn)
         base = fn; sub(/^</, "", base); sub(/[.>].*$/, "", base)
-        kernel = fn ~ /^<(sum_threshold|sum_branch|sum_branchless|count_decisions|dispatch_sequential|dispatch_random)(\.[^>]*)?>$/
-        if (kernel) seen[base == "sum_branch" ? "sum_threshold" : base] = 1
+        kernel = fn ~ /^<(sum_threshold|sum_branch|sum_branchless|count_decisions|dispatch_sequential|dispatch_random|leaf_[0-9]+)(\.[^>]*)?>$/
+        if (kernel) seen[base == "sum_branch" ? "sum_threshold" : base ~ /^leaf_/ ? "leaf_N" : base] = 1
         pop = ""; next
     }
     kernel && NF >= 3 {
         addr = $1; gsub(/[ :]/, "", addr)
         s = hex(addr); e = s + split($2, bytes, " ")
-        split($3, w, " "); op = w[1]
+        insn = $3   # skip prefixes, e.g. the alignment padding "cs cs add"
+        sub(/^((cs|ds|es|ss|fs|gs|data16|addr32|notrack|bnd|lock|rep|repz|repnz|repe|repne|rex(\.[WRXB]+)?) +)+/, "", insn)
+        split(insn, w, " "); op = w[1]
         if (op ~ /^(j|call|ret)/) {
             f = s
             if (op ~ /^j/ && op != "jmp" && pop ~ /^(cmp|test|add|sub|and|inc|dec)/ && pe == s)
@@ -47,7 +49,7 @@ printf '%s\n' "$disassembly" | awk -F'\t' '
         ps = s; pe = e; pop = op
     }
     END {
-        n = split("sum_threshold sum_branchless count_decisions dispatch_sequential dispatch_random", want, " ")
+        n = split("sum_threshold sum_branchless count_decisions dispatch_sequential dispatch_random leaf_N", want, " ")
         for (i = 1; i <= n; i++)
             if (!(want[i] in seen)) {
                 printf "check_jcc.sh: kernel %s not found\n", want[i] > "/dev/stderr"

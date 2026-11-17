@@ -65,13 +65,17 @@ jobs:
 
       # The fixture's kernel is branchless without any blacklisted
       # instruction, so this proves the data-branch check itself still fails.
+      # Unrolled, its outer loop holds forward branches around the inner loop,
+      # which must not count as data branches either.
       - name: Kernel check rejects a branchless fixture
         run: |
-          gcc $BENCH_FLAGS $WARN_FLAGS -o "$RUNNER_TEMP/fixture" .github/scripts/branchless_fixture.c
-          out="$RUNNER_TEMP/check_fixture.txt"
-          .github/scripts/check_kernels.sh "$RUNNER_TEMP/fixture" > "$out" || true
-          cat "$out"
-          grep -q '^FAIL Test 1/4 .*no conditional branch inside the loop' "$out"
+          for extra in "" -funroll-loops; do
+            gcc $BENCH_FLAGS $extra $WARN_FLAGS -o "$RUNNER_TEMP/fixture" .github/scripts/branchless_fixture.c
+            out="$RUNNER_TEMP/check_fixture.txt"
+            .github/scripts/check_kernels.sh "$RUNNER_TEMP/fixture" > "$out" || true
+            cat "$out"
+            grep -q '^FAIL Test 1/4 .*no conditional branch inside the loop' "$out"
+          done
 
       - name: Check no kernel jump crosses a 32-byte boundary
         if: runner.arch == 'X64'
@@ -127,6 +131,14 @@ jobs:
 
       - name: Run (small size)
         run: ./branch_bench $SMALL_RUN
+
+      # With _FORTIFY_SOURCE, Clang inlines glibc's read() wrapper wherever
+      # that wrapper is visible; perf_test.c must still reach its stubs.
+      - name: Perf regression tests (Clang, _FORTIFY_SOURCE=2)
+        run: |
+          clang $CLANG_FLAGS $WARN_FLAGS -D_FORTIFY_SOURCE=2 \
+            -o "$RUNNER_TEMP/perf_test" .github/scripts/perf_test.c
+          "$RUNNER_TEMP/perf_test"
 
       # Clang makes Tests 1-2 branchless (cmov in sum_threshold, sbb in
       # count_decisions), so check_kernels.sh must reject both. This proves
@@ -251,6 +263,9 @@ jobs:
           # Fails if the shim was not used: these lines need the counters.
           grep -q '^\*\*Cost per miss:\*\*' "$dir/report.md"
           grep -q '^\*\*Average clock during measurements:\*\*' "$dir/report.md"
+          # The shim's /proc/cpuinfo checks the model key preference and the
+          # cpufreq clock replacing the model's base clock.
+          grep -qx '## Fake Board @ 3.60 GHz' "$dir/report.md"
           # Only some counters open.
           for ev in misses branches,cycles; do
             FAKE_PERF_EVENTS=$ev ./branch_bench_cov -t 1 $SMALL_RUN -o "$dir/part.md"
