@@ -114,6 +114,32 @@ jobs:
                 exit 1
               fi'
 
+      # Clang with _FORTIFY_SOURCE inlines glibc's read() wrapper, which
+      # calls __read_chk() or read() directly.  glibc 2.40 and later enable
+      # this for Clang; Ubuntu 24.04's 2.39 does not, so this runs in the
+      # image's newer glibc.  perf_test.c must still reach its stubs, and
+      # fake_perf.c must serve __read_chk() (without it every trial reads as
+      # unavailable and the average-clock line is missing).
+      - name: Fortified Clang build reaches perf stubs and shim
+        run: |
+          image=$(sed -n 's/^FROM //p' .github/gcc-latest/Dockerfile)
+          docker run --rm -v "$PWD:/src:ro" -w /src \
+            -e CLANG_FLAGS -e WARN_FLAGS -e SMALL_RUN "$image" sh -ec '
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends clang > /dev/null
+              clang --version
+              fortify="$CLANG_FLAGS $WARN_FLAGS -D_FORTIFY_SOURCE=2"
+              clang $fortify -o /tmp/perf_test .github/scripts/perf_test.c
+              /tmp/perf_test
+              gcc -std=c99 -O2 -Wall -Wextra -Werror -shared -fPIC \
+                -o /tmp/fake_perf.so .github/scripts/fake_perf.c -ldl
+              clang $fortify -o /tmp/branch_bench branch_bench.c
+              objdump -T /tmp/branch_bench | grep -q __read_chk ||
+                { echo "fortified build does not call __read_chk: check proves nothing"; exit 1; }
+              LD_PRELOAD=/tmp/fake_perf.so /tmp/branch_bench $SMALL_RUN -o /tmp/fortify.md > /dev/null
+              grep -q "^\*\*Average clock during measurements:\*\*" /tmp/fortify.md ||
+                { echo "fake_perf.c did not serve the fortified counter reads"; exit 1; }'
+
   clang:
     name: Clang build and static analysis
     runs-on: ubuntu-24.04
@@ -131,28 +157,6 @@ jobs:
 
       - name: Run (small size)
         run: ./branch_bench $SMALL_RUN
-
-      # With _FORTIFY_SOURCE, Clang inlines glibc's read() wrapper wherever
-      # that wrapper is visible; perf_test.c must still reach its stubs.
-      - name: Perf regression tests (Clang, _FORTIFY_SOURCE=2)
-        run: |
-          clang $CLANG_FLAGS $WARN_FLAGS -D_FORTIFY_SOURCE=2 \
-            -o "$RUNNER_TEMP/perf_test" .github/scripts/perf_test.c
-          "$RUNNER_TEMP/perf_test"
-
-      # A fortified build reads the counters through __read_chk(), not read();
-      # without the shim's wrapper every trial would read as unavailable and
-      # the average-clock line would be missing.
-      - name: Faked perf counters reach a fortified build
-        run: |
-          gcc -std=c99 -O2 -Wall -Wextra -Werror -shared -fPIC \
-            -o "$RUNNER_TEMP/fake_perf.so" .github/scripts/fake_perf.c -ldl
-          clang $CLANG_FLAGS $WARN_FLAGS -D_FORTIFY_SOURCE=2 \
-            -o "$RUNNER_TEMP/branch_bench_fortify" branch_bench.c
-          objdump -T "$RUNNER_TEMP/branch_bench_fortify" | grep -q '__read_chk'
-          LD_PRELOAD="$RUNNER_TEMP/fake_perf.so" "$RUNNER_TEMP/branch_bench_fortify" \
-            $SMALL_RUN -o "$RUNNER_TEMP/fortify.md" > /dev/null
-          grep -q '^\*\*Average clock during measurements:\*\*' "$RUNNER_TEMP/fortify.md"
 
       # Clang makes Tests 1-2 branchless (cmov in sum_threshold, sbb in
       # count_decisions), so check_kernels.sh must reject both. This proves
