@@ -15,7 +15,8 @@
  *    miss per 20 ns.  The first three reads exercise the error paths: a
  *    group that never ran, counters that were time-shared, and a short read.
  *  - fopen() of /proc/cpuinfo and of cpufreq's cpuinfo_max_freq returns
- *    fixed contents.
+ *    fixed contents, and sysconf(_SC_NPROCESSORS_CONF) reports 4 CPUs, so
+ *    every fake clock is read whatever the host's CPU count.
  *
  * Counts are for coverage only and mean nothing.  Not for measurements.
  *
@@ -239,10 +240,23 @@ static void build_cpuinfo(void)
 }
 
 /* Per-CPU maximum clock in kHz: a lower value, a higher one, an unparsable
- * one, then lower ones again. */
+ * one, then lower ones again (FAKE_CPUS of them; see sysconf()). */
+#define FAKE_CPUS 4
 static char khz_low[]  = "2400000\n";
 static char khz_high[] = "3600000\n";
 static char khz_bad[]  = "n/a\n";
+
+/* branch_bench.c reads the clock of each of _SC_NPROCESSORS_CONF CPUs.  The
+ * real count would skip cpu1's higher clock on a one-CPU host and fail CI's
+ * "Fake Board @ 3.60 GHz" check. */
+long sysconf(int name)
+{
+    static long (*real)(int);
+    if (name == _SC_NPROCESSORS_CONF)
+        return FAKE_CPUS;
+    if (!real) real = (long (*)(int))dlsym(RTLD_NEXT, "sysconf");
+    return real(name);
+}
 
 FILE *fopen(const char *path, const char *mode)
 {

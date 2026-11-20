@@ -66,7 +66,8 @@ jobs:
       # The fixture's kernel is branchless without any blacklisted
       # instruction, so this proves the data-branch check itself still fails.
       # Unrolled, its outer loop holds forward branches around the inner loop,
-      # which must not count as data branches either.
+      # which must not count as data branches either.  Its sum_branch keeps
+      # a data branch, which must not let sum_threshold pass.
       - name: Kernel check rejects a branchless fixture
         run: |
           for extra in "" -funroll-loops; do
@@ -74,7 +75,8 @@ jobs:
             out="$RUNNER_TEMP/check_fixture.txt"
             .github/scripts/check_kernels.sh "$RUNNER_TEMP/fixture" > "$out" || true
             cat "$out"
-            grep -q '^FAIL Test 1/4 .*no conditional branch inside the loop' "$out"
+            grep -q '^FAIL Test 1/4 sum_threshold: no conditional branch inside the loop' "$out"
+            grep -q '^ok   Test 1/4 sum_branch$' "$out"
           done
 
       - name: Check no kernel jump crosses a 32-byte boundary
@@ -275,18 +277,25 @@ jobs:
         run: |
           gcc -std=c99 -O2 -Wall -Wextra -Werror -shared -fPIC \
             -o "$RUNNER_TEMP/fake_perf.so" .github/scripts/fake_perf.c -ldl
-          export LD_PRELOAD="$RUNNER_TEMP/fake_perf.so"
+          # Preloaded into the benchmark only, not into the shell and tools
+          # smoke_test.sh runs.
+          bench="$RUNNER_TEMP/branch_bench_fake"
+          printf '#!/bin/sh\nLD_PRELOAD=%s exec %s "$@"\n' \
+            "$RUNNER_TEMP/fake_perf.so" "$PWD/branch_bench_cov" > "$bench"
+          chmod +x "$bench"
           dir="$RUNNER_TEMP/smoke-fake"
-          .github/scripts/smoke_test.sh ./branch_bench_cov "$dir"
+          .github/scripts/smoke_test.sh "$bench" "$dir"
           # Fails if the shim was not used: these lines need the counters.
           grep -q '^\*\*Cost per miss:\*\*' "$dir/report.md"
           grep -q '^\*\*Average clock during measurements:\*\*' "$dir/report.md"
+          # The shim time-shares the counters in one trial.
+          grep -q '^_Hardware counters were time-shared in 1 measured trial(s);' "$dir/report.md"
           # The shim's /proc/cpuinfo checks the model key preference and the
           # cpufreq clock replacing the model's base clock.
           grep -qx '## Fake Board @ 3.60 GHz' "$dir/report.md"
           # Only some counters open.
           for ev in misses branches,cycles; do
-            FAKE_PERF_EVENTS=$ev ./branch_bench_cov -t 1 $SMALL_RUN -o "$dir/part.md"
+            FAKE_PERF_EVENTS=$ev "$bench" -t 1 $SMALL_RUN -o "$dir/part.md"
           done
 
       # Covers perf_stop()'s error paths, which need failing counter reads.

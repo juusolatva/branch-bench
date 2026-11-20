@@ -36,6 +36,7 @@ int test_ioctl(int fd, unsigned long request, ...);
 #undef main
 #undef read
 #undef ioctl
+#undef NDEBUG /* the asserts are the tests */
 #include <assert.h>
 
 static u64 samples[8][3 + CTR_COUNT];
@@ -86,10 +87,12 @@ static void invalid_reporting(Result good)
     report_table(f, "test", NULL, rows, 2, &work);
     rewind(f);
     char output[2048] = {0};
-    assert(fread(output, 1, sizeof(output) - 1, f) > 0);
+    size_t got = fread(output, 1, sizeof(output) - 1, f);
+    assert(got > 0);
     assert(strstr(output, "| invalid | 1.0 | – | – | – | – | – |"));
     assert(strstr(output, "| valid |"));
-    assert(fclose(f) == 0);
+    int closed = fclose(f);
+    assert(closed == 0);
     account_clock(&bad);
     assert(clock_cycles_sum == 0 && clock_ms_sum == 0);
     puts("ok   invalid counters excluded from report, miss cost and clock");
@@ -118,15 +121,23 @@ static void skipped_summaries(Result good)
     emit_ratio(f, "", "ratio", 1.0, 0.0, "");
     emit_ratio(f, "", "ratio", 0.0, 1.0, "");
     assert(ftell(f) == 0);
+    /* Misses near UINT64_MAX: base + 1000 would wrap and let a difference of
+     * 10 through. */
+    Result near_max = base, above = good;
+    near_max.counts[CTR_MISSES] = UINT64_MAX - 10;
+    above.counts[CTR_MISSES] = UINT64_MAX;
+    print_miss_cost(f, &near_max, &above);
+    assert(ftell(f) == 0);
     print_miss_cost(f, &base, &good); /* the same results with all counters */
     assert(ftell(f) > 0);
-    assert(fclose(f) == 0);
+    int closed = fclose(f);
+    assert(closed == 0);
     puts("ok   cost per miss and ratios skipped without data");
 }
 
 static void failed_measurements(void)
 {
-    for (int scenario = 0; scenario < 9; scenario++) {
+    for (int scenario = 0; scenario < 11; scenario++) {
         sample_count = 0;
         sample_next = 0;
         ioctl_failure = 0;
@@ -142,6 +153,8 @@ static void failed_measurements(void)
         case 6: ioctl_failure = PERF_EVENT_IOC_ENABLE; break;
         case 7: ioctl_failure = PERF_EVENT_IOC_DISABLE; break;
         case 8: samples[1][1] = 99; break; /* invalid cumulative times */
+        case 9: samples[1][2] = 49; break; /* running went backwards */
+        case 10: samples[1][2] = 160; break; /* ran longer than enabled */
         }
         Result r = {0};
         r.counts_valid = 1; /* failure must also invalidate a reused result */
@@ -166,8 +179,18 @@ static void failed_measurements(void)
     puts("ok   failed reads, unscheduled trials, ioctl errors and recovery");
 }
 
-/* On ARM a counter can open only as its raw PMU event; the banner and report
- * must say which ones did. */
+/* Exact counts when the counters ran the whole trial, rounded ones when
+ * they were time-shared, and no overflow for an extreme ratio. */
+static void count_scaling(void)
+{
+    const u64 big = (1ULL << 53) + 1;   /* not representable as a double */
+    assert(perf_scaled_count(big, 10, 10) == big);
+    assert(perf_scaled_count(5, 3, 2) == 8);   /* 7.5 rounds up; was 7 */
+    assert(perf_scaled_count(4, 3, 2) == 6);
+    assert(perf_scaled_count(UINT64_MAX / 2, 4, 1) == UINT64_MAX);
+    puts("ok   counts exact unless scaled, rounded and capped when scaled");
+}
+
 /* True if the file, read from its start, has a line equal to want. */
 static int has_line(FILE *f, const char *want)
 {
@@ -178,6 +201,78 @@ static int has_line(FILE *f, const char *want)
     return 0;
 }
 
+/* main()'s first trial was time-shared, so the report must say so. */
+static void scaled_note(void)
+{
+    const char *note = "_Hardware counters were time-shared in 1 measured trial(s); "
+                       "their counts are scaled estimates._\n";
+    assert(perf_scaled_trials == 1);
+    FILE *report = tmpfile();
+    assert(report);
+    report_scaled_note(report);
+    assert(has_line(report, note));
+    fclose(report);
+
+    perf_scaled_trials = 0;
+    report = tmpfile();
+    assert(report);
+    report_scaled_note(report);
+    assert(ftell(report) == 0);
+    fclose(report);
+    report_scaled_note(NULL);
+    puts("ok   report notes scaled counts");
+}
+
+/* Runs fn with stdout pointed at a temporary file, which is returned. */
+static FILE *capture_stdout(void (*fn)(void))
+{
+    FILE *out = tmpfile();
+    assert(out);
+    fflush(stdout);
+    int saved = dup(STDOUT_FILENO);
+    int redirected = saved >= 0 && dup2(fileno(out), STDOUT_FILENO) >= 0;
+    assert(redirected);
+    fn();
+    fflush(stdout);
+    int restored = dup2(saved, STDOUT_FILENO) >= 0;
+    close(saved);
+    assert(restored);
+    return out;
+}
+
+static void print_aligned_rows(void)
+{
+    const Work work = {100, "elem"};
+    Result r = {0};
+    r.time_ms = 1;
+    print_row("Plain ASCII label", &r, &work);
+    print_row("Label — with — dashes", &r, &work);
+}
+
+/* printf pads by bytes; rows whose labels have multibyte UTF-8 characters
+ * must still put the time in the same column. */
+static void label_alignment(void)
+{
+    FILE *out = capture_stdout(print_aligned_rows);
+    char a[256], b[256];
+    rewind(out);
+    int read_both = fgets(a, sizeof a, out) && fgets(b, sizeof b, out);
+    assert(read_both);
+    fclose(out);
+    const char *ta = strstr(a, "1.0 ms"), *tb = strstr(b, "1.0 ms");
+    assert(ta && tb);
+    /* Columns before the time: bytes minus continuation bytes. */
+    int ca = (int)(ta - a), cb = (int)(tb - b);
+    for (const char *s = b; s < tb; s++)
+        if (((unsigned char)*s & 0xC0u) == 0x80u) cb--;
+    assert(ca == cb);
+    puts("ok   console rows aligned with UTF-8 labels");
+}
+
+static void print_empty_banner(void) { print_banner(""); }
+
+/* On ARM a counter can open only as its raw PMU event; the banner and report
+ * must say which ones did. */
 static void raw_event_reporting(void)
 {
     perf_raw_mask = (1u << CTR_BRANCHES) | (1u << CTR_CYCLES);
@@ -192,18 +287,7 @@ static void raw_event_reporting(void)
                             "branches (0x12), cycles (0x11)_\n"));
     fclose(report);
 
-    /* print_banner() writes to stdout: point stdout at a file meanwhile. */
-    FILE *banner = tmpfile();
-    assert(banner);
-    fflush(stdout);
-    int saved = dup(STDOUT_FILENO);
-    int redirected = saved >= 0 && dup2(fileno(banner), STDOUT_FILENO) >= 0;
-    assert(redirected);
-    print_banner("");
-    fflush(stdout);
-    int restored = dup2(saved, STDOUT_FILENO) >= 0;
-    close(saved);
-    assert(restored);
+    FILE *banner = capture_stdout(print_empty_banner);
     assert(has_line(banner, "  Raw PMU events:  branches (0x12), cycles (0x11) "
                             "(generic events failed)\n"));
     fclose(banner);
@@ -238,6 +322,9 @@ int main(void)
     invalid_reporting(first);
     skipped_summaries(first);
     failed_measurements();
+    count_scaling();
+    scaled_note();
+    label_alignment();
     raw_event_reporting();
     return 0;
 }
