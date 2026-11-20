@@ -98,8 +98,8 @@ come from the same trial.
 ```
 
 `--size` sets the elements per array (and the calls per trial for
-Test 3); `K`/`M` suffixes are allowed. `--reps` sets how many passes each
-trial makes over the array and does not affect Test 3. Suffixes are
+Test 3). `--reps` sets how many passes each trial makes over the array
+and does not affect Test 3. Both accept `K`/`M` suffixes, which are
 case-insensitive powers of 1024. Size accepts 1–1024M, repetitions
 1–100000, and trials 1–99. Results are only comparable with
 [RESULTS.md](RESULTS.md) at the defaults (`--size 4M --reps 64`).

@@ -26,14 +26,14 @@ objdump=${OBJDUMP:-objdump}
 # Regexes reach awk through the environment (ENVIRON), never awk -v, which
 # would process their backslash escapes.
 case $arch in
-    x86_64)
+    x86_64 | amd64)
         branchless='(cmov[a-z]*|set[a-z]+|sbb[a-z]?|adc[a-z]?)[[:space:]]'
         cond_branch='j(a|ae|b|be|c|e|g|ge|l|le|na|nae|nb|nbe|nc|ne|ng|nge|nl|nle|no|np|ns|nz|o|p|pe|po|s|z)[[:space:]]'
         uncond_branch='jmp[[:space:]]+[0-9a-f]+ <'
         indirect_call='call[[:space:]]+\*'
         simd='%[xyz]mm[0-9]+'
         ;;
-    aarch64)
+    aarch64 | arm64)
         branchless='(csel|csinc|csinv|csneg|cset|csetm|cinc|cinv|cneg|adcs?|sbcs?|ngcs?)[[:space:]]'
         cond_branch='(b\.[a-z]+|cbz|cbnz|tbz|tbnz)[[:space:]]'
         uncond_branch='b[[:space:]]+[0-9a-f]+ <'
@@ -53,9 +53,7 @@ export branchless cond_branch uncond_branch prefixes
 disasm=$("$objdump" -d --no-show-raw-insn "$bin")
 
 # "<address>\t<instruction>" lines of one function, prefixes stripped,
-# matched with optional GCC clone suffixes such as .constprop.0.  GCC folds
-# sum_branch and sum_threshold into one body listed under either name, so
-# the caller passes both.
+# matched with optional GCC clone suffixes such as .constprop.0.
 listing() {
     printf '%s\n' "$disasm" | fn=$1 awk '
         BEGIN {
@@ -159,16 +157,45 @@ check_leaves() {
     syms=$("$objdump" -t "$bin" | awk '/ F / && $NF ~ /^leaf_[0-9]+$/ { print $1, $NF }')
     names=$(printf '%s\n' "$syms" | awk 'NF { n++ } END { print n + 0 }')
     addrs=$(printf '%s\n' "$syms" | awk 'NF { print $1 }' | sort -u | wc -l)
-    rets=$(body 'leaf_[0-9]+' | grep -Ec '^ret' || true)
-    if [ "$names" -ne 32 ] || [ "$addrs" -ne 32 ] || [ "$rets" -ne 32 ]; then
-        echo "FAIL $label: want 32 distinct leaves with their own ret, found $names symbols, $addrs addresses, $rets rets"
+    # One pass: count leaf listings that end without a ret.
+    noret=$(printf '%s\n' "$disasm" | awk '
+        BEGIN {
+            re = "^[0-9a-f]+ <leaf_[0-9]+(\\.[^>]*)?>:$"
+            pre = "^" ENVIRON["prefixes"]
+        }
+        function close_leaf() { if (in_leaf && !has_ret) noret++; in_leaf = 0 }
+        $0 ~ re       { close_leaf(); in_leaf = 1; has_ret = 0; next }
+        /^$/          { close_leaf(); next }
+        in_leaf {
+            insn = $0; sub(/^[^\t]*\t/, "", insn); sub(pre, "", insn)
+            if (insn ~ /^ret/) has_ret = 1
+        }
+        END { close_leaf(); print noret + 0 }')
+    if [ "$names" -ne 32 ] || [ "$addrs" -ne 32 ] || [ "$noret" -ne 0 ]; then
+        echo "FAIL $label: want 32 distinct leaves with their own ret, found $names symbols, $addrs addresses, $noret without ret"
         fail=1
     else
         echo "ok   $label"
     fi
 }
 
-check "Test 1/4 sum_threshold/sum_branch" 'sum_threshold|sum_branch' loop-branch
+# GCC folds sum_branch and sum_threshold into one body listed under either
+# name.  Each name that is listed is checked on its own, so an unfolded
+# build cannot pass on one function's branch while the other lost its own.
+check_test1() {
+    found=0
+    for fn in sum_threshold sum_branch; do
+        if [ -n "$(body "$fn")" ]; then
+            found=1
+            check "Test 1/4 $fn" "$fn" loop-branch
+        fi
+    done
+    if [ "$found" -eq 0 ]; then
+        echo "FAIL Test 1/4 sum_threshold/sum_branch: function not found"; fail=1
+    fi
+}
+
+check_test1
 check "Test 2 count_decisions"            'count_decisions'           loop-branch
 check "Test 3 dispatch_sequential"        'dispatch_sequential'       "$indirect_call"
 check "Test 3 dispatch_random"            'dispatch_random'           "$indirect_call"

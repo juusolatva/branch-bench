@@ -133,8 +133,9 @@ static void anti_dce_sink(u64 v)
  * ───────────────────────────────────────────────────────────────────────── */
 static double now_ms(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    struct timespec ts = {0, 0};
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0.0;   /* never expected; a zero time skips the ratios */
     return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec * 1e-6;
 }
 
@@ -186,6 +187,10 @@ CHECK_LEN(counter_display_order_len_check, counter_display_order, CTR_COUNT);
 /* Bit c set when counter c opened only as its ARM raw event because the
  * generic one failed; stays 0 on other architectures and without HAVE_PERF. */
 static unsigned perf_raw_mask = 0;
+
+/* Measured trials whose counters were time-shared, so their counts are
+ * scaled estimates; the report says so when this is nonzero. */
+static int perf_scaled_trials = 0;
 
 #ifdef HAVE_PERF
 /* All counters are opened as one perf group so the kernel schedules them
@@ -275,6 +280,18 @@ static void perf_start(void)
                          PERF_IOC_FLAG_GROUP) == 0;
 }
 
+/* A count that ran for `running` of the `enabled` time, scaled up to the
+ * whole trial.  Exact when the counters ran throughout (a double would lose
+ * bits above 2^53); otherwise rounded, and capped at UINT64_MAX, since
+ * converting a larger double to u64 is undefined. */
+static u64 perf_scaled_count(u64 count, u64 enabled, u64 running)
+{
+    if (running == enabled)
+        return count;
+    double v = (double)count * ((double)enabled / (double)running) + 0.5;
+    return v >= 18446744073709551616.0 ? UINT64_MAX : (u64)v;   /* 2^64 */
+}
+
 static void perf_stop(Result *r)
 {
     r->counts_valid = 0;
@@ -294,19 +311,15 @@ static void perf_stop(Result *r)
     u64 running = buf[2] - perf_running_start;
     if (!running || running > enabled) return;
 
-    double scale = 1.0;
     if (running < enabled) {       /* counters were time-shared this trial */
-        static int warned = 0;
-        scale = (double)enabled / (double)running;
-        if (!warned) {
+        if (perf_scaled_trials == 0)
             fprintf(stderr, "Note: perf counters were shared with other users; "
                             "counts are scaled estimates.\n");
-            warned = 1;
-        }
+        perf_scaled_trials++;
     }
     for (int c = 0; c < CTR_COUNT; c++)
         if (perf_has(c))
-            r->counts[c] = (u64)((double)buf[3 + perf_slot[c]] * scale);
+            r->counts[c] = perf_scaled_count(buf[3 + perf_slot[c]], enabled, running);
     r->counts_valid = 1;
 }
 
@@ -607,12 +620,23 @@ static void report_table(FILE *f, const char *title, const char *desc,
     fprintf(f, "\n");
 }
 
+/* printf pads %s by bytes, not columns: the field width that gives `label`
+ * `columns` display columns, counting each UTF-8 continuation byte (an
+ * em-dash has two) as taking no column. */
+static int label_field_width(const char *label, int columns)
+{
+    for (const unsigned char *s = (const unsigned char *)label; *s; s++)
+        if ((*s & 0xC0u) == 0x80u)
+            columns++;
+    return columns;
+}
+
 /* Console counterpart of report_table(): one aligned result row. */
 static void print_row(const char *label, const Result *r, const Work *w)
 {
     const u64 branches = r->counts[CTR_BRANCHES];
     const u64 misses   = r->counts[CTR_MISSES];
-    printf("  %-38s  %7.1f ms", label, r->time_ms);
+    printf("  %-*s  %7.1f ms", label_field_width(label, 38), label, r->time_ms);
     if (trials > 1)
         printf(" (%7.1f–%7.1f)", r->time_min_ms, r->time_max_ms);
     for (int k = 0; k < CTR_COUNT; k++) {
@@ -646,7 +670,8 @@ static void print_miss_cost(FILE *report, const Result *predictable,
     const u64 unpred_misses = unpredictable->counts[CTR_MISSES];
     const u64 pred_cycles   = predictable->counts[CTR_CYCLES];
     const u64 unpred_cycles = unpredictable->counts[CTR_CYCLES];
-    if (unpred_misses < pred_misses + 1000 || unpred_cycles <= pred_cycles)
+    if (unpred_misses <= pred_misses || unpred_misses - pred_misses < 1000 ||
+        unpred_cycles <= pred_cycles)
         return;
     double cost = (double)(unpred_cycles - pred_cycles) /
                   (double)(unpred_misses - pred_misses);
@@ -692,9 +717,18 @@ static void emit_pair_summary(FILE *report, const char *title, const char *desc,
 /* ─────────────────────────────────────────────────────────────────────────
  * Array utilities
  * ───────────────────────────────────────────────────────────────────────── */
-static int cmp_u8_asc(const void *a, const void *b)
+/* Sorts bytes ascending with a counting sort: the same result as qsort()
+ * in O(n), without a comparator call per comparison at large --size. */
+static void sort_u8(u8 *arr, size_t n)
 {
-    return (int)*(const u8*)a - (int)*(const u8*)b;
+    size_t count[256] = {0};
+    for (size_t i = 0; i < n; i++)
+        count[arr[i]]++;
+    size_t pos = 0;
+    for (int v = 0; v < 256; v++) {
+        memset(arr + pos, v, count[v]);
+        pos += count[v];
+    }
 }
 
 static void fill_random_bytes(u8 *arr, size_t n)
@@ -705,6 +739,7 @@ static void fill_random_bytes(u8 *arr, size_t n)
 
 static void shuffle_u8(u8 *arr, size_t n)
 {
+    if (n < 2) return;   /* n - 1 below would wrap for n == 0 */
     for (size_t i = n - 1; i > 0; --i) {
         size_t j = rng64() % (i + 1);
         u8 tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
@@ -749,7 +784,7 @@ static void run_test1(FILE *report)
     /* Fill with uniform random bytes, then sort one copy */
     fill_random_bytes(sorted, len);
     memcpy(shuffled, sorted, len);
-    qsort(sorted, len, 1, cmp_u8_asc);
+    sort_u8(sorted, len);
     shuffle_u8(shuffled, len);
 
     printf("TEST 1 — Threshold Sum  (sorted vs shuffled array, %zu×%u reps)\n",
@@ -1005,7 +1040,7 @@ static void run_test4(FILE *report)
     if (!sorted || !random_d) { perror("malloc"); exit(1); }
 
     fill_random_bytes(sorted, len);
-    qsort(sorted, len, 1, cmp_u8_asc);
+    sort_u8(sorted, len);
     fill_random_bytes(random_d, len);
 
     printf("TEST 4 — Branch vs Branchless  (sorted and random data, %zu×%u reps)\n",
@@ -1113,8 +1148,8 @@ static void print_usage(const char *prog)
            "      --size <N>       elements per array (tests 1/2/4) and calls\n"
            "                       per trial (test 3); K/M suffixes allowed\n"
            "                       (default: %u = 4M, max: %lu = 1024M)\n"
-           "      --reps <N>       passes over the array per trial, tests 1/2/4\n"
-           "                       (default: %u, max: %lu)\n"
+           "      --reps <N>       passes over the array per trial, tests 1/2/4;\n"
+           "                       K/M suffixes allowed (default: %u, max: %lu)\n"
            "  -h, --help           show this help\n",
            prog, MAX_TRIALS, NUM_TESTS, DEFAULT_SIZE, MAX_SIZE, DEFAULT_REPS, MAX_REPS);
 }
@@ -1272,6 +1307,14 @@ static void write_report_header(FILE *report, const char *tests_list)
         fprintf(report, "_Only test(s) %s were run._\n\n", tests_list);
 }
 
+/* Marks a report whose counts include scaled estimates (see perf_stop()). */
+static void report_scaled_note(FILE *report)
+{
+    if (report && perf_scaled_trials)
+        fprintf(report, "_Hardware counters were time-shared in %d measured trial(s); "
+                        "their counts are scaled estimates._\n\n", perf_scaled_trials);
+}
+
 /* Average clock over all measured trials, when the cycle counter worked. */
 static void print_clock_summary(FILE *report)
 {
@@ -1313,6 +1356,7 @@ int main(int argc, char **argv)
     if (test_selected(3)) run_test3(report);
     if (test_selected(4)) run_test4(report);
 
+    report_scaled_note(report);
     print_clock_summary(report);
 
     printf("See README.md for how to interpret these results.\n");

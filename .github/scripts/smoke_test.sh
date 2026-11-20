@@ -8,8 +8,14 @@
 set -u
 
 bin=${1:?usage: smoke_test.sh <binary> [work dir]}
-dir=${2:-$(mktemp -d)}
-mkdir -p "$dir"
+if [ $# -ge 2 ]; then
+    dir=$2
+    mkdir -p "$dir"
+else
+    # Only a directory this script created is removed again.
+    dir=$(mktemp -d) || exit 1
+    trap 'rm -rf "$dir"' EXIT
+fi
 small="--size 64K --reps 2"
 fail=0
 
@@ -18,7 +24,10 @@ expect() {
     want=$1; shift
     "$bin" "$@" >"$dir/stdout" 2>"$dir/stderr"
     got=$?
-    if [ "$got" -eq "$want" ]; then
+    if [ "$got" -eq "$want" ] && [ "$want" -ne 0 ] && [ ! -s "$dir/stderr" ]; then
+        echo "FAIL (exit $got) $*: no error message"
+        fail=1
+    elif [ "$got" -eq "$want" ]; then
         echo "ok   (exit $got) $*"
     else
         echo "FAIL (exit $got, want $want) $*"
@@ -37,11 +46,23 @@ expect 0 $small -n 3 -o "$dir/report.md"
 expect 0 --trials 2 --test 2 --test 4 --output "$dir/report2.md" --size 4k --reps 1
 expect 0 -t 1 -t 3 --size 1m --reps 1
 expect 0 -t 3 --size 1000 --reps 1
+expect 0 -t 1 --size 1 --reps 1k
 
 # The report must contain every test that ran.
 for t in 1 2 3 4; do
     grep -q "^### Test $t " "$dir/report.md" || { echo "FAIL report.md lacks Test $t"; fail=1; }
 done
+# A report of selected tests has only those, and says so.
+for t in 1 3; do
+    if grep -q "^### Test $t " "$dir/report2.md"; then
+        echo "FAIL report2.md has Test $t, which was not selected"; fail=1
+    fi
+done
+for t in 2 4; do
+    grep -q "^### Test $t " "$dir/report2.md" || { echo "FAIL report2.md lacks Test $t"; fail=1; }
+done
+grep -qx '_Only test(s) 2, 4 were run._' "$dir/report2.md" ||
+    { echo "FAIL report2.md lacks the selected-tests note"; fail=1; }
 # ... and record the compiler that built it.
 grep -q '^| Array size | Repetitions | Perf counters | Compiler |$' "$dir/report.md" ||
     { echo "FAIL report.md lacks a Compiler column"; fail=1; }
@@ -53,6 +74,7 @@ expect 1 --size -1
 expect 1 --size 2048M
 expect 1 --reps 0
 expect 1 --reps
+expect 1 --reps 1M
 expect 1 -n 100
 expect 1 -t 5
 expect 1 -o
