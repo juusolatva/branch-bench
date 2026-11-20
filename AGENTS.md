@@ -97,8 +97,9 @@ gcc -std=c99 -O0 -g --coverage -fno-tree-vectorize -fno-if-conversion -o perf_te
 gcov -b branch_bench_cov-branch_bench.gcda   # summary; per-line counts in branch_bench.c.gcov
 python3 -m venv "$tmp/gcovr" && "$tmp/gcovr/bin/pip" install --require-hashes -r .github/requirements.txt &&
 "$tmp/gcovr/bin/gcovr" --root . --filter 'branch_bench\.c$' --merge-lines --sonarqube coverage.xml --print-summary --fail-under-line 80
+rm -rf "$tmp"
 ```
-The last two lines install CI's pinned gcovr and write the `coverage.xml` that CI uploads; use them to check a gcovr update. gcovr's line count can differ from `gcov -b`'s by a line or two.
+The two lines before the cleanup install CI's pinned gcovr and write the `coverage.xml` that CI uploads; use them to check a gcovr update. gcovr's line count can differ from `gcov -b`'s by a line or two.
 
 When adding an option, add its valid and invalid forms to `smoke_test.sh`. When adding a kernel that must keep a branch, add it to `check_kernels.sh`; add every new kernel to `check_jcc.sh`'s function list. When code starts using a new perf event, `/proc` or sysfs file (e.g. new `/proc/cpuinfo` keys), extend `fake_perf.c` so the coverage job still reaches it.
 

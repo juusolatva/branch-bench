@@ -15,7 +15,7 @@ commit=$(git describe --always --dirty 2>/dev/null) || commit=""
 case $commit in
     *[!A-Za-z0-9._+-]*)
         echo "run.sh: ignoring tags in unexpected git describe output" >&2
-        commit=$(git describe --always --dirty --exclude='*') ;;
+        commit=$(git describe --always --dirty --exclude='*' 2>/dev/null) || commit="" ;;
 esac
 # shellcheck disable=SC2086  # $flags is meant to split into words
 gcc $flags -DBUILD_FLAGS="\"$flags\"" -DBUILD_COMMIT="\"$commit\"" -o branch_bench branch_bench.c
