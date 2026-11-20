@@ -36,14 +36,15 @@ fallback. If neither line appears, every open counter used its generic event.
 
 ## Prebuilt binaries
 
-Each [release](https://github.com/juusolatva/branch-bench/releases) has static Linux binaries for x86-64 and arm64 (aarch64), built with the newest GCC release and the flags above. Being static, they run on any Linux of that architecture, including musl systems such as OpenWrt. The banner shows the compiler, flags and release tag. Download the one for your machine (`uname -m`) and its `.sha256` file, then:
+Each [release](https://github.com/juusolatva/branch-bench/releases) has static Linux binaries for x86-64 and arm64 (aarch64), built with the newest GCC release and the flags above. Being static, they run on any Linux of that architecture, including musl systems such as OpenWrt. The banner shows the compiler, flags and release tag. Download the one for your machine (`uname -m`) and its `.sha256` file, then set `tag` to the release you downloaded and run:
 
 ```sh
-bin=$(ls branch_bench-*-linux-"$(uname -m)")
-sha256sum -c "$bin.sha256"
-chmod +x "$bin"
-./"$bin" -n 6 -o report.md
+tag=vX.Y.Z
+bin=branch_bench-$tag-linux-$(uname -m)
+sha256sum -c "$bin.sha256" && chmod +x "$bin" && ./"$bin" -n 6 -o report.md
 ```
+
+The `&&` chain stops if the checksum does not match or the files are missing.
 
 `gh attestation verify <file> --repo juusolatva/branch-bench` checks that a binary was built by this repository's release workflow.
 
@@ -112,10 +113,15 @@ Build and run a small workload, then exercise the CLI and report paths:
 ./run.sh --size 64K --reps 2
 .github/scripts/smoke_test.sh ./branch_bench
 .github/scripts/check_kernels.sh ./branch_bench
+dir=$(mktemp -d) &&
 gcc -std=c99 -O2 -fno-tree-vectorize -fno-if-conversion -Wall -Wextra -pedantic -Werror \
-    -o /tmp/perf_test .github/scripts/perf_test.c
-/tmp/perf_test
+    -o "$dir/perf_test" .github/scripts/perf_test.c &&
+"$dir/perf_test"
+rm -rf "$dir"
 ```
+
+The perf test goes in a new private directory, because on a shared machine
+another user can own an executable at a fixed path such as `/tmp/perf_test`.
 
 The kernel check supports x86-64 and aarch64. On x86-64, also run
 `.github/scripts/check_jcc.sh ./branch_bench`; a build made by `run.sh`
