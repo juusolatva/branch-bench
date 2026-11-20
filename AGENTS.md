@@ -87,9 +87,10 @@ To reproduce CI's coverage locally (from a scratch copy of the repo, because `.g
 tmp=$(mktemp -d)   # private, unlike fixed /tmp paths another user could create first
 gcc -std=c99 -O0 -g --coverage -fno-tree-vectorize -fno-if-conversion \
     -DBUILD_FLAGS='"--coverage"' -DBUILD_COMMIT='"local-coverage"' -o branch_bench_cov branch_bench.c
-gcc -shared -fPIC -o fake_perf.so .github/scripts/fake_perf.c -ldl
+gcc -shared -fPIC -o "$tmp/fake_perf.so" .github/scripts/fake_perf.c -ldl
 .github/scripts/smoke_test.sh ./branch_bench_cov                                 # no counters in a VM (CI)
-printf '#!/bin/sh\nLD_PRELOAD=%s exec %s "$@"\n' "$PWD/fake_perf.so" "$PWD/branch_bench_cov" > "$tmp/bench_fake"
+export FAKE_SO="$tmp/fake_perf.so" BENCH="$PWD/branch_bench_cov"             # any characters in the paths
+printf '#!/bin/sh\nLD_PRELOAD="$FAKE_SO" exec "$BENCH" "$@"\n' > "$tmp/bench_fake"
 chmod +x "$tmp/bench_fake"                                                      # shim for the benchmark only
 .github/scripts/smoke_test.sh "$tmp/bench_fake"                                 # all counters faked
 for ev in misses branches,cycles; do                                            # some counters

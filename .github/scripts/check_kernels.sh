@@ -157,10 +157,20 @@ check_leaves() {
     syms=$("$objdump" -t "$bin" | awk '/ F / && $NF ~ /^leaf_[0-9]+$/ { print $1, $NF }')
     names=$(printf '%s\n' "$syms" | awk 'NF { n++ } END { print n + 0 }')
     addrs=$(printf '%s\n' "$syms" | awk 'NF { print $1 }' | sort -u | wc -l)
-    noret=0
-    for leaf in $(printf '%s\n' "$syms" | awk 'NF { print $2 }'); do
-        body "$leaf" | grep -Eq '^ret' || noret=$((noret + 1))
-    done
+    # One pass: count leaf listings that end without a ret.
+    noret=$(printf '%s\n' "$disasm" | awk '
+        BEGIN {
+            re = "^[0-9a-f]+ <leaf_[0-9]+(\\.[^>]*)?>:$"
+            pre = "^" ENVIRON["prefixes"]
+        }
+        function close_leaf() { if (in_leaf && !has_ret) noret++; in_leaf = 0 }
+        $0 ~ re       { close_leaf(); in_leaf = 1; has_ret = 0; next }
+        /^$/          { close_leaf(); next }
+        in_leaf {
+            insn = $0; sub(/^[^\t]*\t/, "", insn); sub(pre, "", insn)
+            if (insn ~ /^ret/) has_ret = 1
+        }
+        END { close_leaf(); print noret + 0 }')
     if [ "$names" -ne 32 ] || [ "$addrs" -ne 32 ] || [ "$noret" -ne 0 ]; then
         echo "FAIL $label: want 32 distinct leaves with their own ret, found $names symbols, $addrs addresses, $noret without ret"
         fail=1

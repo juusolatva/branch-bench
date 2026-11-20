@@ -278,10 +278,11 @@ jobs:
           gcc -std=c99 -O2 -Wall -Wextra -Werror -shared -fPIC \
             -o "$RUNNER_TEMP/fake_perf.so" .github/scripts/fake_perf.c -ldl
           # Preloaded into the benchmark only, not into the shell and tools
-          # smoke_test.sh runs.
+          # smoke_test.sh runs. The paths reach the wrapper unsplit through
+          # the environment.
+          export FAKE_SO="$RUNNER_TEMP/fake_perf.so" BENCH="$PWD/branch_bench_cov"
           bench="$RUNNER_TEMP/branch_bench_fake"
-          printf '#!/bin/sh\nLD_PRELOAD=%s exec %s "$@"\n' \
-            "$RUNNER_TEMP/fake_perf.so" "$PWD/branch_bench_cov" > "$bench"
+          printf '#!/bin/sh\nLD_PRELOAD="$FAKE_SO" exec "$BENCH" "$@"\n' > "$bench"
           chmod +x "$bench"
           dir="$RUNNER_TEMP/smoke-fake"
           .github/scripts/smoke_test.sh "$bench" "$dir"
