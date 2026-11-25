@@ -16,12 +16,12 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  # Flags the benchmark needs (see AGENTS.md, "Critical Compiler Flags").
+  # Flags the benchmark needs (see AGENTS.md, "Compiler flags").
   BENCH_FLAGS: -std=c99 -O2 -fno-tree-vectorize -fno-if-conversion
   # x86-64 only, as in run.sh: keeps every kernel jump off 32-byte boundaries
-  # (JCC erratum, see AGENTS.md).
+  # (JCC erratum, see TESTING.md).
   JCC_FLAGS: -Wa,-mbranches-within-32B-boundaries,-malign-branch=jcc+fused+jmp+call+ret+indirect
-  # Clang has no -fno-if-conversion (see AGENTS.md, "Compiler Support").
+  # Clang has no -fno-if-conversion (see AGENTS.md, "Compiler support").
   CLANG_FLAGS: -std=c99 -O2 -fno-vectorize -fno-slp-vectorize
   WARN_FLAGS: -Wall -Wextra -pedantic -Werror
   # Small enough for CI; still runs Test 4's sanity check.
