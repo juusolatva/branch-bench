@@ -63,4 +63,4 @@ Benchmark timing differences and measurement errors need a demonstrated security
 
 The output option intentionally overwrites an existing destination and currently follows symbolic links. Existing file permissions are retained. This behavior does not establish safety in attacker-writable directories; assess any file-write issue against the actual invocation and filesystem control.
 
-Large caller-selected workloads intentionally consume CPU time and memory. Tests, sanitizers, static analysis, pinned build inputs, and release checks provide evidence about controls, but do not prove the absence of vulnerabilities.
+Large caller-selected workloads intentionally consume CPU time and memory.

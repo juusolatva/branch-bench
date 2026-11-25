@@ -18,7 +18,7 @@ permissions:
   contents: read
 
 env:
-  # Same flags as run.sh and ci.yml (see AGENTS.md, "Critical Compiler Flags").
+  # Same flags as run.sh and ci.yml (see AGENTS.md, "Compiler flags").
   BENCH_FLAGS: -std=c99 -O2 -fno-tree-vectorize -fno-if-conversion
   JCC_FLAGS: -Wa,-mbranches-within-32B-boundaries,-malign-branch=jcc+fused+jmp+call+ret+indirect
   # As in ci.yml. Not part of BUILD_FLAGS: they don't change the code.
