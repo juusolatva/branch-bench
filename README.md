@@ -133,7 +133,7 @@ out-of-order x86 cores.
 
 - **Slowdown** (Tests 1–3) is the unpredictable variant's time divided by the
   predictable one's. In Test 4, the **Branch penalty on random data** divides the
-  branching time on random data by the time on sorted data. **Branchless is
+  branching time on random data by the branching time on sorted data. **Branchless is
   consistent** makes the same comparison for the branchless version; a value
   near 1 means similar times.
 - **Cost per miss** is the extra cycles divided by the extra mispredictions
